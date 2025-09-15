@@ -1,15 +1,13 @@
 use rustc_middle::mir::{self, NonDivergingIntrinsic};
 use rustc_middle::span_bug;
-use rustc_session::config::OptLevel;
 use tracing::instrument;
 
-use super::FunctionCx;
-use super::LocalRef;
+use super::{FunctionCx, LocalRef};
 use crate::traits::*;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     #[instrument(level = "debug", skip(self, bx))]
-    pub fn codegen_statement(&mut self, bx: &mut Bx, statement: &mir::Statement<'tcx>) {
+    pub(crate) fn codegen_statement(&mut self, bx: &mut Bx, statement: &mir::Statement<'tcx>) {
         self.set_debug_loc(bx, statement.source_info);
         match statement.kind {
             mir::StatementKind::Assign(box (ref place, ref rvalue)) => {
@@ -17,7 +15,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     match self.locals[index] {
                         LocalRef::Place(cg_dest) => self.codegen_rvalue(bx, cg_dest, rvalue),
                         LocalRef::UnsizedPlace(cg_indirect_dest) => {
-                            self.codegen_rvalue_unsized(bx, cg_indirect_dest, rvalue)
+                            let ty = cg_indirect_dest.layout.ty;
+                            span_bug!(
+                                statement.source_info.span,
+                                "cannot reallocate from `UnsizedPlace({ty})` \
+                                into `{rvalue:?}`; dynamic alloca is not supported",
+                            );
                         }
                         LocalRef::PendingOperand => {
                             let operand = self.codegen_rvalue_operand(bx, rvalue);
@@ -69,10 +72,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 self.codegen_coverage(bx, kind, statement.source_info.scope);
             }
             mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(ref op)) => {
-                if !matches!(bx.tcx().sess.opts.optimize, OptLevel::No | OptLevel::Less) {
-                    let op_val = self.codegen_operand(bx, op);
-                    bx.assume(op_val.immediate());
-                }
+                let op_val = self.codegen_operand(bx, op);
+                bx.assume(op_val.immediate());
             }
             mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(
                 mir::CopyNonOverlapping { ref count, ref src, ref dst },
@@ -82,7 +83,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let count = self.codegen_operand(bx, count).immediate();
                 let pointee_layout = dst_val
                     .layout
-                    .pointee_info_at(bx, rustc_target::abi::Size::ZERO)
+                    .pointee_info_at(bx, rustc_abi::Size::ZERO)
                     .expect("Expected pointer");
                 let bytes = bx.mul(count, bx.const_usize(pointee_layout.size.bytes()));
 
@@ -96,6 +97,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             | mir::StatementKind::AscribeUserType(..)
             | mir::StatementKind::ConstEvalCounter
             | mir::StatementKind::PlaceMention(..)
+            | mir::StatementKind::BackwardIncompatibleDropHint { .. }
             | mir::StatementKind::Nop => {}
         }
     }

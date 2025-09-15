@@ -8,49 +8,24 @@
 //! A few functions are provided to create a slice from a value reference
 //! or from a raw pointer.
 #![stable(feature = "rust1", since = "1.0.0")]
-// Many of the usings in this module are only used in the test configuration.
-// It's cleaner to just turn off the unused_imports warning than to fix them.
-#![cfg_attr(test, allow(unused_imports, dead_code))]
 
 use core::borrow::{Borrow, BorrowMut};
 #[cfg(not(no_global_oom_handling))]
 use core::cmp::Ordering::{self, Less};
 #[cfg(not(no_global_oom_handling))]
-use core::mem::{self, MaybeUninit};
+use core::mem::MaybeUninit;
 #[cfg(not(no_global_oom_handling))]
 use core::ptr;
-#[cfg(not(no_global_oom_handling))]
-use core::slice::sort;
-
-use crate::alloc::Allocator;
-#[cfg(not(no_global_oom_handling))]
-use crate::alloc::Global;
-#[cfg(not(no_global_oom_handling))]
-use crate::borrow::ToOwned;
-use crate::boxed::Box;
-use crate::vec::Vec;
-
-#[cfg(test)]
-mod tests;
-
-#[unstable(feature = "array_chunks", issue = "74985")]
-pub use core::slice::ArrayChunks;
-#[unstable(feature = "array_chunks", issue = "74985")]
-pub use core::slice::ArrayChunksMut;
 #[unstable(feature = "array_windows", issue = "75027")]
 pub use core::slice::ArrayWindows;
 #[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
 pub use core::slice::EscapeAscii;
+#[stable(feature = "get_many_mut", since = "1.86.0")]
+pub use core::slice::GetDisjointMutError;
 #[stable(feature = "slice_get_slice", since = "1.28.0")]
 pub use core::slice::SliceIndex;
-#[stable(feature = "from_ref", since = "1.28.0")]
-pub use core::slice::{from_mut, from_ref};
-#[unstable(feature = "slice_from_ptr_range", issue = "89792")]
-pub use core::slice::{from_mut_ptr_range, from_ptr_range};
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use core::slice::{from_raw_parts, from_raw_parts_mut};
-#[unstable(feature = "slice_range", issue = "76393")]
-pub use core::slice::{range, try_range};
+#[cfg(not(no_global_oom_handling))]
+use core::slice::sort;
 #[stable(feature = "slice_group_by", since = "1.77.0")]
 pub use core::slice::{ChunkBy, ChunkByMut};
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -69,124 +44,49 @@ pub use core::slice::{RSplit, RSplitMut};
 pub use core::slice::{RSplitN, RSplitNMut, SplitN, SplitNMut};
 #[stable(feature = "split_inclusive", since = "1.51.0")]
 pub use core::slice::{SplitInclusive, SplitInclusiveMut};
+#[stable(feature = "from_ref", since = "1.28.0")]
+pub use core::slice::{from_mut, from_ref};
+#[unstable(feature = "slice_from_ptr_range", issue = "89792")]
+pub use core::slice::{from_mut_ptr_range, from_ptr_range};
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use core::slice::{from_raw_parts, from_raw_parts_mut};
+#[unstable(feature = "slice_range", issue = "76393")]
+pub use core::slice::{range, try_range};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Basic slice extension methods
 ////////////////////////////////////////////////////////////////////////////////
+use crate::alloc::Allocator;
+#[cfg(not(no_global_oom_handling))]
+use crate::alloc::Global;
+#[cfg(not(no_global_oom_handling))]
+use crate::borrow::ToOwned;
+use crate::boxed::Box;
+use crate::vec::Vec;
 
-// HACK(japaric) needed for the implementation of `vec!` macro during testing
-// N.B., see the `hack` module in this file for more details.
-#[cfg(test)]
-pub use hack::into_vec;
-
-// HACK(japaric) needed for the implementation of `Vec::clone` during testing
-// N.B., see the `hack` module in this file for more details.
-#[cfg(test)]
-pub use hack::to_vec;
-
-// HACK(japaric): With cfg(test) `impl [T]` is not available, these three
-// functions are actually methods that are in `impl [T]` but not in
-// `core::slice::SliceExt` - we need to supply these functions for the
-// `test_permutations` test
-pub(crate) mod hack {
-    use core::alloc::Allocator;
-
-    use crate::boxed::Box;
-    use crate::vec::Vec;
-
-    // We shouldn't add inline attribute to this since this is used in
-    // `vec!` macro mostly and causes perf regression. See #71204 for
-    // discussion and perf results.
-    pub fn into_vec<T, A: Allocator>(b: Box<[T], A>) -> Vec<T, A> {
-        unsafe {
-            let len = b.len();
-            let (b, alloc) = Box::into_raw_with_allocator(b);
-            Vec::from_raw_parts_in(b as *mut T, len, len, alloc)
-        }
-    }
-
-    #[cfg(not(no_global_oom_handling))]
-    #[inline]
-    pub fn to_vec<T: ConvertVec, A: Allocator>(s: &[T], alloc: A) -> Vec<T, A> {
-        T::to_vec(s, alloc)
-    }
-
-    #[cfg(not(no_global_oom_handling))]
-    pub trait ConvertVec {
-        fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A>
-        where
-            Self: Sized;
-    }
-
-    #[cfg(not(no_global_oom_handling))]
-    impl<T: Clone> ConvertVec for T {
-        #[inline]
-        default fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A> {
-            struct DropGuard<'a, T, A: Allocator> {
-                vec: &'a mut Vec<T, A>,
-                num_init: usize,
-            }
-            impl<'a, T, A: Allocator> Drop for DropGuard<'a, T, A> {
-                #[inline]
-                fn drop(&mut self) {
-                    // SAFETY:
-                    // items were marked initialized in the loop below
-                    unsafe {
-                        self.vec.set_len(self.num_init);
-                    }
-                }
-            }
-            let mut vec = Vec::with_capacity_in(s.len(), alloc);
-            let mut guard = DropGuard { vec: &mut vec, num_init: 0 };
-            let slots = guard.vec.spare_capacity_mut();
-            // .take(slots.len()) is necessary for LLVM to remove bounds checks
-            // and has better codegen than zip.
-            for (i, b) in s.iter().enumerate().take(slots.len()) {
-                guard.num_init = i;
-                slots[i].write(b.clone());
-            }
-            core::mem::forget(guard);
-            // SAFETY:
-            // the vec was allocated and initialized above to at least this length.
-            unsafe {
-                vec.set_len(s.len());
-            }
-            vec
-        }
-    }
-
-    #[cfg(not(no_global_oom_handling))]
-    impl<T: Copy> ConvertVec for T {
-        #[inline]
-        fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A> {
-            let mut v = Vec::with_capacity_in(s.len(), alloc);
-            // SAFETY:
-            // allocated above with the capacity of `s`, and initialize to `s.len()` in
-            // ptr::copy_to_non_overlapping below.
-            unsafe {
-                s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), s.len());
-                v.set_len(s.len());
-            }
-            v
-        }
-    }
-}
-
-#[cfg(not(test))]
 impl<T> [T] {
-    /// Sorts the slice, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order, preserving initial order of equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*n* \* log(*n*))
     /// worst-case.
     ///
-    /// If `T: Ord` does not implement a total order the resulting order is unspecified. All
-    /// original elements will remain in the slice and any possible modifications via interior
-    /// mutability are observed in the input. Same is true if `T: Ord` panics.
+    /// If the implementation of [`Ord`] for `T` does not implement a [total order], the function
+    /// may panic; even if the function exits normally, the resulting order of elements in the slice
+    /// is unspecified. See also the note on panicking below.
     ///
     /// When applicable, unstable sorting is preferred because it is generally faster than stable
     /// sorting and it doesn't allocate auxiliary memory. See
     /// [`sort_unstable`](slice::sort_unstable). The exception are partially sorted slices, which
     /// may be better served with `slice::sort`.
+    ///
+    /// Sorting types that only implement [`PartialOrd`] such as [`f32`] and [`f64`] require
+    /// additional precautions. For example, `f32::NAN != f32::NAN`, which doesn't fulfill the
+    /// reflexivity requirement of [`Ord`]. By using an alternative comparison function with
+    /// `slice::sort_by` such as [`f32::total_cmp`] or [`f64::total_cmp`] that defines a [total
+    /// order] users can sort slices containing floating-point values. Alternatively, if all values
+    /// in the slice are guaranteed to be in a subset for which [`PartialOrd::partial_cmp`] forms a
+    /// [total order], it's possible to sort the slice with `sort_by(|a, b|
+    /// a.partial_cmp(b).unwrap())`.
     ///
     /// # Current implementation
     ///
@@ -199,18 +99,29 @@ impl<T> [T] {
     /// handled without allocation, medium sized slices allocate `self.len()` and beyond that it
     /// clamps at `self.len() / 2`.
     ///
-    /// If `T: Ord` does not implement a total order, the implementation may panic.
+    /// # Panics
+    ///
+    /// May panic if the implementation of [`Ord`] for `T` does not implement a [total order], or if
+    /// the [`Ord`] implementation itself panics.
+    ///
+    /// All safe functions on slices preserve the invariant that even if the function panics, all
+    /// original elements will remain in the slice and any possible modifications via interior
+    /// mutability are observed in the input. This ensures that recovery code (for instance inside
+    /// of a `Drop` or following a `catch_unwind`) will still have access to all the original
+    /// elements. For instance, if the slice belongs to a `Vec`, the `Vec::drop` method will be able
+    /// to dispose of all contained elements.
     ///
     /// # Examples
     ///
     /// ```
-    /// let mut v = [-5, 4, 1, -3, 2];
+    /// let mut v = [4, -5, 1, -3, 2];
     ///
     /// v.sort();
-    /// assert!(v == [-5, -3, 1, 2, 4]);
+    /// assert_eq!(v, [-5, -3, 1, 2, 4]);
     /// ```
     ///
     /// [driftsort]: https://github.com/Voultapher/driftsort
+    /// [total order]: https://en.wikipedia.org/wiki/Total_order
     #[cfg(not(no_global_oom_handling))]
     #[rustc_allow_incoherent_impl]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -222,30 +133,19 @@ impl<T> [T] {
         stable_sort(self, T::lt);
     }
 
-    /// Sorts the slice with a comparator function, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order with a comparison function, preserving initial order of
+    /// equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*n* \* log(*n*))
     /// worst-case.
     ///
-    /// The comparator function should define a total ordering for the elements in the slice. If the
-    /// ordering is not total, the order of the elements is unspecified.
+    /// If the comparison function `compare` does not implement a [total order], the function may
+    /// panic; even if the function exits normally, the resulting order of elements in the slice is
+    /// unspecified. See also the note on panicking below.
     ///
-    /// If the comparator function does not implement a total order the resulting order is
-    /// unspecified. All original elements will remain in the slice and any possible modifications
-    /// via interior mutability are observed in the input. Same is true if the comparator function
-    /// panics. A total order (for all `a`, `b` and `c`):
-    ///
-    /// * total and antisymmetric: exactly one of `a < b`, `a == b` or `a > b` is true, and
-    /// * transitive, `a < b` and `b < c` implies `a < c`. The same must hold for both `==` and `>`.
-    ///
-    /// For example, while [`f64`] doesn't implement [`Ord`] because `NaN != NaN`, we can use
-    /// `partial_cmp` as our sort function when we know the slice doesn't contain a `NaN`.
-    ///
-    /// ```
-    /// let mut floats = [5f64, 4.0, 1.0, 3.0, 2.0];
-    /// floats.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-    /// assert_eq!(floats, [1.0, 2.0, 3.0, 4.0, 5.0]);
-    /// ```
+    /// For example `|a, b| (a - b).cmp(a)` is a comparison function that is neither transitive nor
+    /// reflexive nor total, `a < b < c < a` with `a = 1, b = 2, c = 3`. For more information and
+    /// examples see the [`Ord`] documentation.
     ///
     /// # Current implementation
     ///
@@ -258,21 +158,31 @@ impl<T> [T] {
     /// handled without allocation, medium sized slices allocate `self.len()` and beyond that it
     /// clamps at `self.len() / 2`.
     ///
-    /// If `T: Ord` does not implement a total order, the implementation may panic.
+    /// # Panics
+    ///
+    /// May panic if `compare` does not implement a [total order], or if `compare` itself panics.
+    ///
+    /// All safe functions on slices preserve the invariant that even if the function panics, all
+    /// original elements will remain in the slice and any possible modifications via interior
+    /// mutability are observed in the input. This ensures that recovery code (for instance inside
+    /// of a `Drop` or following a `catch_unwind`) will still have access to all the original
+    /// elements. For instance, if the slice belongs to a `Vec`, the `Vec::drop` method will be able
+    /// to dispose of all contained elements.
     ///
     /// # Examples
     ///
     /// ```
-    /// let mut v = [5, 4, 1, 3, 2];
+    /// let mut v = [4, -5, 1, -3, 2];
     /// v.sort_by(|a, b| a.cmp(b));
-    /// assert!(v == [1, 2, 3, 4, 5]);
+    /// assert_eq!(v, [-5, -3, 1, 2, 4]);
     ///
     /// // reverse sorting
     /// v.sort_by(|a, b| b.cmp(a));
-    /// assert!(v == [5, 4, 3, 2, 1]);
+    /// assert_eq!(v, [4, 2, 1, -3, -5]);
     /// ```
     ///
     /// [driftsort]: https://github.com/Voultapher/driftsort
+    /// [total order]: https://en.wikipedia.org/wiki/Total_order
     #[cfg(not(no_global_oom_handling))]
     #[rustc_allow_incoherent_impl]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -284,14 +194,15 @@ impl<T> [T] {
         stable_sort(self, |a, b| compare(a, b) == Less);
     }
 
-    /// Sorts the slice with a key extraction function, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order with a key extraction function, preserving initial order
+    /// of equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*m* \* *n* \* log(*n*))
     /// worst-case, where the key function is *O*(*m*).
     ///
-    /// If `K: Ord` does not implement a total order the resulting order is unspecified.
-    /// All original elements will remain in the slice and any possible modifications via interior
-    /// mutability are observed in the input. Same is true if `K: Ord` panics.
+    /// If the implementation of [`Ord`] for `K` does not implement a [total order], the function
+    /// may panic; even if the function exits normally, the resulting order of elements in the slice
+    /// is unspecified. See also the note on panicking below.
     ///
     /// # Current implementation
     ///
@@ -304,18 +215,29 @@ impl<T> [T] {
     /// handled without allocation, medium sized slices allocate `self.len()` and beyond that it
     /// clamps at `self.len() / 2`.
     ///
-    /// If `K: Ord` does not implement a total order, the implementation may panic.
+    /// # Panics
+    ///
+    /// May panic if the implementation of [`Ord`] for `K` does not implement a [total order], or if
+    /// the [`Ord`] implementation or the key-function `f` panics.
+    ///
+    /// All safe functions on slices preserve the invariant that even if the function panics, all
+    /// original elements will remain in the slice and any possible modifications via interior
+    /// mutability are observed in the input. This ensures that recovery code (for instance inside
+    /// of a `Drop` or following a `catch_unwind`) will still have access to all the original
+    /// elements. For instance, if the slice belongs to a `Vec`, the `Vec::drop` method will be able
+    /// to dispose of all contained elements.
     ///
     /// # Examples
     ///
     /// ```
-    /// let mut v = [-5i32, 4, 1, -3, 2];
+    /// let mut v = [4i32, -5, 1, -3, 2];
     ///
     /// v.sort_by_key(|k| k.abs());
-    /// assert!(v == [1, 2, -3, 4, -5]);
+    /// assert_eq!(v, [1, 2, -3, 4, -5]);
     /// ```
     ///
     /// [driftsort]: https://github.com/Voultapher/driftsort
+    /// [total order]: https://en.wikipedia.org/wiki/Total_order
     #[cfg(not(no_global_oom_handling))]
     #[rustc_allow_incoherent_impl]
     #[stable(feature = "slice_sort_by_key", since = "1.7.0")]
@@ -328,7 +250,8 @@ impl<T> [T] {
         stable_sort(self, |a, b| f(a).lt(&f(b)));
     }
 
-    /// Sorts the slice with a key extraction function, preserving initial order of equal elements.
+    /// Sorts the slice in ascending order with a key extraction function, preserving initial order
+    /// of equal elements.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and *O*(*m* \* *n* + *n* \*
     /// log(*n*)) worst-case, where the key function is *O*(*m*).
@@ -337,9 +260,9 @@ impl<T> [T] {
     /// storage to remember the results of key evaluation. The order of calls to the key function is
     /// unspecified and may change in future versions of the standard library.
     ///
-    /// If `K: Ord` does not implement a total order the resulting order is unspecified.
-    /// All original elements will remain in the slice and any possible modifications via interior
-    /// mutability are observed in the input. Same is true if `K: Ord` panics.
+    /// If the implementation of [`Ord`] for `K` does not implement a [total order], the function
+    /// may panic; even if the function exits normally, the resulting order of elements in the slice
+    /// is unspecified. See also the note on panicking below.
     ///
     /// For simple key functions (e.g., functions that are property accesses or basic operations),
     /// [`sort_by_key`](slice::sort_by_key) is likely to be faster.
@@ -356,16 +279,30 @@ impl<T> [T] {
     /// In the worst case, the algorithm allocates temporary storage in a `Vec<(K, usize)>` the
     /// length of the slice.
     ///
+    /// # Panics
+    ///
+    /// May panic if the implementation of [`Ord`] for `K` does not implement a [total order], or if
+    /// the [`Ord`] implementation panics.
+    ///
+    /// All safe functions on slices preserve the invariant that even if the function panics, all
+    /// original elements will remain in the slice and any possible modifications via interior
+    /// mutability are observed in the input. This ensures that recovery code (for instance inside
+    /// of a `Drop` or following a `catch_unwind`) will still have access to all the original
+    /// elements. For instance, if the slice belongs to a `Vec`, the `Vec::drop` method will be able
+    /// to dispose of all contained elements.
+    ///
     /// # Examples
     ///
     /// ```
-    /// let mut v = [-5i32, 4, 32, -3, 2];
+    /// let mut v = [4i32, -5, 1, -3, 2, 10];
     ///
+    /// // Strings are sorted by lexicographical order.
     /// v.sort_by_cached_key(|k| k.to_string());
-    /// assert!(v == [-3, -5, 2, 32, 4]);
+    /// assert_eq!(v, [-3, -5, 1, 10, 2, 4]);
     /// ```
     ///
     /// [ipnsort]: https://github.com/Voultapher/sort-research-rs/tree/main/ipnsort
+    /// [total order]: https://en.wikipedia.org/wiki/Total_order
     #[cfg(not(no_global_oom_handling))]
     #[rustc_allow_incoherent_impl]
     #[stable(feature = "slice_sort_by_cached_key", since = "1.34.0")]
@@ -403,7 +340,7 @@ impl<T> [T] {
         // Avoids binary-size usage in cases where the alignment doesn't work out to make this
         // beneficial or on 32-bit platforms.
         let is_using_u32_as_idx_type_helpful =
-            const { mem::size_of::<(K, u32)>() < mem::size_of::<(K, usize)>() };
+            const { size_of::<(K, u32)>() < size_of::<(K, usize)>() };
 
         // It's possible to instantiate this for u8 and u16 but, doing so is very wasteful in terms
         // of compile-times and binary-size, the peak saved heap memory for u16 is (u8 + u16) -> 4
@@ -458,8 +395,64 @@ impl<T> [T] {
     where
         T: Clone,
     {
-        // N.B., see the `hack` module in this file for more details.
-        hack::to_vec(self, alloc)
+        return T::to_vec(self, alloc);
+
+        trait ConvertVec {
+            fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A>
+            where
+                Self: Sized;
+        }
+
+        impl<T: Clone> ConvertVec for T {
+            #[inline]
+            default fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A> {
+                struct DropGuard<'a, T, A: Allocator> {
+                    vec: &'a mut Vec<T, A>,
+                    num_init: usize,
+                }
+                impl<'a, T, A: Allocator> Drop for DropGuard<'a, T, A> {
+                    #[inline]
+                    fn drop(&mut self) {
+                        // SAFETY:
+                        // items were marked initialized in the loop below
+                        unsafe {
+                            self.vec.set_len(self.num_init);
+                        }
+                    }
+                }
+                let mut vec = Vec::with_capacity_in(s.len(), alloc);
+                let mut guard = DropGuard { vec: &mut vec, num_init: 0 };
+                let slots = guard.vec.spare_capacity_mut();
+                // .take(slots.len()) is necessary for LLVM to remove bounds checks
+                // and has better codegen than zip.
+                for (i, b) in s.iter().enumerate().take(slots.len()) {
+                    guard.num_init = i;
+                    slots[i].write(b.clone());
+                }
+                core::mem::forget(guard);
+                // SAFETY:
+                // the vec was allocated and initialized above to at least this length.
+                unsafe {
+                    vec.set_len(s.len());
+                }
+                vec
+            }
+        }
+
+        impl<T: Copy> ConvertVec for T {
+            #[inline]
+            fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A> {
+                let mut v = Vec::with_capacity_in(s.len(), alloc);
+                // SAFETY:
+                // allocated above with the capacity of `s`, and initialize to `s.len()` in
+                // ptr::copy_to_non_overlapping below.
+                unsafe {
+                    s.as_ptr().copy_to_nonoverlapping(v.as_mut_ptr(), s.len());
+                    v.set_len(s.len());
+                }
+                v
+            }
+        }
     }
 
     /// Converts `self` into a vector without clones or allocation.
@@ -479,9 +472,13 @@ impl<T> [T] {
     #[rustc_allow_incoherent_impl]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
+    #[rustc_diagnostic_item = "slice_into_vec"]
     pub fn into_vec<A: Allocator>(self: Box<Self, A>) -> Vec<T, A> {
-        // N.B., see the `hack` module in this file for more details.
-        hack::into_vec(self)
+        unsafe {
+            let len = self.len();
+            let (b, alloc) = Box::into_raw_with_allocator(self);
+            Vec::from_raw_parts_in(b as *mut T, len, len, alloc)
+        }
     }
 
     /// Creates a vector by copying a slice `n` times.
@@ -491,8 +488,6 @@ impl<T> [T] {
     /// This function will panic if the capacity would overflow.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// assert_eq!([1, 2].repeat(3), vec![1, 2, 1, 2, 1, 2]);
@@ -622,7 +617,6 @@ impl<T> [T] {
     }
 }
 
-#[cfg(not(test))]
 impl [u8] {
     /// Returns a vector containing a copy of this slice where each byte
     /// is mapped to its ASCII upper case equivalent.
@@ -839,14 +833,9 @@ impl<T: Copy, A: Allocator> SpecCloneIntoVec<T, A> for [T] {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone> ToOwned for [T] {
     type Owned = Vec<T>;
-    #[cfg(not(test))]
+
     fn to_owned(&self) -> Vec<T> {
         self.to_vec()
-    }
-
-    #[cfg(test)]
-    fn to_owned(&self) -> Vec<T> {
-        hack::to_vec(self, Global)
     }
 
     fn clone_into(&self, target: &mut Vec<T>) {

@@ -1,29 +1,29 @@
-use rustc_hir::def_id::DefId;
+use rustc_data_structures::fx::FxHashSet;
+use rustc_hir::def_id::LocalDefId;
+use rustc_infer::infer::SubregionOrigin;
 use rustc_infer::infer::canonical::QueryRegionConstraints;
 use rustc_infer::infer::outlives::env::RegionBoundPairs;
 use rustc_infer::infer::outlives::obligations::{TypeOutlives, TypeOutlivesDelegate};
 use rustc_infer::infer::region_constraints::{GenericKind, VerifyBound};
-use rustc_infer::infer::{self, InferCtxt, SubregionOrigin};
+use rustc_infer::traits::query::type_op::DeeplyNormalize;
 use rustc_middle::bug;
-use rustc_middle::mir::{ClosureOutlivesSubject, ClosureRegionRequirements, ConstraintCategory};
-use rustc_middle::traits::query::NoSolution;
-use rustc_middle::traits::ObligationCause;
-use rustc_middle::ty::{self, GenericArgKind, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
+use rustc_middle::ty::{
+    self, GenericArgKind, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, elaborate, fold_regions,
+};
 use rustc_span::Span;
-use rustc_trait_selection::traits::query::type_op::custom::CustomTypeOp;
 use rustc_trait_selection::traits::query::type_op::{TypeOp, TypeOpOutput};
-use rustc_trait_selection::traits::ScrubbedTraitError;
+use tracing::{debug, instrument};
 
+use crate::constraints::OutlivesConstraint;
+use crate::region_infer::TypeTest;
+use crate::type_check::{Locations, MirTypeckRegionConstraints};
+use crate::universal_regions::UniversalRegions;
 use crate::{
-    constraints::OutlivesConstraint,
-    region_infer::TypeTest,
-    type_check::{Locations, MirTypeckRegionConstraints},
-    universal_regions::UniversalRegions,
+    BorrowckInferCtxt, ClosureOutlivesSubject, ClosureRegionRequirements, ConstraintCategory,
 };
 
 pub(crate) struct ConstraintConversion<'a, 'tcx> {
-    infcx: &'a InferCtxt<'tcx>,
-    tcx: TyCtxt<'tcx>,
+    infcx: &'a BorrowckInferCtxt<'tcx>,
     universal_regions: &'a UniversalRegions<'tcx>,
     /// Each RBP `GK: 'a` is assumed to be true. These encode
     /// relationships like `T: 'a` that are added via implicit bounds
@@ -36,9 +36,7 @@ pub(crate) struct ConstraintConversion<'a, 'tcx> {
     /// logic expecting to see (e.g.) `ReStatic`, and if we supplied
     /// our special inference variable there, we would mess that up.
     region_bound_pairs: &'a RegionBoundPairs<'tcx>,
-    implicit_region_bound: ty::Region<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
-    known_type_outlives_obligations: &'tcx [ty::PolyTypeOutlivesPredicate<'tcx>],
+    known_type_outlives_obligations: &'a [ty::PolyTypeOutlivesPredicate<'tcx>],
     locations: Locations,
     span: Span,
     category: ConstraintCategory<'tcx>,
@@ -48,12 +46,10 @@ pub(crate) struct ConstraintConversion<'a, 'tcx> {
 
 impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
     pub(crate) fn new(
-        infcx: &'a InferCtxt<'tcx>,
+        infcx: &'a BorrowckInferCtxt<'tcx>,
         universal_regions: &'a UniversalRegions<'tcx>,
         region_bound_pairs: &'a RegionBoundPairs<'tcx>,
-        implicit_region_bound: ty::Region<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        known_type_outlives_obligations: &'tcx [ty::PolyTypeOutlivesPredicate<'tcx>],
+        known_type_outlives_obligations: &'a [ty::PolyTypeOutlivesPredicate<'tcx>],
         locations: Locations,
         span: Span,
         category: ConstraintCategory<'tcx>,
@@ -61,11 +57,8 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
     ) -> Self {
         Self {
             infcx,
-            tcx: infcx.tcx,
             universal_regions,
             region_bound_pairs,
-            implicit_region_bound,
-            param_env,
             known_type_outlives_obligations,
             locations,
             span,
@@ -77,20 +70,12 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
 
     #[instrument(skip(self), level = "debug")]
     pub(super) fn convert_all(&mut self, query_constraints: &QueryRegionConstraints<'tcx>) {
-        let QueryRegionConstraints { outlives, member_constraints } = query_constraints;
-
-        // Annoying: to invoke `self.to_region_vid`, we need access to
-        // `self.constraints`, but we also want to be mutating
-        // `self.member_constraints`. For now, just swap out the value
-        // we want and replace at the end.
-        let mut tmp = std::mem::take(&mut self.constraints.member_constraints);
-        for member_constraint in member_constraints {
-            tmp.push_constraint(member_constraint, |r| self.to_region_vid(r));
-        }
-        self.constraints.member_constraints = tmp;
+        let QueryRegionConstraints { outlives, assumptions } = query_constraints;
+        let assumptions =
+            elaborate::elaborate_outlives_assumptions(self.infcx.tcx, assumptions.iter().copied());
 
         for &(predicate, constraint_category) in outlives {
-            self.convert(predicate, constraint_category);
+            self.convert(predicate, constraint_category, &assumptions);
         }
     }
 
@@ -98,20 +83,20 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
     /// that we computed for the closure. This has the effect of adding new outlives obligations
     /// to existing region variables in `closure_args`.
     #[instrument(skip(self), level = "debug")]
-    pub fn apply_closure_requirements(
+    pub(crate) fn apply_closure_requirements(
         &mut self,
         closure_requirements: &ClosureRegionRequirements<'tcx>,
-        closure_def_id: DefId,
+        closure_def_id: LocalDefId,
         closure_args: ty::GenericArgsRef<'tcx>,
     ) {
         // Extract the values of the free regions in `closure_args`
         // into a vector. These are the regions that we will be
         // relating to one another.
         let closure_mapping = &UniversalRegions::closure_mapping(
-            self.tcx,
+            self.infcx.tcx,
             closure_args,
             closure_requirements.num_external_vids,
-            closure_def_id.expect_local(),
+            closure_def_id,
         );
         debug!(?closure_mapping);
 
@@ -123,30 +108,35 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
             let subject = match outlives_requirement.subject {
                 ClosureOutlivesSubject::Region(re) => closure_mapping[re].into(),
                 ClosureOutlivesSubject::Ty(subject_ty) => {
-                    subject_ty.instantiate(self.tcx, |vid| closure_mapping[vid]).into()
+                    subject_ty.instantiate(self.infcx.tcx, |vid| closure_mapping[vid]).into()
                 }
             };
 
             self.category = outlives_requirement.category;
             self.span = outlives_requirement.blame_span;
-            self.convert(ty::OutlivesPredicate(subject, outlived_region), self.category);
+            self.convert(
+                ty::OutlivesPredicate(subject, outlived_region),
+                self.category,
+                &Default::default(),
+            );
         }
         (self.category, self.span, self.from_closure) = backup;
     }
 
     fn convert(
         &mut self,
-        predicate: ty::OutlivesPredicate<'tcx, ty::GenericArg<'tcx>>,
+        predicate: ty::ArgOutlivesPredicate<'tcx>,
         constraint_category: ConstraintCategory<'tcx>,
+        higher_ranked_assumptions: &FxHashSet<ty::ArgOutlivesPredicate<'tcx>>,
     ) {
+        let tcx = self.infcx.tcx;
         debug!("generate: constraints at: {:#?}", self.locations);
 
         // Extract out various useful fields we'll need below.
         let ConstraintConversion {
-            tcx,
             infcx,
+            universal_regions,
             region_bound_pairs,
-            implicit_region_bound,
             known_type_outlives_obligations,
             ..
         } = *self;
@@ -157,15 +147,26 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
                 break;
             }
 
-            if !self.tcx.recursion_limit().value_within_limit(iteration) {
+            if !tcx.recursion_limit().value_within_limit(iteration) {
+                // This may actually be reachable. If so, we should convert
+                // this to a proper error/consider whether we should detect
+                // this somewhere else.
                 bug!(
-                    "FIXME(-Znext-solver): Overflowed when processing region obligations: {outlives_predicates:#?}"
+                    "unexpected overflowed when processing region obligations: {outlives_predicates:#?}"
                 );
             }
 
             let mut next_outlives_predicates = vec![];
-            for (ty::OutlivesPredicate(k1, r2), constraint_category) in outlives_predicates {
-                match k1.unpack() {
+            for (pred, constraint_category) in outlives_predicates {
+                // Constraint is implied by a coroutine's well-formedness.
+                if self.infcx.tcx.sess.opts.unstable_opts.higher_ranked_assumptions
+                    && higher_ranked_assumptions.contains(&pred)
+                {
+                    continue;
+                }
+
+                let ty::OutlivesPredicate(k1, r2) = pred;
+                match k1.kind() {
                     GenericArgKind::Lifetime(r1) => {
                         let r1_vid = self.to_region_vid(r1);
                         let r2_vid = self.to_region_vid(r2);
@@ -173,6 +174,9 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
                     }
 
                     GenericArgKind::Type(mut t1) => {
+                        // Scraped constraints may have had inference vars.
+                        t1 = self.infcx.resolve_vars_if_possible(t1);
+
                         // Normalize the type we receive from a `TypeOutlives` obligation
                         // in the new trait solver.
                         if infcx.next_trait_solver() {
@@ -182,10 +186,11 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
                             );
                         }
 
+                        let implicit_region_bound =
+                            ty::Region::new_var(tcx, universal_regions.implicit_region_bound());
                         // we don't actually use this for anything, but
                         // the `TypeOutlives` code needs an origin.
-                        let origin = infer::RelateParamBound(self.span, t1, None);
-
+                        let origin = SubregionOrigin::RelateParamBound(self.span, t1, None);
                         TypeOutlives::new(
                             &mut *self,
                             tcx,
@@ -217,7 +222,7 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
     /// are dealt with during trait solving.
     fn replace_placeholders_with_nll<T: TypeFoldable<TyCtxt<'tcx>>>(&mut self, value: T) -> T {
         if value.has_placeholders() {
-            self.tcx.fold_regions(value, |r, _| match *r {
+            fold_regions(self.infcx.tcx, value, |r, _| match r.kind() {
                 ty::RePlaceholder(placeholder) => {
                     self.constraints.placeholder_region(self.infcx, placeholder)
                 }
@@ -239,7 +244,7 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
     }
 
     fn to_region_vid(&mut self, r: ty::Region<'tcx>) -> ty::RegionVid {
-        if let ty::RePlaceholder(placeholder) = *r {
+        if let ty::RePlaceholder(placeholder) = r.kind() {
             self.constraints.placeholder_region(self.infcx, placeholder).as_var()
         } else {
             self.universal_regions.to_region_vid(r)
@@ -276,32 +281,19 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
         &self,
         ty: Ty<'tcx>,
         next_outlives_predicates: &mut Vec<(
-            ty::OutlivesPredicate<'tcx, ty::GenericArg<'tcx>>,
+            ty::ArgOutlivesPredicate<'tcx>,
             ConstraintCategory<'tcx>,
         )>,
     ) -> Ty<'tcx> {
-        let result = CustomTypeOp::new(
-            |ocx| {
-                ocx.deeply_normalize(
-                    &ObligationCause::dummy_with_span(self.span),
-                    self.param_env,
-                    ty,
-                )
-                .map_err(|_: Vec<ScrubbedTraitError<'tcx>>| NoSolution)
-            },
-            "normalize type outlives obligation",
-        )
-        .fully_perform(self.infcx, self.span);
-
-        match result {
+        match self.infcx.param_env.and(DeeplyNormalize { value: ty }).fully_perform(
+            self.infcx,
+            self.infcx.root_def_id,
+            self.span,
+        ) {
             Ok(TypeOpOutput { output: ty, constraints, .. }) => {
-                if let Some(constraints) = constraints {
-                    assert!(
-                        constraints.member_constraints.is_empty(),
-                        "no member constraints expected from normalizing: {:#?}",
-                        constraints.member_constraints
-                    );
-                    next_outlives_predicates.extend(constraints.outlives.iter().copied());
+                // FIXME(higher_ranked_auto): What should we do with the assumptions here?
+                if let Some(QueryRegionConstraints { outlives, assumptions: _ }) = constraints {
+                    next_outlives_predicates.extend(outlives.iter().copied());
                 }
                 ty
             }

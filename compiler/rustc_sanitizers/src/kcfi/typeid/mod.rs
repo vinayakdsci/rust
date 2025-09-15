@@ -4,12 +4,13 @@
 //! For more information about LLVM KCFI and cross-language LLVM KCFI support for the Rust compiler,
 //! see the tracking issue #123479.
 
-use rustc_middle::ty::{Instance, InstanceKind, ReifyReason, Ty, TyCtxt};
-use rustc_target::abi::call::FnAbi;
 use std::hash::Hasher;
+
+use rustc_middle::ty::{Instance, InstanceKind, ReifyReason, Ty, TyCtxt};
+use rustc_target::callconv::FnAbi;
 use twox_hash::XxHash64;
 
-pub use crate::cfi::typeid::{itanium_cxx_abi, TypeIdOptions};
+pub use crate::cfi::typeid::{TypeIdOptions, itanium_cxx_abi};
 
 /// Returns a KCFI type metadata identifier for the specified FnAbi.
 pub fn typeid_for_fnabi<'tcx>(

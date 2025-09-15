@@ -51,9 +51,13 @@ fn detect_llvm_link() -> (&'static str, &'static str) {
 fn restore_library_path() {
     let key = tracked_env_var_os("REAL_LIBRARY_PATH_VAR").expect("REAL_LIBRARY_PATH_VAR");
     if let Some(env) = tracked_env_var_os("REAL_LIBRARY_PATH") {
-        env::set_var(&key, env);
+        unsafe {
+            env::set_var(&key, env);
+        }
     } else {
-        env::remove_var(&key);
+        unsafe {
+            env::remove_var(&key);
+        }
     }
 }
 
@@ -102,6 +106,10 @@ fn output(cmd: &mut Command) -> String {
 }
 
 fn main() {
+    if cfg!(feature = "check_only") {
+        return;
+    }
+
     for component in REQUIRED_COMPONENTS.iter().chain(OPTIONAL_COMPONENTS.iter()) {
         println!("cargo:rustc-check-cfg=cfg(llvm_component,values(\"{component}\"))");
     }
@@ -163,6 +171,16 @@ fn main() {
     let cxxflags = output(&mut cmd);
     let mut cfg = cc::Build::new();
     cfg.warnings(false);
+
+    // Prevent critical warnings when we're compiling from rust-lang/rust CI,
+    // except on MSVC, as the compiler throws warnings that are only reported
+    // for this platform. See https://github.com/rust-lang/rust/pull/145031#issuecomment-3162677202.
+    // Moreover, LLVM generally guarantees warning-freedom only when building with Clang, as other
+    // compilers have too many false positives. This is typically the case for MSVC, which throws
+    // many false-positive warnings. We keep it excluded, for these reasons.
+    if std::env::var_os("CI").is_some() && !target.contains("msvc") {
+        cfg.warnings_into_errors(true);
+    }
     for flag in cxxflags.split_whitespace() {
         // Ignore flags like `-m64` when we're doing a cross build
         if is_crossed && flag.starts_with("-m") {
@@ -193,6 +211,10 @@ fn main() {
         cfg.define(&flag, None);
     }
 
+    if tracked_env_var_os("LLVM_ENZYME").is_some() {
+        cfg.define("ENZYME", None);
+    }
+
     if tracked_env_var_os("LLVM_RUSTLLVM").is_some() {
         cfg.define("LLVM_RUSTLLVM", None);
     }
@@ -204,7 +226,6 @@ fn main() {
     rerun_if_changed_anything_in_dir(Path::new("llvm-wrapper"));
     cfg.file("llvm-wrapper/PassWrapper.cpp")
         .file("llvm-wrapper/RustWrapper.cpp")
-        .file("llvm-wrapper/ArchiveWrapper.cpp")
         .file("llvm-wrapper/CoverageMappingWrapper.cpp")
         .file("llvm-wrapper/SymbolWrapper.cpp")
         .file("llvm-wrapper/Linker.cpp")
@@ -220,7 +241,10 @@ fn main() {
     let mut cmd = Command::new(&llvm_config);
     cmd.arg(llvm_link_arg).arg("--libs");
 
-    if !is_crossed {
+    // Don't link system libs if cross-compiling unless targeting Windows from Windows host.
+    // On Windows system DLLs aren't linked directly, instead import libraries are used.
+    // These import libraries are independent of the host.
+    if !is_crossed || target.contains("windows") && host.contains("windows") {
         cmd.arg("--system-libs");
     }
 
@@ -230,7 +254,10 @@ fn main() {
         println!("cargo:rustc-link-lib=kstat");
     }
 
-    if (target.starts_with("arm") && !target.contains("freebsd"))
+    if (target.starts_with("arm")
+        && !target.starts_with("arm64")
+        && !target.contains("freebsd")
+        && !target.contains("ohos"))
         || target.starts_with("mips-")
         || target.starts_with("mipsel-")
         || target.starts_with("powerpc-")
@@ -244,6 +271,7 @@ fn main() {
     } else if target.contains("haiku")
         || target.contains("darwin")
         || (is_crossed && (target.contains("dragonfly") || target.contains("solaris")))
+        || target.contains("cygwin")
     {
         println!("cargo:rustc-link-lib=z");
     } else if target.contains("netbsd") {
@@ -259,6 +287,7 @@ fn main() {
     cmd.args(&components);
 
     for lib in output(&mut cmd).split_whitespace() {
+        let mut is_static = false;
         let name = if let Some(stripped) = lib.strip_prefix("-l") {
             stripped
         } else if let Some(stripped) = lib.strip_prefix('-') {
@@ -266,8 +295,24 @@ fn main() {
         } else if Path::new(lib).exists() {
             // On MSVC llvm-config will print the full name to libraries, but
             // we're only interested in the name part
-            let name = Path::new(lib).file_name().unwrap().to_str().unwrap();
-            name.trim_end_matches(".lib")
+            // On Unix when we get a static library llvm-config will print the
+            // full name and we *are* interested in the path, but we need to
+            // handle it separately. For example, when statically linking to
+            // libzstd llvm-config will output something like
+            //   -lrt -ldl -lm -lz /usr/local/lib/libzstd.a -lxml2
+            // and we transform the zstd part into
+            //   cargo:rustc-link-search-native=/usr/local/lib
+            //   cargo:rustc-link-lib=static=zstd
+            let path = Path::new(lib);
+            if lib.ends_with(".a") {
+                is_static = true;
+                println!("cargo:rustc-link-search=native={}", path.parent().unwrap().display());
+                let name = path.file_stem().unwrap().to_str().unwrap();
+                name.trim_start_matches("lib")
+            } else {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.trim_end_matches(".lib")
+            }
         } else if lib.ends_with(".lib") {
             // Some MSVC libraries just come up with `.lib` tacked on, so chop
             // that off
@@ -285,7 +330,13 @@ fn main() {
             continue;
         }
 
-        let kind = if name.starts_with("LLVM") { llvm_kind } else { "dylib" };
+        let kind = if name.starts_with("LLVM") {
+            llvm_kind
+        } else if is_static {
+            "static"
+        } else {
+            "dylib"
+        };
         println!("cargo:rustc-link-lib={kind}={name}");
     }
 
@@ -337,6 +388,7 @@ fn main() {
         || target.contains("freebsd")
         || target.contains("windows-gnullvm")
         || target.contains("aix")
+        || target.contains("ohos")
     {
         "c++"
     } else if target.contains("netbsd") && llvm_static_stdcpp.is_some() {

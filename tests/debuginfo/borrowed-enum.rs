@@ -1,21 +1,20 @@
-// Require a gdb or lldb that can read DW_TAG_variant_part.
-//@ min-gdb-version: 8.2
 //@ min-lldb-version: 1800
 
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
 // gdb-command:run
 
 // gdb-command:print *the_a_ref
-// gdbr-check:$1 = borrowed_enum::ABC::TheA{x: 0, y: 8970181431921507452}
+// gdb-check:$1 = borrowed_enum::ABC::TheA{x: 0, y: 8970181431921507452}
 
 // gdb-command:print *the_b_ref
-// gdbr-check:$2 = borrowed_enum::ABC::TheB(0, 286331153, 286331153)
+// gdb-check:$2 = borrowed_enum::ABC::TheB(0, 286331153, 286331153)
 
 // gdb-command:print *univariant_ref
-// gdbr-check:$3 = borrowed_enum::Univariant::TheOnlyCase(4820353753753434)
+// gdb-check:$3 = borrowed_enum::Univariant::TheOnlyCase(4820353753753434)
 
 
 // === LLDB TESTS ==================================================================================
@@ -23,18 +22,13 @@
 // lldb-command:run
 
 // lldb-command:v *the_a_ref
-// lldbg-check:(borrowed_enum::ABC) *the_a_ref = { value = { x = 0 y = 8970181431921507452 } $discr$ = 0 }
-// lldbr-check:(borrowed_enum::ABC::TheA) *the_a_ref = TheA { TheA: 0, TheB: 8970181431921507452 }
+// lldb-check:(borrowed_enum::ABC) *the_a_ref = { TheA = { x = 0 y = 8970181431921507452 } }
 // lldb-command:v *the_b_ref
-// lldbg-check:(borrowed_enum::ABC) *the_b_ref = { value = { 0 = 0 1 = 286331153 2 = 286331153 } $discr$ = 1 }
-// lldbr-check:(borrowed_enum::ABC::TheB) *the_b_ref = { = 0 = 286331153 = 286331153 }
+// lldb-check:(borrowed_enum::ABC) *the_b_ref = { TheB = { 0 = 0 1 = 286331153 2 = 286331153 } }
 // lldb-command:v *univariant_ref
-// lldbg-check:(borrowed_enum::Univariant) *univariant_ref = { value = { 0 = 4820353753753434 } }
-// lldbr-check:(borrowed_enum::Univariant) *univariant_ref = { TheOnlyCase = { = 4820353753753434 } }
+// lldb-check:(borrowed_enum::Univariant) *univariant_ref = { TheOnlyCase = { 0 = 4820353753753434 } }
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 // The first element is to ensure proper alignment, irrespective of the machines word size. Since
 // the size of the discriminant value is machine dependent, this has be taken into account when

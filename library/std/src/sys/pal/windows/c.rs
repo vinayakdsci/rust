@@ -4,15 +4,9 @@
 #![cfg_attr(test, allow(dead_code))]
 #![unstable(issue = "none", feature = "windows_c")]
 #![allow(clippy::style)]
-#![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::ffi::CStr;
-use crate::mem;
-use crate::os::raw::{c_uint, c_ulong, c_ushort, c_void};
-use crate::os::windows::io::{AsRawHandle, BorrowedHandle};
-use crate::ptr;
-
-pub(super) mod windows_targets;
+use core::ffi::{CStr, c_uint, c_ulong, c_ushort, c_void};
+use core::ptr;
 
 mod windows_sys;
 pub use windows_sys::*;
@@ -43,17 +37,10 @@ pub fn nt_success(status: NTSTATUS) -> bool {
     status >= 0
 }
 
-impl UNICODE_STRING {
-    pub fn from_ref(slice: &[u16]) -> Self {
-        let len = mem::size_of_val(slice);
-        Self { Length: len as _, MaximumLength: len as _, Buffer: slice.as_ptr() as _ }
-    }
-}
-
-impl Default for OBJECT_ATTRIBUTES {
-    fn default() -> Self {
+impl OBJECT_ATTRIBUTES {
+    pub fn with_length() -> Self {
         Self {
-            Length: mem::size_of::<Self>() as _,
+            Length: size_of::<Self>() as _,
             RootDirectory: ptr::null_mut(),
             ObjectName: ptr::null_mut(),
             Attributes: 0,
@@ -108,109 +95,36 @@ pub struct MOUNT_POINT_REPARSE_BUFFER {
 }
 
 // Desktop specific functions & types
-cfg_if::cfg_if! {
-if #[cfg(not(target_vendor = "uwp"))] {
-    pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
-}
-}
-
-pub unsafe extern "system" fn WriteFileEx(
-    hFile: BorrowedHandle<'_>,
-    lpBuffer: *mut ::core::ffi::c_void,
-    nNumberOfBytesToWrite: u32,
-    lpOverlapped: *mut OVERLAPPED,
-    lpCompletionRoutine: LPOVERLAPPED_COMPLETION_ROUTINE,
-) -> BOOL {
-    windows_sys::WriteFileEx(
-        hFile.as_raw_handle(),
-        lpBuffer.cast::<u8>(),
-        nNumberOfBytesToWrite,
-        lpOverlapped,
-        lpCompletionRoutine,
-    )
-}
-
-pub unsafe extern "system" fn ReadFileEx(
-    hFile: BorrowedHandle<'_>,
-    lpBuffer: *mut ::core::ffi::c_void,
-    nNumberOfBytesToRead: u32,
-    lpOverlapped: *mut OVERLAPPED,
-    lpCompletionRoutine: LPOVERLAPPED_COMPLETION_ROUTINE,
-) -> BOOL {
-    windows_sys::ReadFileEx(
-        hFile.as_raw_handle(),
-        lpBuffer.cast::<u8>(),
-        nNumberOfBytesToRead,
-        lpOverlapped,
-        lpCompletionRoutine,
-    )
-}
-
-cfg_if::cfg_if! {
-if #[cfg(not(target_vendor = "uwp"))] {
-pub unsafe fn NtReadFile(
-    filehandle: BorrowedHandle<'_>,
-    event: HANDLE,
-    apcroutine: PIO_APC_ROUTINE,
-    apccontext: *mut c_void,
-    iostatusblock: &mut IO_STATUS_BLOCK,
-    buffer: *mut crate::mem::MaybeUninit<u8>,
-    length: u32,
-    byteoffset: Option<&i64>,
-    key: Option<&u32>,
-) -> NTSTATUS {
-    windows_sys::NtReadFile(
-        filehandle.as_raw_handle(),
-        event,
-        apcroutine,
-        apccontext,
-        iostatusblock,
-        buffer.cast::<c_void>(),
-        length,
-        byteoffset.map(|o| o as *const i64).unwrap_or(ptr::null()),
-        key.map(|k| k as *const u32).unwrap_or(ptr::null()),
-    )
-}
-pub unsafe fn NtWriteFile(
-    filehandle: BorrowedHandle<'_>,
-    event: HANDLE,
-    apcroutine: PIO_APC_ROUTINE,
-    apccontext: *mut c_void,
-    iostatusblock: &mut IO_STATUS_BLOCK,
-    buffer: *const u8,
-    length: u32,
-    byteoffset: Option<&i64>,
-    key: Option<&u32>,
-) -> NTSTATUS {
-    windows_sys::NtWriteFile(
-        filehandle.as_raw_handle(),
-        event,
-        apcroutine,
-        apccontext,
-        iostatusblock,
-        buffer.cast::<c_void>(),
-        length,
-        byteoffset.map(|o| o as *const i64).unwrap_or(ptr::null()),
-        key.map(|k| k as *const u32).unwrap_or(ptr::null()),
-    )
-}
-}
-}
+#[cfg(not(target_vendor = "uwp"))]
+pub const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
 // Use raw-dylib to import ProcessPrng as we can't rely on there being an import library.
-cfg_if::cfg_if! {
-if #[cfg(not(target_vendor = "win7"))] {
-    #[cfg(target_arch = "x86")]
-    #[link(name = "bcryptprimitives", kind = "raw-dylib", import_name_type = "undecorated")]
-    extern "system" {
-        pub fn ProcessPrng(pbdata: *mut u8, cbdata: usize) -> BOOL;
-    }
-    #[cfg(not(target_arch = "x86"))]
-    #[link(name = "bcryptprimitives", kind = "raw-dylib")]
-    extern "system" {
-        pub fn ProcessPrng(pbdata: *mut u8, cbdata: usize) -> BOOL;
-    }
-}}
+#[cfg(not(target_vendor = "win7"))]
+#[cfg_attr(
+    target_arch = "x86",
+    link(name = "bcryptprimitives", kind = "raw-dylib", import_name_type = "undecorated")
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "bcryptprimitives", kind = "raw-dylib"))]
+unsafe extern "system" {
+    pub fn ProcessPrng(pbdata: *mut u8, cbdata: usize) -> BOOL;
+}
+
+windows_targets::link!("ntdll.dll" "system" fn NtCreateNamedPipeFile(
+    filehandle: *mut HANDLE,
+    desiredaccess: FILE_ACCESS_RIGHTS,
+    objectattributes: *const OBJECT_ATTRIBUTES,
+    iostatusblock: *mut IO_STATUS_BLOCK,
+    shareaccess: FILE_SHARE_MODE,
+    createdisposition: NTCREATEFILE_CREATE_DISPOSITION,
+    createoptions: NTCREATEFILE_CREATE_OPTIONS,
+    namedpipetype: u32,
+    readmode: u32,
+    completionmode: u32,
+    maximuminstances: u32,
+    inboundquota: u32,
+    outboundquota: u32,
+    defaulttimeout: *const u64,
+) -> NTSTATUS);
 
 // Functions that aren't available on every version of Windows that we support,
 // but we still use them and just provide some form of a fallback implementation.
@@ -220,26 +134,26 @@ compat_fn_with_fallback! {
     // >= Win10 1607
     // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreaddescription
     pub fn SetThreadDescription(hthread: HANDLE, lpthreaddescription: PCWSTR) -> HRESULT {
-        SetLastError(ERROR_CALL_NOT_IMPLEMENTED as u32); E_NOTIMPL
+        unsafe { SetLastError(ERROR_CALL_NOT_IMPLEMENTED as u32); E_NOTIMPL }
     }
 
     // >= Win10 1607
     // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreaddescription
     pub fn GetThreadDescription(hthread: HANDLE, lpthreaddescription: *mut PWSTR) -> HRESULT {
-        SetLastError(ERROR_CALL_NOT_IMPLEMENTED as u32); E_NOTIMPL
+        unsafe { SetLastError(ERROR_CALL_NOT_IMPLEMENTED as u32); E_NOTIMPL }
     }
 
     // >= Win8 / Server 2012
     // https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimepreciseasfiletime
     #[cfg(target_vendor = "win7")]
     pub fn GetSystemTimePreciseAsFileTime(lpsystemtimeasfiletime: *mut FILETIME) -> () {
-        GetSystemTimeAsFileTime(lpsystemtimeasfiletime)
+        unsafe { GetSystemTimeAsFileTime(lpsystemtimeasfiletime) }
     }
 
     // >= Win11 / Server 2022
     // https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppath2a
     pub fn GetTempPath2W(bufferlength: u32, buffer: PWSTR) -> u32 {
-        GetTempPathW(bufferlength, buffer)
+        unsafe {  GetTempPathW(bufferlength, buffer) }
     }
 }
 
@@ -257,7 +171,7 @@ compat_fn_with_fallback! {
     not(target_arch = "x86"),
     link(name = "api-ms-win-core-synch-l1-2-0", kind = "raw-dylib")
 )]
-extern "system" {
+unsafe extern "system" {
     pub fn WaitOnAddress(
         address: *const c_void,
         compareaddress: *const c_void,
@@ -268,19 +182,19 @@ extern "system" {
     pub fn WakeByAddressAll(address: *const c_void);
 }
 
+// These are loaded by `load_synch_functions`.
 #[cfg(target_vendor = "win7")]
 compat_fn_optional! {
-    crate::sys::compat::load_synch_functions();
     pub fn WaitOnAddress(
-        address: *const ::core::ffi::c_void,
-        compareaddress: *const ::core::ffi::c_void,
+        address: *const c_void,
+        compareaddress: *const c_void,
         addresssize: usize,
         dwmilliseconds: u32
     ) -> BOOL;
-    pub fn WakeByAddressSingle(address: *const ::core::ffi::c_void);
+    pub fn WakeByAddressSingle(address: *const c_void);
 }
 
-#[cfg(any(target_vendor = "win7", target_vendor = "uwp"))]
+#[cfg(any(target_vendor = "win7"))]
 compat_fn_with_fallback! {
     pub static NTDLL: &CStr = c"ntdll";
 
@@ -297,7 +211,7 @@ compat_fn_with_fallback! {
     pub fn NtReleaseKeyedEvent(
         EventHandle: HANDLE,
         Key: *const c_void,
-        Alertable: BOOLEAN,
+        Alertable: bool,
         Timeout: *mut i64
     ) -> NTSTATUS {
         panic!("keyed events not available")
@@ -306,100 +220,20 @@ compat_fn_with_fallback! {
     pub fn NtWaitForKeyedEvent(
         EventHandle: HANDLE,
         Key: *const c_void,
-        Alertable: BOOLEAN,
+        Alertable: bool,
         Timeout: *mut i64
     ) -> NTSTATUS {
         panic!("keyed events not available")
     }
-
-    // These functions are available on UWP when lazily loaded. They will fail WACK if loaded statically.
-    #[cfg(target_vendor = "uwp")]
-    pub fn NtCreateFile(
-        filehandle: *mut HANDLE,
-        desiredaccess: FILE_ACCESS_RIGHTS,
-        objectattributes: *const OBJECT_ATTRIBUTES,
-        iostatusblock: *mut IO_STATUS_BLOCK,
-        allocationsize: *const i64,
-        fileattributes: FILE_FLAGS_AND_ATTRIBUTES,
-        shareaccess: FILE_SHARE_MODE,
-        createdisposition: NTCREATEFILE_CREATE_DISPOSITION,
-        createoptions: NTCREATEFILE_CREATE_OPTIONS,
-        eabuffer: *const ::core::ffi::c_void,
-        ealength: u32
-    ) -> NTSTATUS {
-        STATUS_NOT_IMPLEMENTED
-    }
-    #[cfg(target_vendor = "uwp")]
-    pub fn NtReadFile(
-        filehandle: BorrowedHandle<'_>,
-        event: HANDLE,
-        apcroutine: PIO_APC_ROUTINE,
-        apccontext: *mut c_void,
-        iostatusblock: &mut IO_STATUS_BLOCK,
-        buffer: *mut crate::mem::MaybeUninit<u8>,
-        length: u32,
-        byteoffset: Option<&i64>,
-        key: Option<&u32>
-    ) -> NTSTATUS {
-        STATUS_NOT_IMPLEMENTED
-    }
-    #[cfg(target_vendor = "uwp")]
-    pub fn NtWriteFile(
-        filehandle: BorrowedHandle<'_>,
-        event: HANDLE,
-        apcroutine: PIO_APC_ROUTINE,
-        apccontext: *mut c_void,
-        iostatusblock: &mut IO_STATUS_BLOCK,
-        buffer: *const u8,
-        length: u32,
-        byteoffset: Option<&i64>,
-        key: Option<&u32>
-    ) -> NTSTATUS {
-        STATUS_NOT_IMPLEMENTED
-    }
-    #[cfg(target_vendor = "uwp")]
-    pub fn RtlNtStatusToDosError(Status: NTSTATUS) -> u32 {
-        Status as u32
-    }
 }
 
-// # Arm32 shim
-//
-// AddVectoredExceptionHandler and WSAStartup use platform-specific types.
-// However, Microsoft no longer supports thumbv7a so definitions for those targets
-// are not included in the win32 metadata. We work around that by defining them here.
-//
-// Where possible, these definitions should be kept in sync with https://docs.rs/windows-sys
-cfg_if::cfg_if! {
-if #[cfg(not(target_vendor = "uwp"))] {
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn AddVectoredExceptionHandler(
-            first: u32,
-            handler: PVECTORED_EXCEPTION_HANDLER,
-        ) -> *mut c_void;
+cfg_select! {
+    target_vendor = "uwp" => {
+        windows_targets::link_raw_dylib!("ntdll.dll" "system" fn NtCreateFile(filehandle : *mut HANDLE, desiredaccess : FILE_ACCESS_RIGHTS, objectattributes : *const OBJECT_ATTRIBUTES, iostatusblock : *mut IO_STATUS_BLOCK, allocationsize : *const i64, fileattributes : FILE_FLAGS_AND_ATTRIBUTES, shareaccess : FILE_SHARE_MODE, createdisposition : NTCREATEFILE_CREATE_DISPOSITION, createoptions : NTCREATEFILE_CREATE_OPTIONS, eabuffer : *const core::ffi::c_void, ealength : u32) -> NTSTATUS);
+        windows_targets::link_raw_dylib!("ntdll.dll" "system" fn NtOpenFile(filehandle : *mut HANDLE, desiredaccess : u32, objectattributes : *const OBJECT_ATTRIBUTES, iostatusblock : *mut IO_STATUS_BLOCK, shareaccess : u32, openoptions : u32) -> NTSTATUS);
+        windows_targets::link_raw_dylib!("ntdll.dll" "system" fn NtReadFile(filehandle : HANDLE, event : HANDLE, apcroutine : PIO_APC_ROUTINE, apccontext : *const core::ffi::c_void, iostatusblock : *mut IO_STATUS_BLOCK, buffer : *mut core::ffi::c_void, length : u32, byteoffset : *const i64, key : *const u32) -> NTSTATUS);
+        windows_targets::link_raw_dylib!("ntdll.dll" "system" fn NtWriteFile(filehandle : HANDLE, event : HANDLE, apcroutine : PIO_APC_ROUTINE, apccontext : *const core::ffi::c_void, iostatusblock : *mut IO_STATUS_BLOCK, buffer : *const core::ffi::c_void, length : u32, byteoffset : *const i64, key : *const u32) -> NTSTATUS);
+        windows_targets::link_raw_dylib!("ntdll.dll" "system" fn RtlNtStatusToDosError(status : NTSTATUS) -> u32);
     }
-    pub type PVECTORED_EXCEPTION_HANDLER = Option<
-        unsafe extern "system" fn(exceptioninfo: *mut EXCEPTION_POINTERS) -> i32,
-    >;
-    #[repr(C)]
-    pub struct EXCEPTION_POINTERS {
-        pub ExceptionRecord: *mut EXCEPTION_RECORD,
-        pub ContextRecord: *mut CONTEXT,
-    }
-    #[cfg(target_arch = "arm")]
-    pub enum CONTEXT {}
-}}
-// WSAStartup is only redefined here so that we can override WSADATA for Arm32
-windows_targets::link!("ws2_32.dll" "system" fn WSAStartup(wversionrequested: u16, lpwsadata: *mut WSADATA) -> i32);
-#[cfg(target_arch = "arm")]
-#[repr(C)]
-pub struct WSADATA {
-    pub wVersion: u16,
-    pub wHighVersion: u16,
-    pub szDescription: [u8; 257],
-    pub szSystemStatus: [u8; 129],
-    pub iMaxSockets: u16,
-    pub iMaxUdpDg: u16,
-    pub lpVendorInfo: PSTR,
+    _ => {}
 }

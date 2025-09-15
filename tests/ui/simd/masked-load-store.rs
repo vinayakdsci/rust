@@ -1,27 +1,22 @@
+//@ ignore-backends: gcc
 //@ run-pass
-#![feature(repr_simd, intrinsics)]
+#![feature(repr_simd, core_intrinsics)]
 
-extern "rust-intrinsic" {
-    fn simd_masked_load<M, P, T>(mask: M, pointer: P, values: T) -> T;
-    fn simd_masked_store<M, P, T>(mask: M, pointer: P, values: T) -> ();
-}
+#[path = "../../auxiliary/minisimd.rs"]
+mod minisimd;
+use minisimd::*;
 
-#[derive(Copy, Clone)]
-#[repr(simd)]
-struct Simd<T, const N: usize>([T; N]);
+use std::intrinsics::simd::{simd_masked_load, simd_masked_store};
 
 fn main() {
     unsafe {
         let a = Simd::<u8, 4>([0, 1, 2, 3]);
         let b_src = [4u8, 5, 6, 7];
         let b_default = Simd::<u8, 4>([9; 4]);
-        let b: Simd::<u8, 4> = simd_masked_load(
-            Simd::<i8, 4>([-1, 0, -1, -1]),
-            b_src.as_ptr(),
-            b_default
-        );
+        let b: Simd<u8, 4> =
+            simd_masked_load(Simd::<i8, 4>([-1, 0, -1, -1]), b_src.as_ptr(), b_default);
 
-        assert_eq!(&b.0, &[4, 9, 6, 7]);
+        assert_eq!(b.as_array(), &[4, 9, 6, 7]);
 
         let mut output = [u8::MAX; 5];
 

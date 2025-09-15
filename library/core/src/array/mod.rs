@@ -2,7 +2,7 @@
 //!
 //! *[See also the array primitive type](array).*
 
-#![stable(feature = "core_array", since = "1.36.0")]
+#![stable(feature = "core_array", since = "1.35.0")]
 
 use crate::borrow::{Borrow, BorrowMut};
 use crate::cmp::Ordering;
@@ -10,11 +10,13 @@ use crate::convert::Infallible;
 use crate::error::Error;
 use crate::fmt;
 use crate::hash::{self, Hash};
-use crate::iter::{repeat_n, UncheckedIterator};
+use crate::intrinsics::transmute_unchecked;
+use crate::iter::{UncheckedIterator, repeat_n};
 use crate::mem::{self, MaybeUninit};
 use crate::ops::{
     ChangeOutputType, ControlFlow, FromResidual, Index, IndexMut, NeverShortCircuit, Residual, Try,
 };
+use crate::ptr::{null, null_mut};
 use crate::slice::{Iter, IterMut};
 
 mod ascii;
@@ -23,7 +25,6 @@ mod equality;
 mod iter;
 
 pub(crate) use drain::drain_array_with;
-
 #[stable(feature = "array_value_iter", since = "1.51.0")]
 pub use iter::IntoIter;
 
@@ -38,10 +39,8 @@ pub use iter::IntoIter;
 ///
 /// # Example
 ///
-/// Creating muliple copies of a `String`:
+/// Creating multiple copies of a `String`:
 /// ```rust
-/// #![feature(array_repeat)]
-///
 /// use std::array;
 ///
 /// let string = "Hello there!".to_string();
@@ -49,17 +48,22 @@ pub use iter::IntoIter;
 /// assert_eq!(strings, ["Hello there!", "Hello there!"]);
 /// ```
 #[inline]
-#[unstable(feature = "array_repeat", issue = "126695")]
+#[must_use = "cloning is often expensive and is not expected to have side effects"]
+#[stable(feature = "array_repeat", since = "CURRENT_RUSTC_VERSION")]
 pub fn repeat<T: Clone, const N: usize>(val: T) -> [T; N] {
     from_trusted_iterator(repeat_n(val, N))
 }
 
-/// Creates an array of type [T; N], where each element `T` is the returned value from `cb`
-/// using that element's index.
+/// Creates an array where each element is produced by calling `f` with
+/// that element's index while walking forward through the array.
 ///
-/// # Arguments
+/// This is essentially the same as writing
+/// ```text
+/// [f(0), f(1), f(2), …, f(N - 2), f(N - 1)]
+/// ```
+/// and is similar to `(0..i).map(f)`, just for arrays not iterators.
 ///
-/// * `cb`: Callback where the passed argument is the current array index.
+/// If `N == 0`, this produces an empty array without ever calling `f`.
 ///
 /// # Example
 ///
@@ -81,13 +85,30 @@ pub fn repeat<T: Clone, const N: usize>(val: T) -> [T; N] {
 /// // indexes are:       0     1      2     3      4
 /// assert_eq!(bool_arr, [true, false, true, false, true]);
 /// ```
+///
+/// You can also capture things, for example to create an array full of clones
+/// where you can't just use `[item; N]` because it's not `Copy`:
+/// ```
+/// # // TBH `array::repeat` would be better for this, but it's not stable yet.
+/// let my_string = String::from("Hello");
+/// let clones: [String; 42] = std::array::from_fn(|_| my_string.clone());
+/// assert!(clones.iter().all(|x| *x == my_string));
+/// ```
+///
+/// The array is generated in ascending index order, starting from the front
+/// and going towards the back, so you can use closures with mutable state:
+/// ```
+/// let mut state = 1;
+/// let a = std::array::from_fn(|_| { let x = state; state *= 2; x });
+/// assert_eq!(a, [1, 2, 4, 8, 16, 32]);
+/// ```
 #[inline]
 #[stable(feature = "array_from_fn", since = "1.63.0")]
-pub fn from_fn<T, const N: usize, F>(cb: F) -> [T; N]
+pub fn from_fn<T, const N: usize, F>(f: F) -> [T; N]
 where
     F: FnMut(usize) -> T,
 {
-    try_from_fn(NeverShortCircuit::wrap_mut_1(cb)).0
+    try_from_fn(NeverShortCircuit::wrap_mut_1(f)).0
 }
 
 /// Creates an array `[T; N]` where each fallible array element `T` is returned by the `cb` call.
@@ -147,7 +168,7 @@ pub const fn from_ref<T>(s: &T) -> &[T; 1] {
 
 /// Converts a mutable reference to `T` into a mutable reference to an array of length 1 (without copying).
 #[stable(feature = "array_from_ref", since = "1.53.0")]
-#[rustc_const_unstable(feature = "const_array_from_ref", issue = "90206")]
+#[rustc_const_stable(feature = "const_array_from_ref", since = "1.83.0")]
 pub const fn from_mut<T>(s: &mut T) -> &mut [T; 1] {
     // SAFETY: Converting `&mut T` to `&mut [T; 1]` is sound.
     unsafe { &mut *(s as *mut T).cast::<[T; 1]>() }
@@ -158,32 +179,28 @@ pub const fn from_mut<T>(s: &mut T) -> &mut [T; 1] {
 #[derive(Debug, Copy, Clone)]
 pub struct TryFromSliceError(());
 
-#[stable(feature = "core_array", since = "1.36.0")]
+#[stable(feature = "core_array", since = "1.35.0")]
 impl fmt::Display for TryFromSliceError {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[allow(deprecated)]
-        self.description().fmt(f)
+        "could not convert slice to array".fmt(f)
     }
 }
 
 #[stable(feature = "try_from", since = "1.34.0")]
-impl Error for TryFromSliceError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "could not convert slice to array"
-    }
-}
+impl Error for TryFromSliceError {}
 
 #[stable(feature = "try_from_slice_error", since = "1.36.0")]
-impl From<Infallible> for TryFromSliceError {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl const From<Infallible> for TryFromSliceError {
     fn from(x: Infallible) -> TryFromSliceError {
         match x {}
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T, const N: usize> AsRef<[T]> for [T; N] {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<T, const N: usize> const AsRef<[T]> for [T; N] {
     #[inline]
     fn as_ref(&self) -> &[T] {
         &self[..]
@@ -191,7 +208,8 @@ impl<T, const N: usize> AsRef<[T]> for [T; N] {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T, const N: usize> AsMut<[T]> for [T; N] {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<T, const N: usize> const AsMut<[T]> for [T; N] {
     #[inline]
     fn as_mut(&mut self) -> &mut [T] {
         &mut self[..]
@@ -199,21 +217,23 @@ impl<T, const N: usize> AsMut<[T]> for [T; N] {
 }
 
 #[stable(feature = "array_borrow", since = "1.4.0")]
-impl<T, const N: usize> Borrow<[T]> for [T; N] {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<T, const N: usize> const Borrow<[T]> for [T; N] {
     fn borrow(&self) -> &[T] {
         self
     }
 }
 
 #[stable(feature = "array_borrow", since = "1.4.0")]
-impl<T, const N: usize> BorrowMut<[T]> for [T; N] {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<T, const N: usize> const BorrowMut<[T]> for [T; N] {
     fn borrow_mut(&mut self) -> &mut [T] {
         self
     }
 }
 
-/// Tries to create an array `[T; N]` by copying from a slice `&[T]`. Succeeds if
-/// `slice.len() == N`.
+/// Tries to create an array `[T; N]` by copying from a slice `&[T]`.
+/// Succeeds if `slice.len() == N`.
 ///
 /// ```
 /// let bytes: [u8; 3] = [1, 0, 2];
@@ -225,7 +245,8 @@ impl<T, const N: usize> BorrowMut<[T]> for [T; N] {
 /// assert_eq!(512, u16::from_le_bytes(bytes_tail));
 /// ```
 #[stable(feature = "try_from", since = "1.34.0")]
-impl<T, const N: usize> TryFrom<&[T]> for [T; N]
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<T, const N: usize> const TryFrom<&[T]> for [T; N]
 where
     T: Copy,
 {
@@ -250,7 +271,8 @@ where
 /// assert_eq!(512, u16::from_le_bytes(bytes_tail));
 /// ```
 #[stable(feature = "try_from_mut_slice_to_array", since = "1.59.0")]
-impl<T, const N: usize> TryFrom<&mut [T]> for [T; N]
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<T, const N: usize> const TryFrom<&mut [T]> for [T; N]
 where
     T: Copy,
 {
@@ -275,18 +297,13 @@ where
 /// assert_eq!(512, u16::from_le_bytes(*bytes_tail));
 /// ```
 #[stable(feature = "try_from", since = "1.34.0")]
-impl<'a, T, const N: usize> TryFrom<&'a [T]> for &'a [T; N] {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<'a, T, const N: usize> const TryFrom<&'a [T]> for &'a [T; N] {
     type Error = TryFromSliceError;
 
     #[inline]
     fn try_from(slice: &'a [T]) -> Result<&'a [T; N], TryFromSliceError> {
-        if slice.len() == N {
-            let ptr = slice.as_ptr() as *const [T; N];
-            // SAFETY: ok because we just checked that the length fits
-            unsafe { Ok(&*ptr) }
-        } else {
-            Err(TryFromSliceError(()))
-        }
+        slice.as_array().ok_or(TryFromSliceError(()))
     }
 }
 
@@ -303,18 +320,13 @@ impl<'a, T, const N: usize> TryFrom<&'a [T]> for &'a [T; N] {
 /// assert_eq!(512, u16::from_le_bytes(*bytes_tail));
 /// ```
 #[stable(feature = "try_from", since = "1.34.0")]
-impl<'a, T, const N: usize> TryFrom<&'a mut [T]> for &'a mut [T; N] {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<'a, T, const N: usize> const TryFrom<&'a mut [T]> for &'a mut [T; N] {
     type Error = TryFromSliceError;
 
     #[inline]
     fn try_from(slice: &'a mut [T]) -> Result<&'a mut [T; N], TryFromSliceError> {
-        if slice.len() == N {
-            let ptr = slice.as_mut_ptr() as *mut [T; N];
-            // SAFETY: ok because we just checked that the length fits
-            unsafe { Ok(&mut *ptr) }
-        } else {
-            Err(TryFromSliceError(()))
-        }
+        slice.as_mut_array().ok_or(TryFromSliceError(()))
     }
 }
 
@@ -364,9 +376,10 @@ impl<'a, T, const N: usize> IntoIterator for &'a mut [T; N] {
 }
 
 #[stable(feature = "index_trait_on_arrays", since = "1.50.0")]
-impl<T, I, const N: usize> Index<I> for [T; N]
+#[rustc_const_unstable(feature = "const_index", issue = "143775")]
+impl<T, I, const N: usize> const Index<I> for [T; N]
 where
-    [T]: Index<I>,
+    [T]: [const] Index<I>,
 {
     type Output = <[T] as Index<I>>::Output;
 
@@ -377,9 +390,10 @@ where
 }
 
 #[stable(feature = "index_trait_on_arrays", since = "1.50.0")]
-impl<T, I, const N: usize> IndexMut<I> for [T; N]
+#[rustc_const_unstable(feature = "const_index", issue = "143775")]
+impl<T, I, const N: usize> const IndexMut<I> for [T; N]
 where
-    [T]: IndexMut<I>,
+    [T]: [const] IndexMut<I>,
 {
     #[inline]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
@@ -521,6 +535,7 @@ impl<T, const N: usize> [T; N] {
     /// let y = x.map(|v| v.len());
     /// assert_eq!(y, [6, 9, 3, 3]);
     /// ```
+    #[must_use]
     #[stable(feature = "array_map", since = "1.55.0")]
     pub fn map<F, U>(self, f: F) -> [U; N]
     where
@@ -577,7 +592,8 @@ impl<T, const N: usize> [T; N] {
     /// Returns a mutable slice containing the entire array. Equivalent to
     /// `&mut s[..]`.
     #[stable(feature = "array_as_slice", since = "1.57.0")]
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    #[rustc_const_stable(feature = "const_array_as_mut_slice", since = "1.89.0")]
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
         self
     }
 
@@ -606,8 +622,20 @@ impl<T, const N: usize> [T; N] {
     /// assert_eq!(strings.len(), 3);
     /// ```
     #[stable(feature = "array_methods", since = "1.77.0")]
-    pub fn each_ref(&self) -> [&T; N] {
-        from_trusted_iterator(self.iter())
+    #[rustc_const_stable(feature = "const_array_each_ref", since = "CURRENT_RUSTC_VERSION")]
+    pub const fn each_ref(&self) -> [&T; N] {
+        let mut buf = [null::<T>(); N];
+
+        // FIXME(const_trait_impl): We would like to simply use iterators for this (as in the original implementation), but this is not allowed in constant expressions.
+        let mut i = 0;
+        while i < N {
+            buf[i] = &raw const self[i];
+
+            i += 1;
+        }
+
+        // SAFETY: `*const T` has the same layout as `&T`, and we've also initialised each pointer as a valid reference.
+        unsafe { transmute_unchecked(buf) }
     }
 
     /// Borrows each element mutably and returns an array of mutable references
@@ -625,8 +653,20 @@ impl<T, const N: usize> [T; N] {
     /// assert_eq!(floats, [0.0, 2.7, -1.0]);
     /// ```
     #[stable(feature = "array_methods", since = "1.77.0")]
-    pub fn each_mut(&mut self) -> [&mut T; N] {
-        from_trusted_iterator(self.iter_mut())
+    #[rustc_const_stable(feature = "const_array_each_ref", since = "CURRENT_RUSTC_VERSION")]
+    pub const fn each_mut(&mut self) -> [&mut T; N] {
+        let mut buf = [null_mut::<T>(); N];
+
+        // FIXME(const_trait_impl): We would like to simply use iterators for this (as in the original implementation), but this is not allowed in constant expressions.
+        let mut i = 0;
+        while i < N {
+            buf[i] = &raw mut self[i];
+
+            i += 1;
+        }
+
+        // SAFETY: `*mut T` has the same layout as `&mut T`, and we've also initialised each pointer as a valid reference.
+        unsafe { transmute_unchecked(buf) }
     }
 
     /// Divides one array reference into two at an index.
@@ -671,7 +711,7 @@ impl<T, const N: usize> [T; N] {
     )]
     #[inline]
     pub fn split_array_ref<const M: usize>(&self) -> (&[T; M], &[T]) {
-        (&self[..]).split_first_chunk::<M>().unwrap()
+        self.split_first_chunk::<M>().unwrap()
     }
 
     /// Divides one mutable array reference into two at an index.
@@ -704,7 +744,7 @@ impl<T, const N: usize> [T; N] {
     )]
     #[inline]
     pub fn split_array_mut<const M: usize>(&mut self) -> (&mut [T; M], &mut [T]) {
-        (&mut self[..]).split_first_chunk_mut::<M>().unwrap()
+        self.split_first_chunk_mut::<M>().unwrap()
     }
 
     /// Divides one array reference into two at an index from the end.
@@ -749,7 +789,7 @@ impl<T, const N: usize> [T; N] {
     )]
     #[inline]
     pub fn rsplit_array_ref<const M: usize>(&self) -> (&[T], &[T; M]) {
-        (&self[..]).split_last_chunk::<M>().unwrap()
+        self.split_last_chunk::<M>().unwrap()
     }
 
     /// Divides one mutable array reference into two at an index from the end.
@@ -782,7 +822,7 @@ impl<T, const N: usize> [T; N] {
     )]
     #[inline]
     pub fn rsplit_array_mut<const M: usize>(&mut self) -> (&mut [T], &mut [T; M]) {
-        (&mut self[..]).split_last_chunk_mut::<M>().unwrap()
+        self.split_last_chunk_mut::<M>().unwrap()
     }
 }
 
@@ -878,7 +918,7 @@ impl<T> Guard<'_, T> {
     ///
     /// No more than N elements must be initialized.
     #[inline]
-    pub unsafe fn push_unchecked(&mut self, item: T) {
+    pub(crate) unsafe fn push_unchecked(&mut self, item: T) {
         // SAFETY: If `initialized` was correct before and the caller does not
         // invoke this method more than N times then writes will be in-bounds
         // and slots will not be initialized more than once.
@@ -890,14 +930,13 @@ impl<T> Guard<'_, T> {
 }
 
 impl<T> Drop for Guard<'_, T> {
+    #[inline]
     fn drop(&mut self) {
         debug_assert!(self.initialized <= self.array_mut.len());
 
         // SAFETY: this slice will contain only initialized objects.
         unsafe {
-            crate::ptr::drop_in_place(MaybeUninit::slice_assume_init_mut(
-                self.array_mut.get_unchecked_mut(..self.initialized),
-            ));
+            self.array_mut.get_unchecked_mut(..self.initialized).assume_init_drop();
         }
     }
 }

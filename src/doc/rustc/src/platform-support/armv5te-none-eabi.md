@@ -1,6 +1,7 @@
 # `armv5te-none-eabi`
 
-**Tier: 3**
+* **Tier: 3**
+* **Library Support:** core and alloc (bare-metal, `#![no_std]`)
 
 Bare-metal target for any cpu in the Armv5TE architecture family, supporting
 ARM/Thumb code interworking (aka `A32`/`T32`), with `A32` code as the default code
@@ -13,7 +14,7 @@ See [`arm-none-eabi`](arm-none-eabi.md) for information applicable to all
 
 ## Target Maintainers
 
-* [@QuinnPainter](https://github.com/QuinnPainter)
+[@QuinnPainter](https://github.com/QuinnPainter)
 
 ## Testing
 

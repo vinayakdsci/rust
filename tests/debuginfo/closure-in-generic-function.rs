@@ -1,6 +1,5 @@
-//@ min-lldb-version: 310
-
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
@@ -24,23 +23,16 @@
 // lldb-command:run
 
 // lldb-command:v x
-// lldbg-check:[...] 0.5
-// lldbr-check:(f64) x = 0.5
+// lldb-check:[...] 0.5
 // lldb-command:v y
-// lldbg-check:[...] 10
-// lldbr-check:(i32) y = 10
+// lldb-check:[...] 10
 // lldb-command:continue
 
 // lldb-command:v *x
-// lldbg-check:[...] 29
-// lldbr-check:(i32) *x = 29
+// lldb-check:[...] 29
 // lldb-command:v *y
-// lldbg-check:[...] 110
-// lldbr-check:(i32) *y = 110
+// lldb-check:[...] 110
 // lldb-command:continue
-
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 fn some_generic_fun<T1, T2>(a: T1, b: T2) -> (T2, T1) {
 

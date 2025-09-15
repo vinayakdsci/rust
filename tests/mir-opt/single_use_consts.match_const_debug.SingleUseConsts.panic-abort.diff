@@ -20,8 +20,8 @@
   
       bb1: {
           StorageDead(_2);
--         switchInt(_1) -> [7: bb3, 42: bb4, otherwise: bb2];
-+         switchInt(const <T as MyTrait>::ASSOC_INT) -> [7: bb3, 42: bb4, otherwise: bb2];
+-         switchInt(copy _1) -> [7: bb4, 42: bb3, otherwise: bb2];
++         switchInt(const <T as MyTrait>::ASSOC_INT) -> [7: bb4, 42: bb3, otherwise: bb2];
       }
   
       bb2: {
@@ -30,12 +30,12 @@
       }
   
       bb3: {
-          _0 = const "hello";
+          _0 = const "towel";
           goto -> bb5;
       }
   
       bb4: {
-          _0 = const "towel";
+          _0 = const "hello";
           goto -> bb5;
       }
   
@@ -43,5 +43,17 @@
           StorageDead(_1);
           return;
       }
+  }
+  
+  ALLOC0 (size: 5, align: 1) {
+      77 6f 72 6c 64                                  │ world
+  }
+  
+  ALLOC1 (size: 5, align: 1) {
+      74 6f 77 65 6c                                  │ towel
+  }
+  
+  ALLOC2 (size: 5, align: 1) {
+      68 65 6c 6c 6f                                  │ hello
   }
   

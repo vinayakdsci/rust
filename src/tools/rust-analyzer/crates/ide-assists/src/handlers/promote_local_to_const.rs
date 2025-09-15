@@ -1,19 +1,14 @@
-use hir::{HirDisplay, ModuleDef, PathResolution, Semantics};
-use ide_db::{
-    assists::{AssistId, AssistKind},
-    defs::Definition,
-    syntax_helpers::node_ext::preorder_expr,
-    RootDatabase,
-};
+use hir::HirDisplay;
+use ide_db::{assists::AssistId, defs::Definition};
 use stdx::to_upper_snake_case;
 use syntax::{
-    ast::{self, make, HasName},
-    ted, AstNode, WalkEvent,
+    AstNode,
+    ast::{self, HasName, syntax_factory::SyntaxFactory},
 };
 
 use crate::{
     assist_context::{AssistContext, Assists},
-    utils,
+    utils::{self},
 };
 
 // Assist: promote_local_to_const
@@ -63,25 +58,28 @@ pub(crate) fn promote_local_to_const(acc: &mut Assists, ctx: &AssistContext<'_>)
     };
 
     let initializer = let_stmt.initializer()?;
-    if !is_body_const(&ctx.sema, &initializer) {
+    if !utils::is_body_const(&ctx.sema, &initializer) {
         cov_mark::hit!(promote_local_non_const);
         return None;
     }
 
     acc.add(
-        AssistId("promote_local_to_const", AssistKind::Refactor),
+        AssistId::refactor("promote_local_to_const"),
         "Promote local to constant",
         let_stmt.syntax().text_range(),
         |edit| {
+            let make = SyntaxFactory::with_mappings();
+            let mut editor = edit.make_editor(let_stmt.syntax());
             let name = to_upper_snake_case(&name.to_string());
             let usages = Definition::Local(local).usages(&ctx.sema).all();
             if let Some(usages) = usages.references.get(&ctx.file_id()) {
-                let name_ref = make::name_ref(&name);
+                let name_ref = make.name_ref(&name);
 
                 for usage in usages {
                     let Some(usage_name) = usage.name.as_name_ref().cloned() else { continue };
                     if let Some(record_field) = ast::RecordExprField::for_name_ref(&usage_name) {
-                        let name_expr = make::expr_path(make::path_from_text(&name));
+                        let path = make.ident_path(&name);
+                        let name_expr = make.expr_path(path);
                         utils::replace_record_field_expr(ctx, edit, record_field, name_expr);
                     } else {
                         let usage_range = usage.range;
@@ -90,51 +88,19 @@ pub(crate) fn promote_local_to_const(acc: &mut Assists, ctx: &AssistContext<'_>)
                 }
             }
 
-            let item = make::item_const(None, make::name(&name), make::ty(&ty), initializer)
-                .clone_for_update();
-            let let_stmt = edit.make_mut(let_stmt);
+            let item = make.item_const(None, make.name(&name), make.ty(&ty), initializer);
 
             if let Some((cap, name)) = ctx.config.snippet_cap.zip(item.name()) {
-                edit.add_tabstop_before(cap, name);
+                let tabstop = edit.make_tabstop_before(cap);
+                editor.add_annotation(name.syntax().clone(), tabstop);
             }
 
-            ted::replace(let_stmt.syntax(), item.syntax());
+            editor.replace(let_stmt.syntax(), item.syntax());
+
+            editor.add_mappings(make.finish_with_mappings());
+            edit.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
-}
-
-fn is_body_const(sema: &Semantics<'_, RootDatabase>, expr: &ast::Expr) -> bool {
-    let mut is_const = true;
-    preorder_expr(expr, &mut |ev| {
-        let expr = match ev {
-            WalkEvent::Enter(_) if !is_const => return true,
-            WalkEvent::Enter(expr) => expr,
-            WalkEvent::Leave(_) => return false,
-        };
-        match expr {
-            ast::Expr::CallExpr(call) => {
-                if let Some(ast::Expr::PathExpr(path_expr)) = call.expr() {
-                    if let Some(PathResolution::Def(ModuleDef::Function(func))) =
-                        path_expr.path().and_then(|path| sema.resolve_path(&path))
-                    {
-                        is_const &= func.is_const(sema.db);
-                    }
-                }
-            }
-            ast::Expr::MethodCallExpr(call) => {
-                is_const &=
-                    sema.resolve_method_call(&call).map(|it| it.is_const(sema.db)).unwrap_or(true)
-            }
-            ast::Expr::ForExpr(_)
-            | ast::Expr::ReturnExpr(_)
-            | ast::Expr::TryExpr(_)
-            | ast::Expr::YieldExpr(_)
-            | ast::Expr::AwaitExpr(_) => is_const = false,
-            _ => (),
-        }
-        !is_const
-    });
-    is_const
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ghcr.io/rust-lang/ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -76,8 +76,6 @@ COPY scripts/nodejs.sh /scripts/
 RUN sh /scripts/nodejs.sh /node
 ENV PATH="/node/bin:${PATH}"
 
-COPY host-x86_64/x86_64-gnu-tools/browser-ui-test.version /tmp/
-
 ENV RUST_CONFIGURE_ARGS \
   --build=x86_64-unknown-linux-gnu \
   --save-toolstates=/tmp/toolstate/toolstates.json \
@@ -85,19 +83,12 @@ ENV RUST_CONFIGURE_ARGS \
 
 ENV HOST_TARGET x86_64-unknown-linux-gnu
 
-COPY host-x86_64/dist-x86_64-linux/shared.sh /scripts/
-COPY host-x86_64/dist-x86_64-linux/build-gccjit.sh /scripts/
+# FIXME(#133381): currently rustc alt builds do *not* have rustc debug
+# assertions enabled! Therefore, we cannot force download CI rustc.
+#ENV FORCE_CI_RUSTC 1
 
-RUN /scripts/build-gccjit.sh /scripts
+COPY scripts/shared.sh /scripts/
 
-# For now, we need to use `--unsafe-perm=true` to go around an issue when npm tries
-# to create a new folder. For reference:
-# https://github.com/puppeteer/puppeteer/issues/375
-#
-# We also specify the version in case we need to update it to go around cache limitations.
-#
-# The `browser-ui-test.version` file is also used by bootstrap to emit warnings in case
-# the local version of the package is different than the one used by the CI.
 ENV SCRIPT /tmp/checktools.sh ../x.py && \
-  npm install browser-ui-test@$(head -n 1 /tmp/browser-ui-test.version) --unsafe-perm=true && \
-  python3 ../x.py test tests/rustdoc-gui --stage 2 --test-args "'--no-sandbox --jobs 1'"
+  python3 ../x.py check compiletest --set build.compiletest-use-stage0-libtest=true && \
+  python3 ../x.py test tests/rustdoc-gui --stage 2 --test-args "'--jobs 1'"

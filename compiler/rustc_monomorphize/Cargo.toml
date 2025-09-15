@@ -1,10 +1,11 @@
 [package]
 name = "rustc_monomorphize"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 # tidy-alphabetical-start
+rustc_abi = { path = "../rustc_abi" }
 rustc_data_structures = { path = "../rustc_data_structures" }
 rustc_errors = { path = "../rustc_errors" }
 rustc_fluent_macro = { path = "../rustc_fluent_macro" }

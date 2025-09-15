@@ -1,6 +1,5 @@
-//@ min-lldb-version: 310
-
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
@@ -9,8 +8,7 @@
 // gdb-command:print constant
 // gdb-check:$1 = 1
 // gdb-command:print a_struct
-// gdbg-check:$2 = {a = -2, b = 3.5, c = 4}
-// gdbr-check:$2 = var_captured_in_sendable_closure::Struct {a: -2, b: 3.5, c: 4}
+// gdb-check:$2 = var_captured_in_sendable_closure::Struct {a: -2, b: 3.5, c: 4}
 // gdb-command:print *owned
 // gdb-check:$3 = 5
 // gdb-command:continue
@@ -24,18 +22,13 @@
 // lldb-command:run
 
 // lldb-command:v constant
-// lldbg-check:[...] 1
-// lldbr-check:(isize) constant = 1
+// lldb-check:[...] 1
 // lldb-command:v a_struct
-// lldbg-check:[...] { a = -2 b = 3.5 c = 4 }
-// lldbr-check:(var_captured_in_sendable_closure::Struct) a_struct = { a = -2 b = 3.5 c = 4 }
+// lldb-check:[...] { a = -2 b = 3.5 c = 4 }
 // lldb-command:v *owned
-// lldbg-check:[...] 5
-// lldbr-check:(isize) *owned = 5
+// lldb-check:[...] 5
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 struct Struct {
     a: isize,

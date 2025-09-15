@@ -1,8 +1,6 @@
 //@ edition:2018
 //@ aux-build:edition-kw-macro-2015.rs
 
-#![feature(async_closure)]
-
 fn main() {}
 
 #[macro_use]
@@ -17,8 +15,8 @@ pub fn check_async() {
     let mut r#async = 1; // OK
 
     r#async = consumes_async!(async); // OK
-    r#async = consumes_async!(r#async); //~ ERROR no rules expected the token `r#async`
-    r#async = consumes_async_raw!(async); //~ ERROR no rules expected the token `async`
+    r#async = consumes_async!(r#async); //~ ERROR no rules expected `r#async`
+    r#async = consumes_async_raw!(async); //~ ERROR no rules expected keyword `async`
     r#async = consumes_async_raw!(r#async); // OK
 
     if passes_ident!(async) == 1 {} // FIXME: Edition hygiene bug, async here is 2018 and reserved
@@ -28,5 +26,7 @@ pub fn check_async() {
     module::async(); //~ ERROR expected identifier, found keyword `async`
     module::r#async(); // OK
 
-    let _recovery_witness: () = 0; //~ ERROR mismatched types
+    let _recovery_witness: () = 0; // not emitted because of the macro parsing error
 }
+
+//~? ERROR macro expansion ends with an incomplete expression

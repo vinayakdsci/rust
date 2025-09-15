@@ -4,10 +4,9 @@
     never_type,
     linkage,
     extern_types,
-    naked_functions,
     thread_local,
     repr_simd,
-    raw_ref_op
+    rustc_private
 )]
 #![no_core]
 #![allow(dead_code, non_camel_case_types, internal_features)]
@@ -214,16 +213,17 @@ fn main() {
         assert_eq!(intrinsics::size_of_val(a) as u8, 16);
         assert_eq!(intrinsics::size_of_val(&0u32) as u8, 4);
 
-        assert_eq!(intrinsics::min_align_of::<u16>() as u8, 2);
-        assert_eq!(
-            intrinsics::min_align_of_val(&a) as u8,
-            intrinsics::min_align_of::<&str>() as u8
-        );
+        assert_eq!(intrinsics::align_of::<u16>() as u8, 2);
+        assert_eq!(intrinsics::align_of_val(&a) as u8, intrinsics::align_of::<&str>() as u8);
 
-        assert!(!intrinsics::needs_drop::<u8>());
-        assert!(!intrinsics::needs_drop::<[u8]>());
-        assert!(intrinsics::needs_drop::<NoisyDrop>());
-        assert!(intrinsics::needs_drop::<NoisyDropUnsized>());
+        let u8_needs_drop = const { intrinsics::needs_drop::<u8>() };
+        assert!(!u8_needs_drop);
+        let slice_needs_drop = const { intrinsics::needs_drop::<[u8]>() };
+        assert!(!slice_needs_drop);
+        let noisy_drop = const { intrinsics::needs_drop::<NoisyDrop>() };
+        assert!(noisy_drop);
+        let noisy_unsized_drop = const { intrinsics::needs_drop::<NoisyDropUnsized>() };
+        assert!(noisy_unsized_drop);
 
         Unique { pointer: NonNull(1 as *mut &str), _marker: PhantomData } as Unique<dyn SomeTrait>;
 
@@ -275,7 +275,7 @@ fn main() {
 
     assert_eq!(((|()| 42u8) as fn(()) -> u8)(()), 42);
 
-    #[cfg(not(any(jit, windows)))]
+    #[cfg(not(any(jit, target_vendor = "apple", windows)))]
     {
         extern "C" {
             #[linkage = "extern_weak"]
@@ -348,7 +348,8 @@ fn main() {
     struct V([f64; 2]);
 
     let f = V([0.0, 1.0]);
-    let _a = f.0[0];
+    let fp = (&raw const f) as *const [f64; 2];
+    let _a = (unsafe { &*fp })[0];
 
     stack_val_align();
 }
@@ -388,11 +389,9 @@ global_asm! {
 }
 
 #[cfg(all(not(jit), target_arch = "x86_64"))]
-#[naked]
+#[unsafe(naked)]
 extern "C" fn naked_test() {
-    unsafe {
-        asm!("ret", options(noreturn));
-    }
+    naked_asm!("ret")
 }
 
 #[repr(C)]
@@ -585,6 +584,7 @@ pub enum E2<X> {
     V4,
 }
 
+#[allow(unreachable_patterns)]
 fn check_niche_behavior() {
     if let E1::V2 { .. } = (E1::V1 { f: true }) {
         intrinsics::abort();

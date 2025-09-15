@@ -1,6 +1,8 @@
 //@ revisions: normalize_param_env normalize_obligation hrtb
 //@ check-pass
 //@ compile-flags: -Znext-solver
+#![feature(rustc_attrs)]
+#![rustc_no_implicit_bounds]
 
 trait Foo {
     #[cfg(normalize_param_env)]
@@ -11,10 +13,10 @@ trait Foo {
     type Gat<'b> where for<'a> <Self as MirrorRegion<'a>>::Assoc: 'b;
 }
 
-trait Mirror { type Assoc: ?Sized; }
-impl<T: ?Sized> Mirror for T { type Assoc = T; }
+trait Mirror { type Assoc; }
+impl<T> Mirror for T { type Assoc = T; }
 
-trait MirrorRegion<'a> { type Assoc: ?Sized; }
+trait MirrorRegion<'a> { type Assoc; }
 impl<'a, T> MirrorRegion<'a> for T { type Assoc = T; }
 
 impl<T> Foo for T {

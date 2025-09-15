@@ -1,28 +1,34 @@
-use super::{probe, MethodCallee};
+use std::ops::Deref;
 
-use crate::{callee, FnCtxt};
 use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
 use rustc_hir::GenericArg;
+use rustc_hir::def_id::DefId;
 use rustc_hir_analysis::hir_ty_lowering::generics::{
     check_generic_arg_count_for_call, lower_generic_args,
 };
 use rustc_hir_analysis::hir_ty_lowering::{
-    GenericArgsLowerer, HirTyLowerer, IsMethodCall, RegionInferReason,
+    FeedConstTy, GenericArgsLowerer, HirTyLowerer, IsMethodCall, RegionInferReason,
 };
-use rustc_infer::infer::{self, DefineOpaqueTypes, InferOk};
-use rustc_middle::traits::{ObligationCauseCode, UnifyReceiverContext};
-use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCoercion};
-use rustc_middle::ty::adjustment::{AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
-use rustc_middle::ty::fold::TypeFoldable;
+use rustc_infer::infer::{
+    BoundRegionConversionTime, DefineOpaqueTypes, InferOk, RegionVariableOrigin,
+};
+use rustc_lint::builtin::SUPERTRAIT_ITEM_SHADOWING_USAGE;
+use rustc_middle::traits::ObligationCauseCode;
+use rustc_middle::ty::adjustment::{
+    Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, PointerCoercion,
+};
 use rustc_middle::ty::{
-    self, GenericArgs, GenericArgsRef, GenericParamDefKind, Ty, TyCtxt, UserArgs, UserType,
+    self, GenericArgs, GenericArgsRef, GenericParamDefKind, Ty, TyCtxt, TypeFoldable,
+    TypeVisitableExt, UserArgs,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{DUMMY_SP, Span};
 use rustc_trait_selection::traits;
+use tracing::debug;
 
-use std::ops::Deref;
+use super::{MethodCallee, probe};
+use crate::errors::{SupertraitItemShadowee, SupertraitItemShadower, SupertraitItemShadowing};
+use crate::{FnCtxt, callee};
 
 struct ConfirmContext<'a, 'tcx> {
     fcx: &'a FnCtxt<'a, 'tcx>,
@@ -40,13 +46,13 @@ impl<'a, 'tcx> Deref for ConfirmContext<'a, 'tcx> {
 }
 
 #[derive(Debug)]
-pub struct ConfirmResult<'tcx> {
+pub(crate) struct ConfirmResult<'tcx> {
     pub callee: MethodCallee<'tcx>,
     pub illegal_sized_bound: Option<Span>,
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
-    pub fn confirm_method(
+    pub(crate) fn confirm_method(
         &self,
         span: Span,
         self_expr: &'tcx hir::Expr<'tcx>,
@@ -64,7 +70,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         confirm_cx.confirm(unadjusted_self_ty, pick, segment)
     }
 
-    pub fn confirm_method_for_diagnostic(
+    pub(crate) fn confirm_method_for_diagnostic(
         &self,
         span: Span,
         self_expr: &'tcx hir::Expr<'tcx>,
@@ -110,7 +116,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         // If there is a `Self: Sized` bound and `Self` is a trait object, it is possible that
         // something which derefs to `Self` actually implements the trait and the caller
         // wanted to make a static dispatch on it but forgot to import the trait.
-        // See test `tests/ui/issue-35976.rs`.
+        // See test `tests/ui/issues/issue-35976.rs`.
         //
         // In that case, we'll error anyway, but we'll also re-run the search with all traits
         // in scope, and if we find another method which can be used, we'll output an
@@ -132,33 +138,26 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             "confirm: self_ty={:?} method_sig_rcvr={:?} method_sig={:?} method_predicates={:?}",
             self_ty, method_sig_rcvr, method_sig, method_predicates
         );
-        self.unify_receivers(self_ty, method_sig_rcvr, pick, all_args);
+        self.unify_receivers(self_ty, method_sig_rcvr, pick);
 
         let (method_sig, method_predicates) =
             self.normalize(self.span, (method_sig, method_predicates));
-        let method_sig = ty::Binder::dummy(method_sig);
 
         // Make sure nobody calls `drop()` explicitly.
-        self.enforce_illegal_method_limitations(pick);
+        self.check_for_illegal_method_calls(pick);
+
+        // Lint when an item is shadowing a supertrait item.
+        self.lint_shadowed_supertrait_items(pick, segment);
 
         // Add any trait/regions obligations specified on the method's type parameters.
         // We won't add these if we encountered an illegal sized bound, so that we can use
         // a custom error in that case.
         if illegal_sized_bound.is_none() {
-            self.add_obligations(
-                Ty::new_fn_ptr(self.tcx, method_sig),
-                all_args,
-                method_predicates,
-                pick.item.def_id,
-            );
+            self.add_obligations(method_sig, all_args, method_predicates, pick.item.def_id);
         }
 
         // Create the final `MethodCallee`.
-        let callee = MethodCallee {
-            def_id: pick.item.def_id,
-            args: all_args,
-            sig: method_sig.skip_binder(),
-        };
+        let callee = MethodCallee { def_id: pick.item.def_id, args: all_args, sig: method_sig };
         ConfirmResult { callee, illegal_sized_bound }
     }
 
@@ -187,7 +186,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
         match pick.autoref_or_ptr_adjustment {
             Some(probe::AutorefOrPtrAdjustment::Autoref { mutbl, unsize }) => {
-                let region = self.next_region_var(infer::Autoref(self.span));
+                let region = self.next_region_var(RegionVariableOrigin::Autoref(self.span));
                 // Type we're wrapping in a reference, used later for unsizing
                 let base_ty = target;
 
@@ -197,10 +196,8 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                 // for two-phase borrows.
                 let mutbl = AutoBorrowMutability::new(mutbl, AllowTwoPhase::Yes);
 
-                adjustments.push(Adjustment {
-                    kind: Adjust::Borrow(AutoBorrow::Ref(region, mutbl)),
-                    target,
-                });
+                adjustments
+                    .push(Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(mutbl)), target });
 
                 if unsize {
                     let unsized_ty = if let ty::Array(elem_ty, _) = base_ty.kind() {
@@ -232,6 +229,23 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                     target,
                 });
             }
+
+            Some(probe::AutorefOrPtrAdjustment::ReborrowPin(mutbl)) => {
+                let region = self.next_region_var(RegionVariableOrigin::Autoref(self.span));
+
+                target = match target.kind() {
+                    ty::Adt(pin, args) if self.tcx.is_lang_item(pin.did(), hir::LangItem::Pin) => {
+                        let inner_ty = match args[0].expect_ty().kind() {
+                            ty::Ref(_, ty, _) => *ty,
+                            _ => bug!("Expected a reference type for argument to Pin"),
+                        };
+                        Ty::new_pinned_ref(self.tcx, region, inner_ty, mutbl)
+                    }
+                    _ => bug!("Cannot adjust receiver type for reborrowing pin of {target:?}"),
+                };
+
+                adjustments.push(Adjustment { kind: Adjust::ReborrowPin(mutbl), target });
+            }
             None => {}
         }
 
@@ -246,7 +260,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
     }
 
     /// Returns a set of generic parameters for the method *receiver* where all type and region
-    /// parameters are instantiated with fresh variables. This generic paramters does not include any
+    /// parameters are instantiated with fresh variables. This generic parameters does not include any
     /// parameters declared on the method itself.
     ///
     /// Note that this generic parameters may include late-bound regions from the impl level. If so,
@@ -268,6 +282,25 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
             probe::ObjectPick => {
                 let trait_def_id = pick.item.container_id(self.tcx);
+
+                // If the trait is not object safe (specifically, we care about when
+                // the receiver is not valid), then there's a chance that we will not
+                // actually be able to recover the object by derefing the receiver like
+                // we should if it were valid.
+                if !self.tcx.is_dyn_compatible(trait_def_id) {
+                    return ty::GenericArgs::extend_with_error(self.tcx, trait_def_id, &[]);
+                }
+
+                // This shouldn't happen for non-region error kinds, but may occur
+                // when we have error regions. Specifically, since we canonicalize
+                // during method steps, we may successfully deref when we assemble
+                // the pick, but fail to deref when we try to extract the object
+                // type from the pick during confirmation. This is fine, we're basically
+                // already doomed by this point.
+                if self_ty.references_error() {
+                    return ty::GenericArgs::extend_with_error(self.tcx, trait_def_id, &[]);
+                }
+
                 self.extract_existential_trait_ref(self_ty, |this, object_ty, principal| {
                     // The object data has no entry for the Self
                     // Type. For the purposes of this method call, we
@@ -278,7 +311,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                     // distinct types (e.g., if `Self` appeared as an
                     // argument type), but those cases have already
                     // been ruled out when we deemed the trait to be
-                    // "object safe".
+                    // "dyn-compatible".
                     let original_poly_trait_ref = principal.with_self_ty(this.tcx, object_ty);
                     let upcast_poly_trait_ref = this.upcast(original_poly_trait_ref, trait_def_id);
                     let upcast_trait_ref =
@@ -319,9 +352,17 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         // yield an object-type (e.g., `&Object` or `Box<Object>`
         // etc).
 
-        // FIXME: this feels, like, super dubious
-        self.fcx
-            .autoderef(self.span, self_ty)
+        let mut autoderef = self.fcx.autoderef(self.span, self_ty);
+
+        // We don't need to gate this behind arbitrary self types
+        // per se, but it does make things a bit more gated.
+        if self.tcx.features().arbitrary_self_types()
+            || self.tcx.features().arbitrary_self_types_pointers()
+        {
+            autoderef = autoderef.use_receiver_trait();
+        }
+
+        autoderef
             .include_raw_pointers()
             .find_map(|(ty, _)| match ty.kind() {
                 ty::Dynamic(data, ..) => Some(closure(
@@ -361,7 +402,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             IsMethodCall::Yes,
         );
 
-        // Create generic paramters for early-bound lifetime parameters,
+        // Create generic parameters for early-bound lifetime parameters,
         // combining parameters from the type and those from the method.
         assert_eq!(generics.parent_count, parent_args.len());
 
@@ -385,7 +426,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
             fn provided_kind(
                 &mut self,
-                _preceding_args: &[ty::GenericArg<'tcx>],
+                preceding_args: &[ty::GenericArg<'tcx>],
                 param: &ty::GenericParamDef,
                 arg: &GenericArg<'tcx>,
             ) -> ty::GenericArg<'tcx> {
@@ -397,14 +438,20 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                         .lower_lifetime(lt, RegionInferReason::Param(param))
                         .into(),
                     (GenericParamDefKind::Type { .. }, GenericArg::Type(ty)) => {
-                        self.cfcx.lower_ty(ty).raw.into()
-                    }
-                    (GenericParamDefKind::Const { .. }, GenericArg::Const(ct)) => {
-                        self.cfcx.lower_const_arg(ct, param.def_id).into()
+                        // We handle the ambig portions of `Ty` in the match arms below
+                        self.cfcx.lower_ty(ty.as_unambig_ty()).raw.into()
                     }
                     (GenericParamDefKind::Type { .. }, GenericArg::Infer(inf)) => {
-                        self.cfcx.ty_infer(Some(param), inf.span).into()
+                        self.cfcx.lower_ty(&inf.to_ty()).raw.into()
                     }
+                    (GenericParamDefKind::Const { .. }, GenericArg::Const(ct)) => self
+                        .cfcx
+                        // We handle the ambig portions of `ConstArg` in the match arms below
+                        .lower_const_arg(
+                            ct.as_unambig_ct(),
+                            FeedConstTy::Param(param.def_id, preceding_args),
+                        )
+                        .into(),
                     (GenericParamDefKind::Const { .. }, GenericArg::Infer(inf)) => {
                         self.cfcx.ct_infer(Some(param), inf.span).into()
                     }
@@ -462,9 +509,8 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                     user_self_ty: None, // not relevant here
                 };
 
-                self.fcx.canonicalize_user_type_annotation(UserType::TypeOf(
-                    pick.item.def_id,
-                    user_args,
+                self.fcx.canonicalize_user_type_annotation(ty::UserType::new(
+                    ty::UserTypeKind::TypeOf(pick.item.def_id, user_args),
                 ))
             });
 
@@ -483,37 +529,32 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         self_ty: Ty<'tcx>,
         method_self_ty: Ty<'tcx>,
         pick: &probe::Pick<'tcx>,
-        args: GenericArgsRef<'tcx>,
     ) {
         debug!(
             "unify_receivers: self_ty={:?} method_self_ty={:?} span={:?} pick={:?}",
             self_ty, method_self_ty, self.span, pick
         );
-        let cause = self.cause(
-            self.self_expr.span,
-            ObligationCauseCode::UnifyReceiver(Box::new(UnifyReceiverContext {
-                assoc_item: pick.item,
-                param_env: self.param_env,
-                args,
-            })),
-        );
+        let cause = self.cause(self.self_expr.span, ObligationCauseCode::Misc);
         match self.at(&cause, self.param_env).sup(DefineOpaqueTypes::Yes, method_self_ty, self_ty) {
             Ok(InferOk { obligations, value: () }) => {
                 self.register_predicates(obligations);
             }
             Err(terr) => {
-                // FIXME(arbitrary_self_types): We probably should limit the
-                // situations where this can occur by adding additional restrictions
-                // to the feature, like the self type can't reference method args.
-                if self.tcx.features().arbitrary_self_types {
+                if self.tcx.features().arbitrary_self_types() {
                     self.err_ctxt()
-                        .report_mismatched_types(&cause, method_self_ty, self_ty, terr)
+                        .report_mismatched_types(
+                            &cause,
+                            self.param_env,
+                            method_self_ty,
+                            self_ty,
+                            terr,
+                        )
                         .emit();
                 } else {
                     // This has/will have errored in wfcheck, which we cannot depend on from here, as typeck on functions
                     // may run before wfcheck if the function is used in const eval.
                     self.dcx().span_delayed_bug(
-                        cause.span(),
+                        cause.span,
                         format!("{self_ty} was a subtype of {method_self_ty} but now is not?"),
                     );
                 }
@@ -532,12 +573,12 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         debug!("instantiate_method_sig(pick={:?}, all_args={:?})", pick, all_args);
 
         // Instantiate the bounds on the method with the
-        // type/early-bound-regions instatiations performed. There can
+        // type/early-bound-regions instantiations performed. There can
         // be no late-bound regions appearing here.
         let def_id = pick.item.def_id;
         let method_predicates = self.tcx.predicates_of(def_id).instantiate(self.tcx, all_args);
 
-        debug!("method_predicates after instantitation = {:?}", method_predicates);
+        debug!("method_predicates after instantiation = {:?}", method_predicates);
 
         let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, all_args);
         debug!("type scheme instantiated, sig={:?}", sig);
@@ -550,14 +591,14 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
     fn add_obligations(
         &mut self,
-        fty: Ty<'tcx>,
+        sig: ty::FnSig<'tcx>,
         all_args: GenericArgsRef<'tcx>,
         method_predicates: ty::InstantiatedPredicates<'tcx>,
         def_id: DefId,
     ) {
         debug!(
-            "add_obligations: fty={:?} all_args={:?} method_predicates={:?} def_id={:?}",
-            fty, all_args, method_predicates, def_id
+            "add_obligations: sig={:?} all_args={:?} method_predicates={:?} def_id={:?}",
+            sig, all_args, method_predicates, def_id
         );
 
         // FIXME: could replace with the following, but we already calculated `method_predicates`,
@@ -571,7 +612,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                     self.call_expr.hir_id,
                     idx,
                 );
-                traits::ObligationCause::new(self.span, self.body_id, code)
+                self.cause(self.span, code)
             },
             self.param_env,
             method_predicates,
@@ -581,12 +622,18 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
         // this is a projection from a trait reference, so we have to
         // make sure that the trait reference inputs are well-formed.
-        self.add_wf_bounds(all_args, self.call_expr);
+        self.add_wf_bounds(all_args, self.call_expr.span);
 
         // the function type must also be well-formed (this is not
         // implied by the args being well-formed because of inherent
         // impls and late-bound regions - see issue #28609).
-        self.register_wf_obligation(fty.into(), self.span, ObligationCauseCode::WellFormed(None));
+        for ty in sig.inputs_and_output {
+            self.register_wf_obligation(
+                ty.into(),
+                self.span,
+                ObligationCauseCode::WellFormed(None),
+            );
+        }
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -616,20 +663,59 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             })
     }
 
-    fn enforce_illegal_method_limitations(&self, pick: &probe::Pick<'_>) {
+    fn check_for_illegal_method_calls(&self, pick: &probe::Pick<'_>) {
         // Disallow calls to the method `drop` defined in the `Drop` trait.
-        if let Some(trait_def_id) = pick.item.trait_container(self.tcx) {
-            if let Err(e) = callee::check_legal_trait_for_method_call(
+        if let Some(trait_def_id) = pick.item.trait_container(self.tcx)
+            && let Err(e) = callee::check_legal_trait_for_method_call(
                 self.tcx,
                 self.span,
                 Some(self.self_expr.span),
                 self.call_expr.span,
                 trait_def_id,
                 self.body_id.to_def_id(),
-            ) {
-                self.set_tainted_by_errors(e);
-            }
+            )
+        {
+            self.set_tainted_by_errors(e);
         }
+    }
+
+    fn lint_shadowed_supertrait_items(
+        &self,
+        pick: &probe::Pick<'_>,
+        segment: &hir::PathSegment<'tcx>,
+    ) {
+        if pick.shadowed_candidates.is_empty() {
+            return;
+        }
+
+        let shadower_span = self.tcx.def_span(pick.item.def_id);
+        let subtrait = self.tcx.item_name(pick.item.trait_container(self.tcx).unwrap());
+        let shadower = SupertraitItemShadower { span: shadower_span, subtrait };
+
+        let shadowee = if let [shadowee] = &pick.shadowed_candidates[..] {
+            let shadowee_span = self.tcx.def_span(shadowee.def_id);
+            let supertrait = self.tcx.item_name(shadowee.trait_container(self.tcx).unwrap());
+            SupertraitItemShadowee::Labeled { span: shadowee_span, supertrait }
+        } else {
+            let (traits, spans): (Vec<_>, Vec<_>) = pick
+                .shadowed_candidates
+                .iter()
+                .map(|item| {
+                    (
+                        self.tcx.item_name(item.trait_container(self.tcx).unwrap()),
+                        self.tcx.def_span(item.def_id),
+                    )
+                })
+                .unzip();
+            SupertraitItemShadowee::Several { traits: traits.into(), spans: spans.into() }
+        };
+
+        self.tcx.emit_node_span_lint(
+            SUPERTRAIT_ITEM_SHADOWING_USAGE,
+            segment.hir_id,
+            segment.ident.span,
+            SupertraitItemShadowing { shadower, shadowee, item: segment.ident.name, subtrait },
+        );
     }
 
     fn upcast(
@@ -641,23 +727,33 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             traits::upcast_choices(self.tcx, source_trait_ref, target_trait_def_id);
 
         // must be exactly one trait ref or we'd get an ambig error etc
-        if upcast_trait_refs.len() != 1 {
-            span_bug!(
+        if let &[upcast_trait_ref] = upcast_trait_refs.as_slice() {
+            upcast_trait_ref
+        } else {
+            self.dcx().span_delayed_bug(
                 self.span,
-                "cannot uniquely upcast `{:?}` to `{:?}`: `{:?}`",
-                source_trait_ref,
-                target_trait_def_id,
-                upcast_trait_refs
+                format!(
+                    "cannot uniquely upcast `{:?}` to `{:?}`: `{:?}`",
+                    source_trait_ref, target_trait_def_id, upcast_trait_refs
+                ),
             );
-        }
 
-        upcast_trait_refs.into_iter().next().unwrap()
+            ty::Binder::dummy(ty::TraitRef::new_from_args(
+                self.tcx,
+                target_trait_def_id,
+                ty::GenericArgs::extend_with_error(self.tcx, target_trait_def_id, &[]),
+            ))
+        }
     }
 
     fn instantiate_binder_with_fresh_vars<T>(&self, value: ty::Binder<'tcx, T>) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
-        self.fcx.instantiate_binder_with_fresh_vars(self.span, infer::FnCall, value)
+        self.fcx.instantiate_binder_with_fresh_vars(
+            self.span,
+            BoundRegionConversionTime::FnCall,
+            value,
+        )
     }
 }

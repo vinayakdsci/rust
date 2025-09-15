@@ -2,37 +2,21 @@
 
 use crate::io::ErrorKind;
 
-pub use self::rand::hashmap_random_keys;
-
 #[cfg(not(target_os = "espidf"))]
 #[macro_use]
 pub mod weak;
 
-pub mod alloc;
-pub mod android;
-pub mod args;
-pub mod env;
-pub mod fd;
-pub mod fs;
+#[cfg(target_os = "fuchsia")]
+pub mod fuchsia;
 pub mod futex;
-pub mod io;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod kernel_copy;
-#[cfg(target_os = "l4re")]
-mod l4re;
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(not(target_os = "l4re"))]
-pub mod net;
-#[cfg(target_os = "l4re")]
-pub use self::l4re::net;
 pub mod os;
 pub mod pipe;
-pub mod process;
-pub mod rand;
 pub mod stack_overflow;
-pub mod stdio;
-pub mod thread;
+pub mod sync;
 pub mod thread_parking;
 pub mod time;
 
@@ -40,6 +24,7 @@ pub mod time;
 pub fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {}
 
 #[cfg(not(target_os = "espidf"))]
+#[cfg_attr(target_os = "vita", allow(unused_variables))]
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.
 // See `fn init()` in `library/std/src/rt.rs` for docs on `sigpipe`.
@@ -60,7 +45,8 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     reset_sigpipe(sigpipe);
 
     stack_overflow::init();
-    args::init(argc, argv);
+    #[cfg(not(target_os = "vita"))]
+    crate::sys::args::init(argc, argv);
 
     // Normally, `thread::spawn` will call `Thread::set_name` but since this thread
     // already exists, we have to call it ourselves. We only do this on Apple targets
@@ -68,10 +54,34 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     // thread-id for the main thread and so renaming the main thread will rename the
     // process and we only want to enable this on platforms we've tested.
     if cfg!(target_vendor = "apple") {
-        thread::Thread::set_name(&c"main");
+        crate::sys::thread::set_name(c"main");
     }
 
     unsafe fn sanitize_standard_fds() {
+        #[allow(dead_code, unused_variables, unused_mut)]
+        let mut opened_devnull = -1;
+        #[allow(dead_code, unused_variables, unused_mut)]
+        let mut open_devnull = || {
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            use libc::open;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            use libc::open64 as open;
+
+            if opened_devnull != -1 {
+                if libc::dup(opened_devnull) != -1 {
+                    return;
+                }
+            }
+            opened_devnull = open(c"/dev/null".as_ptr(), libc::O_RDWR, 0);
+            if opened_devnull == -1 {
+                // If the stream is closed but we failed to reopen it, abort the
+                // process. Otherwise we wouldn't preserve the safety of
+                // operations on the corresponding Rust object Stdin, Stdout, or
+                // Stderr.
+                libc::abort();
+            }
+        };
+
         // fast path with a single syscall for systems with poll()
         #[cfg(not(any(
             miri,
@@ -82,15 +92,12 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             target_os = "l4re",
             target_os = "horizon",
             target_os = "vita",
+            target_os = "rtems",
             // The poll on Darwin doesn't set POLLNVAL for closed fds.
             target_vendor = "apple",
         )))]
         'poll: {
             use crate::sys::os::errno;
-            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-            use libc::open as open64;
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            use libc::open64;
             let pfds: &mut [_] = &mut [
                 libc::pollfd { fd: 0, events: 0, revents: 0 },
                 libc::pollfd { fd: 1, events: 0, revents: 0 },
@@ -117,13 +124,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
                 if pfd.revents & libc::POLLNVAL == 0 {
                     continue;
                 }
-                if open64(c"/dev/null".as_ptr().cast(), libc::O_RDWR, 0) == -1 {
-                    // If the stream is closed but we failed to reopen it, abort the
-                    // process. Otherwise we wouldn't preserve the safety of
-                    // operations on the corresponding Rust object Stdin, Stdout, or
-                    // Stderr.
-                    libc::abort();
-                }
+                open_devnull();
             }
             return;
         }
@@ -141,19 +142,9 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
         )))]
         {
             use crate::sys::os::errno;
-            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-            use libc::open as open64;
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            use libc::open64;
             for fd in 0..3 {
                 if libc::fcntl(fd, libc::F_GETFD) == -1 && errno() == libc::EBADF {
-                    if open64(c"/dev/null".as_ptr().cast(), libc::O_RDWR, 0) == -1 {
-                        // If the stream is closed but we failed to reopen it, abort the
-                        // process. Otherwise we wouldn't preserve the safety of
-                        // operations on the corresponding Rust object Stdin, Stdout, or
-                        // Stderr.
-                        libc::abort();
-                    }
+                    open_devnull();
                 }
             }
         }
@@ -164,6 +155,8 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
             target_os = "emscripten",
             target_os = "fuchsia",
             target_os = "horizon",
+            target_os = "vxworks",
+            target_os = "vita",
             // Unikraft's `signal` implementation is currently broken:
             // https://github.com/unikraft/lib-musl/issues/57
             target_vendor = "unikraft",
@@ -209,8 +202,10 @@ pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     target_os = "emscripten",
     target_os = "fuchsia",
     target_os = "horizon",
+    target_os = "vxworks",
+    target_os = "vita",
 )))]
-static ON_BROKEN_PIPE_FLAG_USED: crate::sync::atomic::AtomicBool =
+static ON_BROKEN_PIPE_FLAG_USED: crate::sync::atomic::Atomic<bool> =
     crate::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(any(
@@ -218,6 +213,9 @@ static ON_BROKEN_PIPE_FLAG_USED: crate::sync::atomic::AtomicBool =
     target_os = "emscripten",
     target_os = "fuchsia",
     target_os = "horizon",
+    target_os = "vxworks",
+    target_os = "vita",
+    target_os = "nuttx",
 )))]
 pub(crate) fn on_broken_pipe_flag_used() -> bool {
     ON_BROKEN_PIPE_FLAG_USED.load(crate::sync::atomic::Ordering::Relaxed)
@@ -229,10 +227,7 @@ pub unsafe fn cleanup() {
     stack_overflow::cleanup();
 }
 
-#[cfg(target_os = "android")]
-pub use crate::sys::android::signal;
 #[allow(unused_imports)]
-#[cfg(not(target_os = "android"))]
 pub use libc::signal;
 
 #[inline]
@@ -251,7 +246,7 @@ pub fn decode_error_kind(errno: i32) -> ErrorKind {
         libc::ECONNREFUSED => ConnectionRefused,
         libc::ECONNRESET => ConnectionReset,
         libc::EDEADLK => Deadlock,
-        libc::EDQUOT => FilesystemQuotaExceeded,
+        libc::EDQUOT => QuotaExceeded,
         libc::EEXIST => AlreadyExists,
         libc::EFBIG => FileTooLarge,
         libc::EHOSTUNREACH => HostUnreachable,
@@ -278,6 +273,8 @@ pub fn decode_error_kind(errno: i32) -> ErrorKind {
         libc::ETIMEDOUT => TimedOut,
         libc::ETXTBSY => ExecutableFileBusy,
         libc::EXDEV => CrossesDevices,
+        libc::EINPROGRESS => InProgress,
+        libc::EOPNOTSUPP => Unsupported,
 
         libc::EACCES | libc::EPERM => PermissionDenied,
 
@@ -305,7 +302,7 @@ macro_rules! impl_is_minus_one {
 
 impl_is_minus_one! { i8 i16 i32 i64 isize }
 
-/// Convert native return values to Result using the *-1 means error is in `errno`*  convention.
+/// Converts native return values to Result using the *-1 means error is in `errno`*  convention.
 /// Non-error values are `Ok`-wrapped.
 pub fn cvt<T: IsMinusOne>(t: T) -> crate::io::Result<T> {
     if t.is_minus_one() { Err(crate::io::Error::last_os_error()) } else { Ok(t) }
@@ -366,35 +363,42 @@ pub fn cvt_nz(error: libc::c_int) -> crate::io::Result<()> {
 // multithreaded C program.  It is much less severe for Rust, because Rust
 // stdlib doesn't use libc stdio buffering.  In a typical Rust program, which
 // does not use C stdio, even a buggy libc::abort() is, in fact, safe.
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub fn abort_internal() -> ! {
     unsafe { libc::abort() }
 }
 
-cfg_if::cfg_if! {
-    if #[cfg(target_os = "android")] {
+cfg_select! {
+    target_os = "android" => {
         #[link(name = "dl", kind = "static", modifiers = "-bundle",
             cfg(target_feature = "crt-static"))]
         #[link(name = "dl", cfg(not(target_feature = "crt-static")))]
         #[link(name = "log", cfg(not(target_feature = "crt-static")))]
-        extern "C" {}
-    } else if #[cfg(target_os = "freebsd")] {
+        unsafe extern "C" {}
+    }
+    target_os = "freebsd" => {
         #[link(name = "execinfo")]
         #[link(name = "pthread")]
-        extern "C" {}
-    } else if #[cfg(target_os = "netbsd")] {
+        unsafe extern "C" {}
+    }
+    target_os = "netbsd" => {
+        #[link(name = "execinfo")]
         #[link(name = "pthread")]
         #[link(name = "rt")]
-        extern "C" {}
-    } else if #[cfg(any(target_os = "dragonfly", target_os = "openbsd"))] {
+        unsafe extern "C" {}
+    }
+    any(target_os = "dragonfly", target_os = "openbsd", target_os = "cygwin") => {
         #[link(name = "pthread")]
-        extern "C" {}
-    } else if #[cfg(target_os = "solaris")] {
+        unsafe extern "C" {}
+    }
+    target_os = "solaris" => {
         #[link(name = "socket")]
         #[link(name = "posix4")]
         #[link(name = "pthread")]
         #[link(name = "resolv")]
-        extern "C" {}
-    } else if #[cfg(target_os = "illumos")] {
+        unsafe extern "C" {}
+    }
+    target_os = "illumos" => {
         #[link(name = "socket")]
         #[link(name = "posix4")]
         #[link(name = "pthread")]
@@ -402,29 +406,34 @@ cfg_if::cfg_if! {
         #[link(name = "nsl")]
         // Use libumem for the (malloc-compatible) allocator
         #[link(name = "umem")]
-        extern "C" {}
-    } else if #[cfg(target_vendor = "apple")] {
+        unsafe extern "C" {}
+    }
+    target_vendor = "apple" => {
         // Link to `libSystem.dylib`.
         //
         // Don't get confused by the presence of `System.framework`,
         // it is a deprecated wrapper over the dynamic library.
         #[link(name = "System")]
-        extern "C" {}
-    } else if #[cfg(target_os = "fuchsia")] {
+        unsafe extern "C" {}
+    }
+    target_os = "fuchsia" => {
         #[link(name = "zircon")]
         #[link(name = "fdio")]
-        extern "C" {}
-    } else if #[cfg(all(target_os = "linux", target_env = "uclibc"))] {
-        #[link(name = "dl")]
-        extern "C" {}
-    } else if #[cfg(target_os = "vita")] {
-        #[link(name = "pthread", kind = "static", modifiers = "-bundle")]
-        extern "C" {}
+        unsafe extern "C" {}
     }
+    all(target_os = "linux", target_env = "uclibc") => {
+        #[link(name = "dl")]
+        unsafe extern "C" {}
+    }
+    target_os = "vita" => {
+        #[link(name = "pthread", kind = "static", modifiers = "-bundle")]
+        unsafe extern "C" {}
+    }
+    _ => {}
 }
 
-#[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))]
-mod unsupported {
+#[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita", target_os = "nuttx"))]
+pub mod unsupported {
     use crate::io;
 
     pub fn unsupported<T>() -> io::Result<T> {

@@ -1,9 +1,9 @@
 // This tests the different -Crelro-level values, and makes sure that they work properly.
 
 //@ only-linux
+//@ ignore-cross-compile
 
-use run_make_support::llvm_readobj;
-use run_make_support::rustc;
+use run_make_support::{llvm_readobj, rustc};
 
 fn compile(relro_level: &str) {
     rustc().arg(format!("-Crelro-level={relro_level}")).input("hello.rs").run();

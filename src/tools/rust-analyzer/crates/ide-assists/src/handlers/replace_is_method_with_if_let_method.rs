@@ -1,9 +1,7 @@
-use syntax::{
-    ast::{self, make, AstNode},
-    ted,
-};
+use ide_db::syntax_helpers::suggest_name;
+use syntax::ast::{self, AstNode, syntax_factory::SyntaxFactory};
 
-use crate::{utils::suggest_name, AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists};
 
 // Assist: replace_is_some_with_if_let_some
 //
@@ -19,7 +17,7 @@ use crate::{utils::suggest_name, AssistContext, AssistId, AssistKind, Assists};
 // ```
 // fn main() {
 //     let x = Some(1);
-//     if let Some(${0:x}) = x {}
+//     if let Some(${0:x1}) = x {}
 // }
 // ```
 pub(crate) fn replace_is_method_with_if_let_method(
@@ -39,10 +37,13 @@ pub(crate) fn replace_is_method_with_if_let_method(
         "is_some" | "is_ok" => {
             let receiver = call_expr.receiver()?;
 
+            let mut name_generator = suggest_name::NameGenerator::new_from_scope_locals(
+                ctx.sema.scope(if_expr.syntax()),
+            );
             let var_name = if let ast::Expr::PathExpr(path_expr) = receiver.clone() {
-                path_expr.path()?.to_string()
+                name_generator.suggest_name(&path_expr.path()?.to_string())
             } else {
-                suggest_name::for_variable(&receiver, &ctx.sema)
+                name_generator.for_variable(&receiver, &ctx.sema)
             };
 
             let (assist_id, message, text) = if name_ref.text() == "is_some" {
@@ -52,25 +53,28 @@ pub(crate) fn replace_is_method_with_if_let_method(
             };
 
             acc.add(
-                AssistId(assist_id, AssistKind::RefactorRewrite),
+                AssistId::refactor_rewrite(assist_id),
                 message,
                 call_expr.syntax().text_range(),
                 |edit| {
-                    let call_expr = edit.make_mut(call_expr);
+                    let make = SyntaxFactory::with_mappings();
+                    let mut editor = edit.make_editor(call_expr.syntax());
 
-                    let var_pat = make::ident_pat(false, false, make::name(&var_name));
-                    let pat = make::tuple_struct_pat(make::ext::ident_path(text), [var_pat.into()]);
-                    let let_expr = make::expr_let(pat.into(), receiver).clone_for_update();
+                    let var_pat = make.ident_pat(false, false, make.name(&var_name));
+                    let pat = make.tuple_struct_pat(make.ident_path(text), [var_pat.into()]);
+                    let let_expr = make.expr_let(pat.into(), receiver);
 
-                    if let Some(cap) = ctx.config.snippet_cap {
-                        if let Some(ast::Pat::TupleStructPat(pat)) = let_expr.pat() {
-                            if let Some(first_var) = pat.fields().next() {
-                                edit.add_placeholder_snippet(cap, first_var);
-                            }
-                        }
+                    if let Some(cap) = ctx.config.snippet_cap
+                        && let Some(ast::Pat::TupleStructPat(pat)) = let_expr.pat()
+                        && let Some(first_var) = pat.fields().next()
+                    {
+                        let placeholder = edit.make_placeholder_snippet(cap);
+                        editor.add_annotation(first_var.syntax(), placeholder);
                     }
 
-                    ted::replace(call_expr.syntax(), let_expr.syntax());
+                    editor.replace(call_expr.syntax(), let_expr.syntax());
+                    editor.add_mappings(make.finish_with_mappings());
+                    edit.add_file_edits(ctx.vfs_file_id(), editor);
                 },
             )
         }
@@ -97,7 +101,7 @@ fn main() {
             r#"
 fn main() {
     let x = Some(1);
-    if let Some(${0:x}) = x {}
+    if let Some(${0:x1}) = x {}
 }
 "#,
         );
@@ -149,7 +153,7 @@ fn main() {
             r#"
 fn main() {
     let x = Ok(1);
-    if let Ok(${0:x}) = x {}
+    if let Ok(${0:x1}) = x {}
 }
 "#,
         );

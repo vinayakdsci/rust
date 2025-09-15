@@ -1,20 +1,21 @@
-use crate::diagnostics::error::{
-    span_err, throw_invalid_attr, throw_span_err, DiagnosticDeriveError,
-};
-use proc_macro::Span;
-use proc_macro2::{Ident, TokenStream};
-use quote::{format_ident, quote, ToTokens};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
+
+use proc_macro::Span;
+use proc_macro2::{Ident, TokenStream};
+use quote::{ToTokens, format_ident, quote};
 use syn::meta::ParseNestedMeta;
 use syn::punctuated::Punctuated;
-use syn::{parenthesized, LitStr, Path, Token};
-use syn::{spanned::Spanned, Attribute, Field, Meta, Type, TypeTuple};
+use syn::spanned::Spanned;
+use syn::{Attribute, Field, LitStr, Meta, Path, Token, Type, TypeTuple, parenthesized};
 use synstructure::{BindingInfo, VariantInfo};
 
 use super::error::invalid_attr;
+use crate::diagnostics::error::{
+    DiagnosticDeriveError, span_err, throw_invalid_attr, throw_span_err,
+};
 
 thread_local! {
     pub(crate) static CODE_IDENT_COUNT: RefCell<u32> = RefCell::new(0);
@@ -145,7 +146,7 @@ impl<'ty> FieldInnerTy<'ty> {
             };
 
             let path = &ty_path.path;
-            let ty = path.segments.iter().last().unwrap();
+            let ty = path.segments.last().unwrap();
             let syn::PathArguments::AngleBracketed(bracketed) = &ty.arguments else {
                 panic!("expected bracketed generic arguments");
             };
@@ -242,7 +243,7 @@ impl<T> SetOnce<T> for SpannedOption<T> {
                 *self = Some((value, span));
             }
             Some((_, prev_span)) => {
-                span_err(span, "specified multiple times")
+                span_err(span, "attribute specified multiple times")
                     .span_note(*prev_span, "previously specified here")
                     .emit();
             }
@@ -759,8 +760,8 @@ impl SubdiagnosticVariant {
                 }
                 (
                     "applicability",
-                    SubdiagnosticKind::Suggestion { ref mut applicability, .. }
-                    | SubdiagnosticKind::MultipartSuggestion { ref mut applicability, .. },
+                    SubdiagnosticKind::Suggestion { applicability, .. }
+                    | SubdiagnosticKind::MultipartSuggestion { applicability, .. },
                 ) => {
                     let value = get_string!();
                     let value = Applicability::from_str(&value.value()).unwrap_or_else(|()| {

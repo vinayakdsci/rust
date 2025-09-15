@@ -1,9 +1,12 @@
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 
+use derive_where::derive_where;
 use rustc_type_ir::inherent::*;
-use rustc_type_ir::visit::{TypeVisitable, TypeVisitableExt, TypeVisitor};
-use rustc_type_ir::{self as ty, InferCtxtLike, Interner};
+use rustc_type_ir::{
+    self as ty, InferCtxtLike, Interner, TrivialTypeTraversalImpls, TypeVisitable,
+    TypeVisitableExt, TypeVisitor,
+};
 use tracing::instrument;
 
 /// Whether we do the orphan check relative to this crate or to some remote crate.
@@ -93,6 +96,8 @@ pub fn trait_ref_is_local_or_fundamental<I: Interner>(tcx: I, trait_ref: ty::Tra
     trait_ref.def_id.is_local() || tcx.trait_is_fundamental(trait_ref.def_id)
 }
 
+TrivialTypeTraversalImpls! { IsFirstInputType, }
+
 #[derive(Debug, Copy, Clone)]
 pub enum IsFirstInputType {
     No,
@@ -108,15 +113,13 @@ impl From<bool> for IsFirstInputType {
     }
 }
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound = "T: Debug"))]
+#[derive_where(Debug; I: Interner, T: Debug)]
 pub enum OrphanCheckErr<I: Interner, T> {
     NonLocalInputType(Vec<(I::Ty, IsFirstInputType)>),
     UncoveredTyParams(UncoveredTyParams<I, T>),
 }
 
-#[derive(derivative::Derivative)]
-#[derivative(Debug(bound = "T: Debug"))]
+#[derive_where(Debug; I: Interner, T: Debug)]
 pub struct UncoveredTyParams<I: Interner, T> {
     pub uncovered: T,
     pub local_ty: Option<I::Ty>,
@@ -292,7 +295,7 @@ where
         ControlFlow::Break(OrphanCheckEarlyExit::UncoveredTyParam(ty))
     }
 
-    fn def_id_is_local(&mut self, def_id: I::DefId) -> bool {
+    fn def_id_is_local(&mut self, def_id: impl DefId<I>) -> bool {
         match self.in_crate {
             InCrate::Local { .. } => def_id.is_local(),
             InCrate::Remote => false,
@@ -335,12 +338,14 @@ where
             | ty::Str
             | ty::FnDef(..)
             | ty::Pat(..)
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::Array(..)
             | ty::Slice(..)
             | ty::RawPtr(..)
             | ty::Never
-            | ty::Tuple(..) => self.found_non_local_ty(ty),
+            | ty::Tuple(..)
+            // FIXME(unsafe_binders): Non-local?
+            | ty::UnsafeBinder(_) => self.found_non_local_ty(ty),
 
             ty::Param(..) => panic!("unexpected ty param"),
 
@@ -430,7 +435,21 @@ where
                 }
             }
             ty::Error(_) => ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),
-            ty::Closure(did, ..) | ty::CoroutineClosure(did, ..) | ty::Coroutine(did, ..) => {
+            ty::Closure(did, ..) => {
+                if self.def_id_is_local(did) {
+                    ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
+                } else {
+                    self.found_non_local_ty(ty)
+                }
+            }
+            ty::CoroutineClosure(did, ..) => {
+                if self.def_id_is_local(did) {
+                    ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
+                } else {
+                    self.found_non_local_ty(ty)
+                }
+            }
+            ty::Coroutine(did, ..) => {
                 if self.def_id_is_local(did) {
                     ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty))
                 } else {

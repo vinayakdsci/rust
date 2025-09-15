@@ -21,11 +21,11 @@ fn compare_address() -> bool {
     // CHECK: bb0: {
     // CHECK-NEXT: _1 = const 5_u8;
     // CHECK-NEXT: _2 = &_1;
-    // CHECK-NEXT: _3 = _1;
+    // CHECK-NEXT: _3 = copy _1;
     // CHECK-NEXT: _4 = &_3;
-    // CHECK-NEXT: _0 = cmp_ref(_2, _4)
+    // CHECK-NEXT: _0 = cmp_ref(copy _2, copy _4)
     // CHECK: bb1: {
-    // CHECK-NEXT: _0 = opaque::<u8>(_3)
+    // CHECK-NEXT: _0 = opaque::<u8>(copy _3)
     mir! {
         {
             let a = 5_u8;
@@ -51,9 +51,9 @@ fn borrowed<T: Copy + Freeze>(x: T) -> bool {
     // CHECK-LABEL: fn borrowed(
     // CHECK: bb0: {
     // CHECK-NEXT: _3 = &_1;
-    // CHECK-NEXT: _0 = opaque::<&T>(_3)
+    // CHECK-NEXT: _0 = opaque::<&T>(copy _3)
     // CHECK: bb1: {
-    // CHECK-NEXT: _0 = opaque::<T>(_1)
+    // CHECK-NEXT: _0 = opaque::<T>(copy _1)
     mir! {
         {
             let a = x;
@@ -74,11 +74,11 @@ fn borrowed<T: Copy + Freeze>(x: T) -> bool {
 fn non_freeze<T: Copy>(x: T) -> bool {
     // CHECK-LABEL: fn non_freeze(
     // CHECK: bb0: {
-    // CHECK-NEXT: _2 = _1;
+    // CHECK-NEXT: _2 = copy _1;
     // CHECK-NEXT: _3 = &_1;
-    // CHECK-NEXT: _0 = opaque::<&T>(_3)
+    // CHECK-NEXT: _0 = opaque::<&T>(copy _3)
     // CHECK: bb1: {
-    // CHECK-NEXT: _0 = opaque::<T>(_2)
+    // CHECK-NEXT: _0 = opaque::<T>(copy _2)
     mir! {
         {
             let a = x;
@@ -94,11 +94,45 @@ fn non_freeze<T: Copy>(x: T) -> bool {
     }
 }
 
+/// We must not unify a borrowed local with another that may be written-to before the borrow is
+/// read again. As we have no aliasing model yet, this means forbidding unifying borrowed locals.
+fn borrow_in_loop() {
+    // CHECK-LABEL: fn borrow_in_loop(
+    // CHECK: debug c => [[c:_.*]];
+    // CHECK: debug p => [[p:_.*]];
+    // CHECK: debug a => [[a:_.*]];
+    // CHECK: debug b => [[b:_.*]];
+    // CHECK-NOT: &[[a]]
+    // CHECK-NOT: &[[b]]
+    // CHECK: [[a]] = Not({{.*}});
+    // CHECK-NOT: &[[a]]
+    // CHECK-NOT: &[[b]]
+    // CHECK: [[b]] = Not({{.*}});
+    // CHECK-NOT: &[[a]]
+    // CHECK-NOT: &[[b]]
+    // CHECK: &[[c]]
+    // CHECK-NOT: &[[a]]
+    // CHECK-NOT: &[[b]]
+    let mut c;
+    let mut p = &false;
+    loop {
+        let a = !*p;
+        let b = !*p;
+        c = a;
+        p = &c;
+        if a != b {
+            return;
+        }
+    }
+}
+
 fn main() {
     assert!(!compare_address());
     non_freeze(5);
+    borrow_in_loop();
 }
 
 // EMIT_MIR borrowed_local.compare_address.CopyProp.diff
 // EMIT_MIR borrowed_local.borrowed.CopyProp.diff
 // EMIT_MIR borrowed_local.non_freeze.CopyProp.diff
+// EMIT_MIR borrowed_local.borrow_in_loop.CopyProp.diff

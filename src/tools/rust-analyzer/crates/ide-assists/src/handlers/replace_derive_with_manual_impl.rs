@@ -1,20 +1,20 @@
-use hir::{ImportPathConfig, InFile, MacroFileIdExt, ModuleDef};
+use hir::{InFile, ModuleDef};
 use ide_db::{helpers::mod_path_to_ast, imports::import_assets::NameToImport, items_locator};
 use itertools::Itertools;
 use syntax::{
-    ast::{self, make, AstNode, HasName},
-    ted,
     SyntaxKind::WHITESPACE,
     T,
+    ast::{self, AstNode, HasName, make},
+    syntax_editor::{Position, SyntaxEditor},
 };
 
 use crate::{
-    assist_context::{AssistContext, Assists, SourceChangeBuilder},
+    AssistConfig, AssistId,
+    assist_context::{AssistContext, Assists},
     utils::{
-        add_trait_assoc_items_to_impl, filter_assoc_items, gen_trait_fn_body, generate_trait_impl,
-        DefaultMethods, IgnoreAssocItems,
+        DefaultMethods, IgnoreAssocItems, add_trait_assoc_items_to_impl, filter_assoc_items,
+        gen_trait_fn_body, generate_trait_impl,
     },
-    AssistId, AssistKind,
 };
 
 // Assist: replace_derive_with_manual_impl
@@ -70,30 +70,23 @@ pub(crate) fn replace_derive_with_manual_impl(
 
     let current_module = ctx.sema.scope(adt.syntax())?.module();
     let current_crate = current_module.krate();
+    let current_edition = current_crate.edition(ctx.db());
 
     let found_traits = items_locator::items_with_name(
-        &ctx.sema,
+        ctx.db(),
         current_crate,
         NameToImport::exact_case_sensitive(path.segments().last()?.to_string()),
         items_locator::AssocSearchMode::Exclude,
     )
-    .filter_map(|item| match item.as_module_def()? {
+    .filter_map(|(item, _)| match item.into_module_def() {
         ModuleDef::Trait(trait_) => Some(trait_),
         _ => None,
     })
     .flat_map(|trait_| {
         current_module
-            .find_path(
-                ctx.sema.db,
-                hir::ModuleDef::Trait(trait_),
-                ImportPathConfig {
-                    prefer_no_std: ctx.config.prefer_no_std,
-                    prefer_prelude: ctx.config.prefer_prelude,
-                    prefer_absolute: ctx.config.prefer_absolute,
-                },
-            )
+            .find_path(ctx.sema.db, hir::ModuleDef::Trait(trait_), ctx.config.import_path_config())
             .as_ref()
-            .map(mod_path_to_ast)
+            .map(|path| mod_path_to_ast(path, current_edition))
             .zip(Some(trait_))
     });
 
@@ -132,77 +125,69 @@ fn add_assist(
     let annotated_name = adt.name()?;
     let label = format!("Convert to manual `impl {replace_trait_path} for {annotated_name}`");
 
-    acc.add(
-        AssistId("replace_derive_with_manual_impl", AssistKind::Refactor),
-        label,
-        target,
-        |builder| {
-            let insert_after = ted::Position::after(builder.make_mut(adt.clone()).syntax());
+    acc.add(AssistId::refactor("replace_derive_with_manual_impl"), label, target, |builder| {
+        let insert_after = Position::after(adt.syntax());
+        let impl_is_unsafe = trait_.map(|s| s.is_unsafe(ctx.db())).unwrap_or(false);
+        let impl_def = impl_def_from_trait(
+            &ctx.sema,
+            ctx.config,
+            adt,
+            &annotated_name,
+            trait_,
+            replace_trait_path,
+            impl_is_unsafe,
+        );
 
-            let impl_def_with_items =
-                impl_def_from_trait(&ctx.sema, adt, &annotated_name, trait_, replace_trait_path);
-            update_attribute(builder, old_derives, old_tree, old_trait_path, attr);
+        let mut editor = builder.make_editor(attr.syntax());
+        update_attribute(&mut editor, old_derives, old_tree, old_trait_path, attr);
 
-            let trait_path = make::ty_path(replace_trait_path.clone());
+        let trait_path = make::ty_path(replace_trait_path.clone());
 
-            match (ctx.config.snippet_cap, impl_def_with_items) {
-                (None, _) => {
-                    let impl_def = generate_trait_impl(adt, trait_path);
+        let (impl_def, first_assoc_item) = if let Some(impl_def) = impl_def {
+            (
+                impl_def.clone(),
+                impl_def.assoc_item_list().and_then(|list| list.assoc_items().next()),
+            )
+        } else {
+            (generate_trait_impl(impl_is_unsafe, adt, trait_path), None)
+        };
 
-                    ted::insert_all(
-                        insert_after,
-                        vec![make::tokens::blank_line().into(), impl_def.syntax().clone().into()],
-                    );
+        if let Some(cap) = ctx.config.snippet_cap {
+            if let Some(first_assoc_item) = first_assoc_item {
+                if let ast::AssocItem::Fn(ref func) = first_assoc_item
+                    && let Some(m) = func.syntax().descendants().find_map(ast::MacroCall::cast)
+                    && m.syntax().text() == "todo!()"
+                {
+                    // Make the `todo!()` a placeholder
+                    builder.add_placeholder_snippet(cap, m);
+                } else {
+                    // If we haven't already added a snippet, add a tabstop before the generated function
+                    builder.add_tabstop_before(cap, first_assoc_item);
                 }
-                (Some(cap), None) => {
-                    let impl_def = generate_trait_impl(adt, trait_path);
+            } else if let Some(l_curly) =
+                impl_def.assoc_item_list().and_then(|it| it.l_curly_token())
+            {
+                builder.add_tabstop_after_token(cap, l_curly);
+            }
+        }
 
-                    if let Some(l_curly) =
-                        impl_def.assoc_item_list().and_then(|it| it.l_curly_token())
-                    {
-                        builder.add_tabstop_after_token(cap, l_curly);
-                    }
-
-                    ted::insert_all(
-                        insert_after,
-                        vec![make::tokens::blank_line().into(), impl_def.syntax().clone().into()],
-                    );
-                }
-                (Some(cap), Some((impl_def, first_assoc_item))) => {
-                    let mut added_snippet = false;
-                    if let ast::AssocItem::Fn(ref func) = first_assoc_item {
-                        if let Some(m) = func.syntax().descendants().find_map(ast::MacroCall::cast)
-                        {
-                            if m.syntax().text() == "todo!()" {
-                                // Make the `todo!()` a placeholder
-                                builder.add_placeholder_snippet(cap, m);
-                                added_snippet = true;
-                            }
-                        }
-                    }
-
-                    if !added_snippet {
-                        // If we haven't already added a snippet, add a tabstop before the generated function
-                        builder.add_tabstop_before(cap, first_assoc_item);
-                    }
-
-                    ted::insert_all(
-                        insert_after,
-                        vec![make::tokens::blank_line().into(), impl_def.syntax().clone().into()],
-                    );
-                }
-            };
-        },
-    )
+        editor.insert_all(
+            insert_after,
+            vec![make::tokens::blank_line().into(), impl_def.syntax().clone().into()],
+        );
+        builder.add_file_edits(ctx.vfs_file_id(), editor);
+    })
 }
 
 fn impl_def_from_trait(
     sema: &hir::Semantics<'_, ide_db::RootDatabase>,
+    config: &AssistConfig,
     adt: &ast::Adt,
     annotated_name: &ast::Name,
     trait_: Option<hir::Trait>,
     trait_path: &ast::Path,
-) -> Option<(ast::Impl, ast::AssocItem)> {
+    impl_is_unsafe: bool,
+) -> Option<ast::Impl> {
     let trait_ = trait_?;
     let target_scope = sema.scope(annotated_name.syntax())?;
 
@@ -219,21 +204,39 @@ fn impl_def_from_trait(
     if trait_items.is_empty() {
         return None;
     }
-    let impl_def = generate_trait_impl(adt, make::ty_path(trait_path.clone()));
+    let impl_def = generate_trait_impl(impl_is_unsafe, adt, make::ty_path(trait_path.clone()));
 
-    let first_assoc_item =
-        add_trait_assoc_items_to_impl(sema, &trait_items, trait_, &impl_def, target_scope);
+    let assoc_items =
+        add_trait_assoc_items_to_impl(sema, config, &trait_items, trait_, &impl_def, &target_scope);
+    let assoc_item_list = if let Some((first, other)) =
+        assoc_items.split_first().map(|(first, other)| (first.clone_subtree(), other))
+    {
+        let first_item = if let ast::AssocItem::Fn(ref func) = first
+            && let Some(body) = gen_trait_fn_body(func, trait_path, adt, None)
+            && let Some(func_body) = func.body()
+        {
+            let mut editor = SyntaxEditor::new(first.syntax().clone());
+            editor.replace(func_body.syntax(), body.syntax());
+            ast::AssocItem::cast(editor.finish().new_root().clone())
+        } else {
+            Some(first.clone())
+        };
+        let items = first_item.into_iter().chain(other.iter().cloned()).collect();
+        make::assoc_item_list(Some(items))
+    } else {
+        make::assoc_item_list(None)
+    }
+    .clone_for_update();
 
-    // Generate a default `impl` function body for the derived trait.
-    if let ast::AssocItem::Fn(ref func) = first_assoc_item {
-        let _ = gen_trait_fn_body(func, trait_path, adt, None);
-    };
-
-    Some((impl_def, first_assoc_item))
+    let impl_def = impl_def.clone_subtree();
+    let mut editor = SyntaxEditor::new(impl_def.syntax().clone());
+    editor.replace(impl_def.assoc_item_list()?.syntax(), assoc_item_list.syntax());
+    let impl_def = ast::Impl::cast(editor.finish().new_root().clone())?;
+    Some(impl_def)
 }
 
 fn update_attribute(
-    builder: &mut SourceChangeBuilder,
+    editor: &mut SyntaxEditor,
     old_derives: &[ast::Path],
     old_tree: &ast::TokenTree,
     old_trait_path: &ast::Path,
@@ -246,8 +249,6 @@ fn update_attribute(
     let has_more_derives = !new_derives.is_empty();
 
     if has_more_derives {
-        let old_tree = builder.make_mut(old_tree.clone());
-
         // Make the paths into flat lists of tokens in a vec
         let tt = new_derives.iter().map(|path| path.syntax().clone()).map(|node| {
             node.descendants_with_tokens()
@@ -262,24 +263,23 @@ fn update_attribute(
         let tt = tt.collect::<Vec<_>>();
 
         let new_tree = make::token_tree(T!['('], tt).clone_for_update();
-        ted::replace(old_tree.syntax(), new_tree.syntax());
+        editor.replace(old_tree.syntax(), new_tree.syntax());
     } else {
         // Remove the attr and any trailing whitespace
-        let attr = builder.make_mut(attr.clone());
 
         if let Some(line_break) =
             attr.syntax().next_sibling_or_token().filter(|t| t.kind() == WHITESPACE)
         {
-            ted::remove(line_break)
+            editor.delete(line_break)
         }
 
-        ted::remove(attr.syntax())
+        editor.delete(attr.syntax())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_assist, check_assist_not_applicable};
+    use crate::tests::{check_assist, check_assist_no_snippet_cap, check_assist_not_applicable};
 
     use super::*;
 
@@ -301,6 +301,30 @@ struct Foo {
 
 impl core::fmt::Debug for Foo {
     $0fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Foo").field("bar", &self.bar).finish()
+    }
+}
+"#,
+        )
+    }
+    #[test]
+    fn add_custom_impl_without_snippet() {
+        check_assist_no_snippet_cap(
+            replace_derive_with_manual_impl,
+            r#"
+//- minicore: fmt, derive
+#[derive(Debu$0g)]
+struct Foo {
+    bar: String,
+}
+"#,
+            r#"
+struct Foo {
+    bar: String,
+}
+
+impl core::fmt::Debug for Foo {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Foo").field("bar", &self.bar).finish()
     }
 }
@@ -1379,6 +1403,23 @@ impl core::fmt::Debug for Foo {
         f.debug_struct("Foo").finish()
     }
 }
+"#,
+        )
+    }
+
+    #[test]
+    fn unsafeness_of_a_trait_observed() {
+        check_assist(
+            replace_derive_with_manual_impl,
+            r#"
+//- minicore: send, derive
+#[derive(Sen$0d)]
+pub struct Foo;
+"#,
+            r#"
+pub struct Foo;
+
+unsafe impl Send for Foo {$0}
 "#,
         )
     }

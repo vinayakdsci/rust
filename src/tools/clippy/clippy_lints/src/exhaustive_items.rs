@@ -1,10 +1,10 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::indent_of;
 use rustc_errors::Applicability;
-use rustc_hir::{Item, ItemKind};
+use rustc_hir::attrs::AttributeKind;
+use rustc_hir::{Item, ItemKind, find_attr};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::sym;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -70,25 +70,29 @@ declare_lint_pass!(ExhaustiveItems => [EXHAUSTIVE_ENUMS, EXHAUSTIVE_STRUCTS]);
 
 impl LateLintPass<'_> for ExhaustiveItems {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &Item<'_>) {
-        if let ItemKind::Enum(..) | ItemKind::Struct(..) = item.kind
-            && cx.effective_visibilities.is_exported(item.owner_id.def_id)
-            && let attrs = cx.tcx.hir().attrs(item.hir_id())
-            && !attrs.iter().any(|a| a.has_name(sym::non_exhaustive))
+        let (lint, msg, fields) = match item.kind {
+            ItemKind::Enum(..) => (
+                EXHAUSTIVE_ENUMS,
+                "exported enums should not be exhaustive",
+                [].as_slice(),
+            ),
+            ItemKind::Struct(_, _, v) if v.fields().iter().all(|f| f.default.is_none()) => (
+                EXHAUSTIVE_STRUCTS,
+                "exported structs should not be exhaustive",
+                v.fields(),
+            ),
+            _ => return,
+        };
+        if cx.effective_visibilities.is_exported(item.owner_id.def_id)
+            && let attrs = cx.tcx.hir_attrs(item.hir_id())
+            && !find_attr!(attrs, AttributeKind::NonExhaustive(..))
+            && fields.iter().all(|f| cx.tcx.visibility(f.def_id).is_public())
         {
-            let (lint, msg) = if let ItemKind::Struct(ref v, ..) = item.kind {
-                if v.fields().iter().any(|f| !cx.tcx.visibility(f.def_id).is_public()) {
-                    // skip structs with private fields
-                    return;
-                }
-                (EXHAUSTIVE_STRUCTS, "exported structs should not be exhaustive")
-            } else {
-                (EXHAUSTIVE_ENUMS, "exported enums should not be exhaustive")
-            };
-            let suggestion_span = item.span.shrink_to_lo();
-            let indent = " ".repeat(indent_of(cx, item.span).unwrap_or(0));
             span_lint_and_then(cx, lint, item.span, msg, |diag| {
+                let suggestion_span = item.span.shrink_to_lo();
+                let indent = " ".repeat(indent_of(cx, item.span).unwrap_or(0));
                 let sugg = format!("#[non_exhaustive]\n{indent}");
-                diag.span_suggestion(
+                diag.span_suggestion_verbose(
                     suggestion_span,
                     "try adding #[non_exhaustive]",
                     sugg,

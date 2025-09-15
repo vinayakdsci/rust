@@ -1,5 +1,3 @@
-#![allow(rustc::usage_of_ty_tykind)]
-
 /// This higher-order macro declares a list of types which can be allocated by `Arena`.
 ///
 /// Specifying the `decode` modifier will add decode impls for `&T` and `&[T]` where `T` is the type
@@ -8,8 +6,9 @@
 macro_rules! arena_types {
     ($macro:path) => (
         $macro!([
-            [] layout: rustc_target::abi::LayoutS<rustc_target::abi::FieldIdx, rustc_target::abi::VariantIdx>,
-            [] fn_abi: rustc_target::abi::call::FnAbi<'tcx, rustc_middle::ty::Ty<'tcx>>,
+            [] layout: rustc_abi::LayoutData<rustc_abi::FieldIdx, rustc_abi::VariantIdx>,
+            [] proxy_coroutine_layout: rustc_middle::mir::CoroutineLayout<'tcx>,
+            [] fn_abi: rustc_target::callconv::FnAbi<'tcx, rustc_middle::ty::Ty<'tcx>>,
             // AdtDef are interned and compared by address
             [decode] adt_def: rustc_middle::ty::AdtDefData,
             [] steal_thir: rustc_data_structures::steal::Steal<rustc_middle::thir::Thir<'tcx>>,
@@ -28,14 +27,13 @@ macro_rules! arena_types {
                     rustc_middle::mir::Body<'tcx>
                 >,
             [decode] typeck_results: rustc_middle::ty::TypeckResults<'tcx>,
-            [decode] borrowck_result: rustc_middle::mir::BorrowCheckResult<'tcx>,
+            [decode] borrowck_result: rustc_middle::mir::ConcreteOpaqueTypes<'tcx>,
             [] resolver: rustc_data_structures::steal::Steal<(
                 rustc_middle::ty::ResolverAstLowering,
-                rustc_data_structures::sync::Lrc<rustc_ast::Crate>,
+                std::sync::Arc<rustc_ast::Crate>,
             )>,
             [] crate_for_resolver: rustc_data_structures::steal::Steal<(rustc_ast::Crate, rustc_ast::AttrVec)>,
             [] resolutions: rustc_middle::ty::ResolverGlobalCtxt,
-            [decode] code_region: rustc_middle::mir::coverage::CodeRegion,
             [] const_allocs: rustc_middle::mir::interpret::Allocation,
             [] region_scope_tree: rustc_middle::middle::region::ScopeTree,
             // Required for the incremental on-disk cache
@@ -61,10 +59,6 @@ macro_rules! arena_types {
             [] dtorck_constraint: rustc_middle::traits::query::DropckConstraint<'tcx>,
             [] candidate_step: rustc_middle::traits::query::CandidateStep<'tcx>,
             [] autoderef_bad_ty: rustc_middle::traits::query::MethodAutoderefBadTy<'tcx>,
-            [] canonical_goal_evaluation:
-                rustc_type_ir::solve::inspect::CanonicalGoalEvaluationStep<
-                    rustc_middle::ty::TyCtxt<'tcx>
-                >,
             [] query_region_constraints: rustc_middle::infer::canonical::QueryRegionConstraints<'tcx>,
             [] type_op_subtype:
                 rustc_middle::infer::canonical::Canonical<'tcx,
@@ -86,14 +80,18 @@ macro_rules! arena_types {
                 rustc_middle::infer::canonical::Canonical<'tcx,
                     rustc_middle::infer::canonical::QueryResponse<'tcx, rustc_middle::ty::Ty<'tcx>>
                 >,
+            [] inspect_probe: rustc_middle::traits::solve::inspect::Probe<rustc_middle::ty::TyCtxt<'tcx>>,
             [] effective_visibilities: rustc_middle::middle::privacy::EffectiveVisibilities,
             [] upvars_mentioned: rustc_data_structures::fx::FxIndexMap<rustc_hir::HirId, rustc_hir::Upvar>,
-            [] object_safety_violations: rustc_middle::traits::ObjectSafetyViolation,
+            [] dyn_compatibility_violations: rustc_middle::traits::DynCompatibilityViolation,
             [] codegen_unit: rustc_middle::mir::mono::CodegenUnit<'tcx>,
-            [decode] attribute: rustc_ast::Attribute,
-            [] name_set: rustc_data_structures::unord::UnordSet<rustc_span::symbol::Symbol>,
-            [] ordered_name_set: rustc_data_structures::fx::FxIndexSet<rustc_span::symbol::Symbol>,
-            [] pats: rustc_middle::ty::PatternKind<'tcx>,
+            [decode] attribute: rustc_hir::Attribute,
+            [] name_set: rustc_data_structures::unord::UnordSet<rustc_span::Symbol>,
+            [] autodiff_item: rustc_ast::expand::autodiff_attrs::AutoDiffItem,
+            [] ordered_name_set: rustc_data_structures::fx::FxIndexSet<rustc_span::Symbol>,
+            [] valtree: rustc_middle::ty::ValTreeKind<'tcx>,
+            [] stable_order_of_exportable_impls:
+                rustc_data_structures::fx::FxIndexMap<rustc_hir::def_id::DefId, usize>,
 
             // Note that this deliberately duplicates items in the `rustc_hir::arena`,
             // since we need to allocate this type on both the `rustc_hir` arena
@@ -113,7 +111,7 @@ macro_rules! arena_types {
             [] external_constraints: rustc_middle::traits::solve::ExternalConstraintsData<rustc_middle::ty::TyCtxt<'tcx>>,
             [] predefined_opaques_in_body: rustc_middle::traits::solve::PredefinedOpaquesData<rustc_middle::ty::TyCtxt<'tcx>>,
             [decode] doc_link_resolutions: rustc_hir::def::DocLinkResMap,
-            [] stripped_cfg_items: rustc_ast::expand::StrippedCfgItem,
+            [] stripped_cfg_items: rustc_hir::attrs::StrippedCfgItem,
             [] mod_child: rustc_middle::metadata::ModChild,
             [] features: rustc_feature::Features,
             [decode] specialization_graph: rustc_middle::traits::specialization_graph::Graph,

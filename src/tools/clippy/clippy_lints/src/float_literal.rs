@@ -1,17 +1,20 @@
-use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::numeric_literal;
-use rustc_ast::ast::{self, LitFloatType, LitKind};
+use clippy_config::Conf;
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::{ExprUseNode, expr_use_ctxt, numeric_literal};
+use rustc_ast::ast::{LitFloatType, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{self, FloatTy};
-use rustc_session::declare_lint_pass;
+use rustc_session::impl_lint_pass;
 use std::fmt;
 
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for float literals with a precision greater
     /// than that supported by the underlying type.
+    ///
+    /// The lint is suppressed for literals with over `const_literal_digits_threshold` digits.
     ///
     /// ### Why is this bad?
     /// Rust will truncate the literal silently.
@@ -58,14 +61,27 @@ declare_clippy_lint! {
     "lossy whole number float literals"
 }
 
-declare_lint_pass!(FloatLiteral => [EXCESSIVE_PRECISION, LOSSY_FLOAT_LITERAL]);
+pub struct FloatLiteral {
+    const_literal_digits_threshold: usize,
+}
+
+impl_lint_pass!(FloatLiteral => [
+    EXCESSIVE_PRECISION, LOSSY_FLOAT_LITERAL
+]);
+
+impl FloatLiteral {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            const_literal_digits_threshold: conf.const_literal_digits_threshold,
+        }
+    }
+}
 
 impl<'tcx> LateLintPass<'tcx> for FloatLiteral {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'_>) {
-        let ty = cx.typeck_results().expr_ty(expr);
-        if let ty::Float(fty) = *ty.kind()
-            && let hir::ExprKind::Lit(lit) = expr.kind
+        if let hir::ExprKind::Lit(lit) = expr.kind
             && let LitKind::Float(sym, lit_float_ty) = lit.node
+            && let ty::Float(fty) = *cx.typeck_results().expr_ty(expr).kind()
         {
             let sym_str = sym.as_str();
             let formatter = FloatFormat::new(sym_str);
@@ -76,10 +92,10 @@ impl<'tcx> LateLintPass<'tcx> for FloatLiteral {
             let digits = count_digits(sym_str);
             let max = max_digits(fty);
             let type_suffix = match lit_float_ty {
-                LitFloatType::Suffixed(ast::FloatTy::F16) => Some("f16"),
-                LitFloatType::Suffixed(ast::FloatTy::F32) => Some("f32"),
-                LitFloatType::Suffixed(ast::FloatTy::F64) => Some("f64"),
-                LitFloatType::Suffixed(ast::FloatTy::F128) => Some("f128"),
+                LitFloatType::Suffixed(FloatTy::F16) => Some("f16"),
+                LitFloatType::Suffixed(FloatTy::F32) => Some("f32"),
+                LitFloatType::Suffixed(FloatTy::F64) => Some("f64"),
+                LitFloatType::Suffixed(FloatTy::F128) => Some("f128"),
                 LitFloatType::Unsuffixed => None,
             };
             let (is_whole, is_inf, mut float_str) = match fty {
@@ -106,32 +122,53 @@ impl<'tcx> LateLintPass<'tcx> for FloatLiteral {
             if is_whole && !sym_str.contains(['e', 'E']) {
                 // Normalize the literal by stripping the fractional portion
                 if sym_str.split('.').next().unwrap() != float_str {
-                    // If the type suffix is missing the suggestion would be
-                    // incorrectly interpreted as an integer so adding a `.0`
-                    // suffix to prevent that.
-                    if type_suffix.is_none() {
-                        float_str.push_str(".0");
-                    }
-
-                    span_lint_and_sugg(
+                    span_lint_and_then(
                         cx,
                         LOSSY_FLOAT_LITERAL,
                         expr.span,
                         "literal cannot be represented as the underlying type without loss of precision",
-                        "consider changing the type or replacing it with",
-                        numeric_literal::format(&float_str, type_suffix, true),
-                        Applicability::MachineApplicable,
+                        |diag| {
+                            // If the type suffix is missing the suggestion would be
+                            // incorrectly interpreted as an integer so adding a `.0`
+                            // suffix to prevent that.
+                            if type_suffix.is_none() {
+                                float_str.push_str(".0");
+                            }
+                            diag.span_suggestion_verbose(
+                                expr.span,
+                                "consider changing the type or replacing it with",
+                                numeric_literal::format(&float_str, type_suffix, true),
+                                Applicability::MachineApplicable,
+                            );
+                        },
                     );
                 }
-            } else if digits > max as usize && float_str.len() < sym_str.len() {
-                span_lint_and_sugg(
+            } else if digits > max as usize && count_digits(&float_str) < digits {
+                if digits >= self.const_literal_digits_threshold
+                    && matches!(expr_use_ctxt(cx, expr).use_node(cx), ExprUseNode::ConstStatic(_))
+                {
+                    // If a big enough number of digits is specified and it's a constant
+                    // we assume the user is definining a constant, and excessive precision is ok
+                    return;
+                }
+                span_lint_and_then(
                     cx,
                     EXCESSIVE_PRECISION,
                     expr.span,
                     "float has excessive precision",
-                    "consider changing the type or truncating it to",
-                    numeric_literal::format(&float_str, type_suffix, true),
-                    Applicability::MachineApplicable,
+                    |diag| {
+                        if digits >= self.const_literal_digits_threshold
+                            && let Some(let_stmt) = maybe_let_stmt(cx, expr)
+                        {
+                            diag.span_note(let_stmt.span, "consider making it a `const` item");
+                        }
+                        diag.span_suggestion_verbose(
+                            expr.span,
+                            "consider changing the type or truncating it to",
+                            numeric_literal::format(&float_str, type_suffix, true),
+                            Applicability::MachineApplicable,
+                        );
+                    },
                 );
             }
         }
@@ -186,5 +223,13 @@ impl FloatFormat {
             Self::UpperExp => format!("{f:E}"),
             Self::Normal => format!("{f}"),
         }
+    }
+}
+
+fn maybe_let_stmt<'a>(cx: &LateContext<'a>, expr: &hir::Expr<'_>) -> Option<&'a hir::LetStmt<'a>> {
+    let parent = cx.tcx.parent_hir_node(expr.hir_id);
+    match parent {
+        hir::Node::LetStmt(let_stmt) => Some(let_stmt),
+        _ => None,
     }
 }

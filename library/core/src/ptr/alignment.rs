@@ -1,5 +1,6 @@
+#![allow(clippy::enum_clike_unportable_variant)]
+
 use crate::num::NonZero;
-#[cfg(debug_assertions)]
 use crate::ub_checks::assert_unsafe_precondition;
 use crate::{cmp, fmt, hash, mem, num};
 
@@ -14,8 +15,8 @@ use crate::{cmp, fmt, hash, mem, num};
 pub struct Alignment(AlignmentEnum);
 
 // Alignment is `repr(usize)`, but via extra steps.
-const _: () = assert!(mem::size_of::<Alignment>() == mem::size_of::<usize>());
-const _: () = assert!(mem::align_of::<Alignment>() == mem::align_of::<usize>());
+const _: () = assert!(size_of::<Alignment>() == size_of::<usize>());
+const _: () = assert!(align_of::<Alignment>() == align_of::<usize>());
 
 fn _alignment_can_be_structurally_matched(a: Alignment) -> bool {
     matches!(a, Alignment::MIN)
@@ -39,14 +40,14 @@ impl Alignment {
 
     /// Returns the alignment for a type.
     ///
-    /// This provides the same numerical value as [`mem::align_of`],
+    /// This provides the same numerical value as [`align_of`],
     /// but in an `Alignment` instead of a `usize`.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
+    #[must_use]
     pub const fn of<T>() -> Self {
-        // SAFETY: rustc ensures that type alignment is always a power of two.
-        unsafe { Alignment::new_unchecked(mem::align_of::<T>()) }
+        // This can't actually panic since type alignment is always a power of two.
+        const { Alignment::new(align_of::<T>()).unwrap() }
     }
 
     /// Creates an `Alignment` from a `usize`, or returns `None` if it's
@@ -54,7 +55,6 @@ impl Alignment {
     ///
     /// Note that `0` is not a power of two, nor a valid alignment.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const fn new(align: usize) -> Option<Self> {
         if align.is_power_of_two() {
@@ -74,10 +74,9 @@ impl Alignment {
     /// Equivalently, it must be `1 << exp` for some `exp` in `0..usize::BITS`.
     /// It must *not* be zero.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
+    #[track_caller]
     pub const unsafe fn new_unchecked(align: usize) -> Self {
-        #[cfg(debug_assertions)]
         assert_unsafe_precondition!(
             check_language_ub,
             "Alignment::new_unchecked requires a power of two",
@@ -91,7 +90,6 @@ impl Alignment {
 
     /// Returns the alignment as a [`usize`].
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const fn as_usize(self) -> usize {
         self.0 as usize
@@ -99,11 +97,15 @@ impl Alignment {
 
     /// Returns the alignment as a <code>[NonZero]<[usize]></code>.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const fn as_nonzero(self) -> NonZero<usize> {
+        // This transmutes directly to avoid the UbCheck in `NonZero::new_unchecked`
+        // since there's no way for the user to trip that check anyway -- the
+        // validity invariant of the type would have to have been broken earlier --
+        // and emitting it in an otherwise simple method is bad for compile time.
+
         // SAFETY: All the discriminants are non-zero.
-        unsafe { NonZero::new_unchecked(self.as_usize()) }
+        unsafe { mem::transmute::<Alignment, NonZero<usize>>(self) }
     }
 
     /// Returns the base-2 logarithm of the alignment.
@@ -120,7 +122,6 @@ impl Alignment {
     /// assert_eq!(Alignment::new(1024).unwrap().log2(), 10);
     /// ```
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const fn log2(self) -> u32 {
         self.as_nonzero().trailing_zeros()
@@ -150,11 +151,15 @@ impl Alignment {
     /// assert_ne!(one.mask(Alignment::of::<Align4>().mask()), one);
     /// ```
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-    #[rustc_const_unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[inline]
     pub const fn mask(self) -> usize {
         // SAFETY: The alignment is always nonzero, and therefore decrementing won't overflow.
         !(unsafe { self.as_usize().unchecked_sub(1) })
+    }
+
+    // FIXME(const-hack) Remove me once `Ord::max` is usable in const
+    pub(crate) const fn max(a: Self, b: Self) -> Self {
+        if a.as_usize() > b.as_usize() { a } else { b }
     }
 }
 
@@ -166,7 +171,8 @@ impl fmt::Debug for Alignment {
 }
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl TryFrom<NonZero<usize>> for Alignment {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl const TryFrom<NonZero<usize>> for Alignment {
     type Error = num::TryFromIntError;
 
     #[inline]
@@ -176,7 +182,8 @@ impl TryFrom<NonZero<usize>> for Alignment {
 }
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl TryFrom<usize> for Alignment {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl const TryFrom<usize> for Alignment {
     type Error = num::TryFromIntError;
 
     #[inline]
@@ -186,7 +193,8 @@ impl TryFrom<usize> for Alignment {
 }
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl From<Alignment> for NonZero<usize> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl const From<Alignment> for NonZero<usize> {
     #[inline]
     fn from(align: Alignment) -> NonZero<usize> {
         align.as_nonzero()
@@ -194,14 +202,14 @@ impl From<Alignment> for NonZero<usize> {
 }
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl From<Alignment> for usize {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl const From<Alignment> for usize {
     #[inline]
     fn from(align: Alignment) -> usize {
         align.as_usize()
     }
 }
 
-#[rustc_const_unstable(feature = "const_alloc_layout", issue = "67521")]
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 impl cmp::Ord for Alignment {
     #[inline]
@@ -210,7 +218,6 @@ impl cmp::Ord for Alignment {
     }
 }
 
-#[rustc_const_unstable(feature = "const_alloc_layout", issue = "67521")]
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 impl cmp::PartialOrd for Alignment {
     #[inline]
@@ -229,7 +236,8 @@ impl hash::Hash for Alignment {
 
 /// Returns [`Alignment::MIN`], which is valid for any type.
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-impl Default for Alignment {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+impl const Default for Alignment {
     fn default() -> Alignment {
         Alignment::MIN
     }
@@ -237,7 +245,7 @@ impl Default for Alignment {
 
 #[cfg(target_pointer_width = "16")]
 #[derive(Copy, Clone, PartialEq, Eq)]
-#[repr(u16)]
+#[repr(usize)]
 enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
@@ -259,7 +267,7 @@ enum AlignmentEnum {
 
 #[cfg(target_pointer_width = "32")]
 #[derive(Copy, Clone, PartialEq, Eq)]
-#[repr(u32)]
+#[repr(usize)]
 enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,
@@ -297,7 +305,7 @@ enum AlignmentEnum {
 
 #[cfg(target_pointer_width = "64")]
 #[derive(Copy, Clone, PartialEq, Eq)]
-#[repr(u64)]
+#[repr(usize)]
 enum AlignmentEnum {
     _Align1Shl0 = 1 << 0,
     _Align1Shl1 = 1 << 1,

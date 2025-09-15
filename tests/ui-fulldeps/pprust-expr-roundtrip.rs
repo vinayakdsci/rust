@@ -1,5 +1,7 @@
 //@ run-pass
 //@ ignore-cross-compile
+//@ aux-crate: parser=parser.rs
+//@ edition: 2021
 
 // The general idea of this test is to enumerate all "interesting" expressions and check that
 // `parse(print(e)) == e` for all `e`. Here's what's interesting, for the purposes of this test:
@@ -21,7 +23,6 @@
 
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
-extern crate rustc_data_structures;
 extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
@@ -32,32 +33,22 @@ extern crate thin_vec;
 #[allow(unused_extern_crates)]
 extern crate rustc_driver;
 
-use rustc_ast::mut_visit::{visit_clobber, MutVisitor};
-use rustc_ast::ptr::P;
+use parser::parse_expr;
+use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
-use rustc_parse::{new_parser_from_source_str, unwrap_or_emit_fatal};
 use rustc_session::parse::ParseSess;
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Ident;
-use rustc_span::{FileName, DUMMY_SP};
+use rustc_span::DUMMY_SP;
 use thin_vec::{thin_vec, ThinVec};
 
-fn parse_expr(psess: &ParseSess, src: &str) -> Option<P<Expr>> {
-    let src_as_string = src.to_string();
-
-    let mut p = unwrap_or_emit_fatal(
-        new_parser_from_source_str(psess, FileName::Custom(src_as_string.clone()), src_as_string)
-    );
-    p.parse_expr().map_err(|e| e.cancel()).ok()
-}
-
 // Helper functions for building exprs
-fn expr(kind: ExprKind) -> P<Expr> {
-    P(Expr { id: DUMMY_NODE_ID, kind, span: DUMMY_SP, attrs: AttrVec::new(), tokens: None })
+fn expr(kind: ExprKind) -> Box<Expr> {
+    Box::new(Expr { id: DUMMY_NODE_ID, kind, span: DUMMY_SP, attrs: AttrVec::new(), tokens: None })
 }
 
-fn make_x() -> P<Expr> {
+fn make_x() -> Box<Expr> {
     let seg = PathSegment::from_ident(Ident::from_str("x"));
     let path = Path { segments: thin_vec![seg], span: DUMMY_SP, tokens: None };
     expr(ExprKind::Path(None, path))
@@ -66,7 +57,7 @@ fn make_x() -> P<Expr> {
 /// Iterate over exprs of depth up to `depth`. The goal is to explore all "interesting"
 /// combinations of expression nesting. For example, we explore combinations using `if`, but not
 /// `while` or `match`, since those should print and parse in much the same way as `if`.
-fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
+fn iter_exprs(depth: usize, f: &mut dyn FnMut(Box<Expr>)) {
     if depth == 0 {
         f(make_x());
         return;
@@ -116,18 +107,20 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Unary(UnOp::Deref, e)));
             }
             9 => {
-                let block = P(Block {
+                let block = Box::new(Block {
                     stmts: ThinVec::new(),
                     id: DUMMY_NODE_ID,
                     rules: BlockCheckMode::Default,
                     span: DUMMY_SP,
                     tokens: None,
-                    could_be_bare_literal: false,
                 });
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::If(e, block.clone(), None)));
             }
             10 => {
-                let decl = P(FnDecl { inputs: thin_vec![], output: FnRetTy::Default(DUMMY_SP) });
+                let decl = Box::new(FnDecl {
+                    inputs: thin_vec![],
+                    output: FnRetTy::Default(DUMMY_SP),
+                });
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::Closure(Box::new(Closure {
                         binder: ClosureBinder::NotPresent,
@@ -168,7 +161,7 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
             }
             16 => {
                 let path = Path::from_ident(Ident::from_str("S"));
-                g(ExprKind::Struct(P(StructExpr {
+                g(ExprKind::Struct(Box::new(StructExpr {
                     qself: None,
                     path,
                     fields: thin_vec![],
@@ -179,12 +172,15 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Try(e)));
             }
             18 => {
-                let pat =
-                    P(Pat { id: DUMMY_NODE_ID, kind: PatKind::Wild, span: DUMMY_SP, tokens: None });
-                iter_exprs(
-                    depth - 1,
-                    &mut |e| g(ExprKind::Let(pat.clone(), e, DUMMY_SP, Recovered::No))
-                )
+                let pat = Box::new(Pat {
+                    id: DUMMY_NODE_ID,
+                    kind: PatKind::Wild,
+                    span: DUMMY_SP,
+                    tokens: None,
+                });
+                iter_exprs(depth - 1, &mut |e| {
+                    g(ExprKind::Let(pat.clone(), e, DUMMY_SP, Recovered::No))
+                })
             }
             _ => panic!("bad counter value in iter_exprs"),
         }
@@ -197,12 +193,12 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
 struct RemoveParens;
 
 impl MutVisitor for RemoveParens {
-    fn visit_expr(&mut self, e: &mut P<Expr>) {
+    fn visit_expr(&mut self, e: &mut Expr) {
         match e.kind.clone() {
-            ExprKind::Paren(inner) => *e = inner,
+            ExprKind::Paren(inner) => *e = *inner,
             _ => {}
         };
-        mut_visit::noop_visit_expr(e, self);
+        mut_visit::walk_expr(self, e);
     }
 }
 
@@ -210,17 +206,11 @@ impl MutVisitor for RemoveParens {
 struct AddParens;
 
 impl MutVisitor for AddParens {
-    fn visit_expr(&mut self, e: &mut P<Expr>) {
-        mut_visit::noop_visit_expr(e, self);
-        visit_clobber(e, |e| {
-            P(Expr {
-                id: DUMMY_NODE_ID,
-                kind: ExprKind::Paren(e),
-                span: DUMMY_SP,
-                attrs: AttrVec::new(),
-                tokens: None,
-            })
-        });
+    fn visit_expr(&mut self, e: &mut Expr) {
+        mut_visit::walk_expr(self, e);
+        let expr = std::mem::replace(e, Expr::dummy());
+
+        e.kind = ExprKind::Paren(Box::new(expr));
     }
 }
 

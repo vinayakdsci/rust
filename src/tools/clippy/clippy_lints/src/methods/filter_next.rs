@@ -1,4 +1,5 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
+use clippy_utils::path_to_local_with_projections;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::implements_trait;
 use rustc_ast::{BindingMode, Mutability};
@@ -9,21 +10,6 @@ use rustc_span::sym;
 
 use super::FILTER_NEXT;
 
-fn path_to_local(expr: &hir::Expr<'_>) -> Option<hir::HirId> {
-    match expr.kind {
-        hir::ExprKind::Field(f, _) => path_to_local(f),
-        hir::ExprKind::Index(recv, _, _) => path_to_local(recv),
-        hir::ExprKind::Path(hir::QPath::Resolved(
-            _,
-            hir::Path {
-                res: rustc_hir::def::Res::Local(local),
-                ..
-            },
-        )) => Some(*local),
-        _ => None,
-    }
-}
-
 /// lint use of `filter().next()` for `Iterators`
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
@@ -32,9 +18,10 @@ pub(super) fn check<'tcx>(
     filter_arg: &'tcx hir::Expr<'_>,
 ) {
     // lint if caller of `.filter().next()` is an Iterator
-    let recv_impls_iterator = cx.tcx.get_diagnostic_item(sym::Iterator).map_or(false, |id| {
-        implements_trait(cx, cx.typeck_results().expr_ty(recv), id, &[])
-    });
+    let recv_impls_iterator = cx
+        .tcx
+        .get_diagnostic_item(sym::Iterator)
+        .is_some_and(|id| implements_trait(cx, cx.typeck_results().expr_ty(recv), id, &[]));
     if recv_impls_iterator {
         let msg = "called `filter(..).next()` on an `Iterator`. This is more succinctly expressed by calling \
                    `.find(..)` instead";
@@ -43,7 +30,7 @@ pub(super) fn check<'tcx>(
             let iter_snippet = snippet(cx, recv.span, "..");
             // add note if not multi-line
             span_lint_and_then(cx, FILTER_NEXT, expr.span, msg, |diag| {
-                let (applicability, pat) = if let Some(id) = path_to_local(recv)
+                let (applicability, pat) = if let Some(id) = path_to_local_with_projections(recv)
                     && let hir::Node::Pat(pat) = cx.tcx.hir_node(id)
                     && let hir::PatKind::Binding(BindingMode(_, Mutability::Not), _, ident, _) = pat.kind
                 {

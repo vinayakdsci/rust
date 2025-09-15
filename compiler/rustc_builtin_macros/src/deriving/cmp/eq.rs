@@ -1,13 +1,12 @@
-use crate::deriving::generic::ty::*;
-use crate::deriving::generic::*;
-use crate::deriving::path_std;
-
 use rustc_ast::{self as ast, MetaItem};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::sym;
-use rustc_span::Span;
-use thin_vec::{thin_vec, ThinVec};
+use rustc_span::{Span, sym};
+use thin_vec::{ThinVec, thin_vec};
+
+use crate::deriving::generic::ty::*;
+use crate::deriving::generic::*;
+use crate::deriving::path_std;
 
 pub(crate) fn expand_deriving_eq(
     cx: &ExtCtxt<'_>,
@@ -44,6 +43,7 @@ pub(crate) fn expand_deriving_eq(
         }],
         associated_types: Vec::new(),
         is_const,
+        is_staged_api_crate: cx.ecfg.features.staged_api(),
     };
     trait_def.expand_ext(cx, mitem, item, push, true)
 }

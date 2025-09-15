@@ -6,7 +6,8 @@
 //! Use this to test functionality local to one file.
 //!
 //! Simple Example:
-//! ```
+//!
+//! ```ignore
 //! r#"
 //! fn main() {
 //!     println!("Hello World")
@@ -19,7 +20,8 @@
 //! which is also how to define multiple files in a single test fixture
 //!
 //! Example using two files in the same crate:
-//! ```
+//!
+//! ```ignore
 //! "
 //! //- /main.rs
 //! mod foo;
@@ -33,7 +35,8 @@
 //! ```
 //!
 //! Example using two crates with one file each, with one crate depending on the other:
-//! ```
+//!
+//! ```ignore
 //! r#"
 //! //- /main.rs crate:a deps:b
 //! fn main() {
@@ -51,7 +54,8 @@
 //! for the syntax.
 //!
 //! Example using some available metadata:
-//! ```
+//!
+//! ```ignore
 //! "
 //! //- /lib.rs crate:foo deps:bar,baz cfg:foo=a,bar=b env:OUTDIR=path/to,OTHER=foo
 //! fn insert_source_code_here() {}
@@ -168,7 +172,7 @@ impl FixtureWithProjectMeta {
     /// That will set toolchain to nightly and include predefined proc macros and a subset of
     /// `libcore` into the fixture, see `minicore.rs` for what's available. Note that toolchain
     /// defaults to stable.
-    pub fn parse(ra_fixture: &str) -> Self {
+    pub fn parse(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> Self {
         let fixture = trim_indent(ra_fixture);
         let mut fixture = fixture.as_str();
         let mut toolchain = None;
@@ -214,16 +218,11 @@ impl FixtureWithProjectMeta {
                 );
             }
 
-            if line.starts_with("//-") {
+            if let Some(line) = line.strip_prefix("//-") {
                 let meta = Self::parse_meta_line(line);
                 res.push(meta);
             } else {
-                if line.starts_with("// ")
-                    && line.contains(':')
-                    && !line.contains("::")
-                    && !line.contains('.')
-                    && line.chars().all(|it| !it.is_uppercase())
-                {
+                if matches!(line.strip_prefix("// "), Some(l) if l.trim().starts_with('/')) {
                     panic!("looks like invalid metadata line: {line:?}");
                 }
 
@@ -238,8 +237,7 @@ impl FixtureWithProjectMeta {
 
     //- /lib.rs crate:foo deps:bar,baz cfg:foo=a,bar=b env:OUTDIR=path/to,OTHER=foo
     fn parse_meta_line(meta: &str) -> Fixture {
-        assert!(meta.starts_with("//-"));
-        let meta = meta["//-".len()..].trim();
+        let meta = meta.trim();
         let mut components = meta.split_ascii_whitespace();
 
         let path = components.next().expect("fixture meta must start with a path").to_owned();
@@ -414,23 +412,39 @@ impl MiniCore {
         }
 
         let mut active_regions = Vec::new();
+        let mut inactive_regions = Vec::new();
         let mut seen_regions = Vec::new();
         for line in lines {
             let trimmed = line.trim();
             if let Some(region) = trimmed.strip_prefix("// region:") {
-                active_regions.push(region);
-                continue;
+                if let Some(region) = region.strip_prefix('!') {
+                    inactive_regions.push(region);
+                    continue;
+                } else {
+                    active_regions.push(region);
+                    continue;
+                }
             }
             if let Some(region) = trimmed.strip_prefix("// endregion:") {
-                let prev = active_regions.pop().unwrap();
+                let (prev, region) = if let Some(region) = region.strip_prefix('!') {
+                    (inactive_regions.pop().unwrap(), region)
+                } else {
+                    (active_regions.pop().unwrap(), region)
+                };
                 assert_eq!(prev, region, "unbalanced region pairs");
                 continue;
             }
 
-            let mut line_region = false;
-            if let Some(idx) = trimmed.find("// :") {
-                line_region = true;
-                active_regions.push(&trimmed[idx + "// :".len()..]);
+            let mut active_line_region = 0;
+            let mut inactive_line_region = 0;
+            if let Some(idx) = trimmed.find("// :!") {
+                let regions = trimmed[idx + "// :!".len()..].split(", ");
+                inactive_line_region += regions.clone().count();
+                inactive_regions.extend(regions);
+            } else if let Some(idx) = trimmed.find("// :") {
+                let regions = trimmed[idx + "// :".len()..].split(", ");
+                active_line_region += regions.clone().count();
+                active_regions.extend(regions);
             }
 
             let mut keep = true;
@@ -440,17 +454,29 @@ impl MiniCore {
                 seen_regions.push(region);
                 keep &= self.has_flag(region);
             }
+            for &region in &inactive_regions {
+                assert!(!region.starts_with(' '), "region marker starts with a space: {region:?}");
+                self.assert_valid_flag(region);
+                seen_regions.push(region);
+                keep &= !self.has_flag(region);
+            }
 
             if keep {
                 buf.push_str(line);
             }
-            if line_region {
-                active_regions.pop().unwrap();
+            if active_line_region > 0 {
+                active_regions.drain(active_regions.len() - active_line_region..);
+            }
+            if inactive_line_region > 0 {
+                inactive_regions.drain(inactive_regions.len() - active_line_region..);
             }
         }
 
         if !active_regions.is_empty() {
             panic!("unclosed regions: {active_regions:?} Add an `endregion` comment");
+        }
+        if !inactive_regions.is_empty() {
+            panic!("unclosed regions: {inactive_regions:?} Add an `endregion` comment");
         }
 
         for flag in &self.valid_flags {

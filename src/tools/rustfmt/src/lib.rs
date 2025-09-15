@@ -5,13 +5,9 @@
 #![allow(clippy::match_like_matches_macro)]
 #![allow(unreachable_pub)]
 
-#[macro_use]
-extern crate tracing;
-
 // N.B. these crates are loaded from the sysroot, so they need extern crate.
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
-extern crate rustc_builtin_macros;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
 extern crate rustc_expand;
@@ -48,8 +44,8 @@ use crate::shape::Indent;
 use crate::utils::indent_next_line;
 
 pub use crate::config::{
-    load_config, CliOptions, Color, Config, Edition, EmitMode, FileLines, FileName, NewlineStyle,
-    Range, Verbosity,
+    CliOptions, Color, Config, Edition, EmitMode, FileLines, FileName, NewlineStyle, Range,
+    StyleEdition, Verbosity, Version, load_config,
 };
 
 pub use crate::format_report_formatter::{FormatReportFormatter, FormatReportFormatterBuilder};
@@ -94,6 +90,7 @@ mod rewrite;
 pub(crate) mod rustfmt_diff;
 mod shape;
 mod skip;
+mod sort;
 pub(crate) mod source_file;
 pub(crate) mod source_map;
 mod spanned;

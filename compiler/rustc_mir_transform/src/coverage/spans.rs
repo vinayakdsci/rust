@@ -1,40 +1,102 @@
-use std::collections::VecDeque;
-
-use rustc_data_structures::captures::Captures;
-use rustc_data_structures::fx::FxHashSet;
 use rustc_middle::mir;
-use rustc_span::Span;
+use rustc_middle::mir::coverage::{Mapping, MappingKind, START_BCB};
+use rustc_middle::ty::TyCtxt;
+use rustc_span::source_map::SourceMap;
+use rustc_span::{BytePos, DesugaringKind, ExpnId, ExpnKind, MacroKind, Span};
+use tracing::instrument;
 
+use crate::coverage::expansion::{self, ExpnTree, SpanWithBcb};
 use crate::coverage::graph::{BasicCoverageBlock, CoverageGraph};
-use crate::coverage::mappings;
-use crate::coverage::spans::from_mir::{
-    extract_covspans_from_mir, ExtractedCovspans, Hole, SpanFromMir,
-};
-use crate::coverage::ExtractedHirInfo;
+use crate::coverage::hir_info::ExtractedHirInfo;
+use crate::coverage::spans::from_mir::{Hole, RawSpanFromMir};
 
 mod from_mir;
 
-pub(super) fn extract_refined_covspans(
-    mir_body: &mir::Body<'_>,
+pub(super) fn extract_refined_covspans<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &mir::Body<'tcx>,
     hir_info: &ExtractedHirInfo,
-    basic_coverage_blocks: &CoverageGraph,
-    code_mappings: &mut impl Extend<mappings::CodeMapping>,
+    graph: &CoverageGraph,
+    mappings: &mut Vec<Mapping>,
 ) {
-    let ExtractedCovspans { mut covspans } =
-        extract_covspans_from_mir(mir_body, hir_info, basic_coverage_blocks);
+    if hir_info.is_async_fn {
+        // An async function desugars into a function that returns a future,
+        // with the user code wrapped in a closure. Any spans in the desugared
+        // outer function will be unhelpful, so just keep the signature span
+        // and ignore all of the spans in the MIR body.
+        if let Some(span) = hir_info.fn_sig_span {
+            mappings.push(Mapping { span, kind: MappingKind::Code { bcb: START_BCB } })
+        }
+        return;
+    }
 
-    // First, perform the passes that need macro information.
-    covspans.sort_by(|a, b| basic_coverage_blocks.cmp_in_dominator_order(a.bcb, b.bcb));
-    remove_unwanted_macro_spans(&mut covspans);
-    split_visible_macro_spans(&mut covspans);
+    let &ExtractedHirInfo { body_span, .. } = hir_info;
 
-    // We no longer need the extra information in `SpanFromMir`, so convert to `Covspan`.
-    let mut covspans = covspans.into_iter().map(SpanFromMir::into_covspan).collect::<Vec<_>>();
+    let raw_spans = from_mir::extract_raw_spans_from_mir(mir_body, graph);
+    // Use the raw spans to build a tree of expansions for this function.
+    let expn_tree = expansion::build_expn_tree(
+        raw_spans
+            .into_iter()
+            .map(|RawSpanFromMir { raw_span, bcb }| SpanWithBcb { span: raw_span, bcb }),
+    );
+
+    let mut covspans = vec![];
+    let mut push_covspan = |covspan: Covspan| {
+        let covspan_span = covspan.span;
+        // Discard any spans not contained within the function body span.
+        // Also discard any spans that fill the entire body, because they tend
+        // to represent compiler-inserted code, e.g. implicitly returning `()`.
+        if !body_span.contains(covspan_span) || body_span.source_equal(covspan_span) {
+            return;
+        }
+
+        // Each pushed covspan should have the same context as the body span.
+        // If it somehow doesn't, discard the covspan, or panic in debug builds.
+        if !body_span.eq_ctxt(covspan_span) {
+            debug_assert!(
+                false,
+                "span context mismatch: body_span={body_span:?}, covspan.span={covspan_span:?}"
+            );
+            return;
+        }
+
+        covspans.push(covspan);
+    };
+
+    if let Some(node) = expn_tree.get(body_span.ctxt().outer_expn()) {
+        for &SpanWithBcb { span, bcb } in &node.spans {
+            push_covspan(Covspan { span, bcb });
+        }
+
+        // For each expansion with its call-site in the body span, try to
+        // distill a corresponding covspan.
+        for &child_expn_id in &node.child_expn_ids {
+            if let Some(covspan) =
+                single_covspan_for_child_expn(tcx, graph, &expn_tree, child_expn_id)
+            {
+                push_covspan(covspan);
+            }
+        }
+    }
+
+    // Only proceed if we found at least one usable span.
+    if covspans.is_empty() {
+        return;
+    }
+
+    // Also add the function signature span, if available.
+    // Otherwise, add a fake span at the start of the body, to avoid an ugly
+    // gap between the start of the body and the first real span.
+    // FIXME: Find a more principled way to solve this problem.
+    covspans.push(Covspan {
+        span: hir_info.fn_sig_span.unwrap_or_else(|| body_span.shrink_to_lo()),
+        bcb: START_BCB,
+    });
 
     let compare_covspans = |a: &Covspan, b: &Covspan| {
         compare_spans(a.span, b.span)
             // After deduplication, we want to keep only the most-dominated BCB.
-            .then_with(|| basic_coverage_blocks.cmp_in_dominator_order(a.bcb, b.bcb).reverse())
+            .then_with(|| graph.cmp_in_dominator_order(a.bcb, b.bcb).reverse())
     };
     covspans.sort_by(compare_covspans);
 
@@ -45,141 +107,103 @@ pub(super) fn extract_refined_covspans(
     covspans.dedup_by(|b, a| a.span.source_equal(b.span));
 
     // Sort the holes, and merge overlapping/adjacent holes.
-    let mut holes = hir_info.hole_spans.iter().map(|&span| Hole { span }).collect::<Vec<_>>();
+    let mut holes = hir_info
+        .hole_spans
+        .iter()
+        .copied()
+        // Discard any holes that aren't directly visible within the body span.
+        .filter(|&hole_span| body_span.contains(hole_span) && body_span.eq_ctxt(hole_span))
+        .map(|span| Hole { span })
+        .collect::<Vec<_>>();
     holes.sort_by(|a, b| compare_spans(a.span, b.span));
     holes.dedup_by(|b, a| a.merge_if_overlapping_or_adjacent(b));
 
-    // Split the covspans into separate buckets that don't overlap any holes.
-    let buckets = divide_spans_into_buckets(covspans, &holes);
+    // Discard any span that overlaps with a hole.
+    discard_spans_overlapping_holes(&mut covspans, &holes);
 
-    for mut covspans in buckets {
-        // Make sure each individual bucket is internally sorted.
-        covspans.sort_by(compare_covspans);
-        let _span = debug_span!("processing bucket", ?covspans).entered();
+    // Discard spans that overlap in unwanted ways.
+    let mut covspans = remove_unwanted_overlapping_spans(covspans);
 
-        let mut covspans = remove_unwanted_overlapping_spans(covspans);
-        debug!(?covspans, "after removing overlaps");
+    // For all empty spans, either enlarge them to be non-empty, or discard them.
+    let source_map = tcx.sess.source_map();
+    covspans.retain_mut(|covspan| {
+        let Some(span) = ensure_non_empty_span(source_map, covspan.span) else { return false };
+        covspan.span = span;
+        true
+    });
 
-        // Do one last merge pass, to simplify the output.
-        covspans.dedup_by(|b, a| a.merge_if_eligible(b));
-        debug!(?covspans, "after merge");
+    // Merge covspans that can be merged.
+    covspans.dedup_by(|b, a| a.merge_if_eligible(b));
 
-        code_mappings.extend(covspans.into_iter().map(|Covspan { span, bcb }| {
-            // Each span produced by the refiner represents an ordinary code region.
-            mappings::CodeMapping { span, bcb }
-        }));
+    mappings.extend(covspans.into_iter().map(|Covspan { span, bcb }| {
+        // Each span produced by the refiner represents an ordinary code region.
+        Mapping { span, kind: MappingKind::Code { bcb } }
+    }));
+}
+
+/// For a single child expansion, try to distill it into a single span+BCB mapping.
+fn single_covspan_for_child_expn(
+    tcx: TyCtxt<'_>,
+    graph: &CoverageGraph,
+    expn_tree: &ExpnTree,
+    expn_id: ExpnId,
+) -> Option<Covspan> {
+    let node = expn_tree.get(expn_id)?;
+
+    let bcbs =
+        expn_tree.iter_node_and_descendants(expn_id).flat_map(|n| n.spans.iter().map(|s| s.bcb));
+
+    let bcb = match node.expn_kind {
+        // For bang-macros (e.g. `assert!`, `trace!`) and for `await`, taking
+        // the "first" BCB in dominator order seems to give good results.
+        ExpnKind::Macro(MacroKind::Bang, _) | ExpnKind::Desugaring(DesugaringKind::Await) => {
+            bcbs.min_by(|&a, &b| graph.cmp_in_dominator_order(a, b))?
+        }
+        // For other kinds of expansion, taking the "last" (most-dominated) BCB
+        // seems to give good results.
+        _ => bcbs.max_by(|&a, &b| graph.cmp_in_dominator_order(a, b))?,
+    };
+
+    // For bang-macro expansions, limit the call-site span to just the macro
+    // name plus `!`, excluding the macro arguments.
+    let mut span = node.call_site?;
+    if matches!(node.expn_kind, ExpnKind::Macro(MacroKind::Bang, _)) {
+        span = tcx.sess.source_map().span_through_char(span, '!');
     }
+
+    Some(Covspan { span, bcb })
 }
 
-/// Macros that expand into branches (e.g. `assert!`, `trace!`) tend to generate
-/// multiple condition/consequent blocks that have the span of the whole macro
-/// invocation, which is unhelpful. Keeping only the first such span seems to
-/// give better mappings, so remove the others.
+/// Discard all covspans that overlap a hole.
 ///
-/// (The input spans should be sorted in BCB dominator order, so that the
-/// retained "first" span is likely to dominate the others.)
-fn remove_unwanted_macro_spans(covspans: &mut Vec<SpanFromMir>) {
-    let mut seen_macro_spans = FxHashSet::default();
-    covspans.retain(|covspan| {
-        // Ignore (retain) non-macro-expansion spans.
-        if covspan.visible_macro.is_none() {
-            return true;
-        }
-
-        // Retain only the first macro-expanded covspan with this span.
-        seen_macro_spans.insert(covspan.span)
-    });
-}
-
-/// When a span corresponds to a macro invocation that is visible from the
-/// function body, split it into two parts. The first part covers just the
-/// macro name plus `!`, and the second part covers the rest of the macro
-/// invocation. This seems to give better results for code that uses macros.
-fn split_visible_macro_spans(covspans: &mut Vec<SpanFromMir>) {
-    let mut extra_spans = vec![];
-
-    covspans.retain(|covspan| {
-        let Some(visible_macro) = covspan.visible_macro else { return true };
-
-        let split_len = visible_macro.as_str().len() as u32 + 1;
-        let (before, after) = covspan.span.split_at(split_len);
-        if !covspan.span.contains(before) || !covspan.span.contains(after) {
-            // Something is unexpectedly wrong with the split point.
-            // The debug assertion in `split_at` will have already caught this,
-            // but in release builds it's safer to do nothing and maybe get a
-            // bug report for unexpected coverage, rather than risk an ICE.
-            return true;
-        }
-
-        extra_spans.push(SpanFromMir::new(before, covspan.visible_macro, covspan.bcb));
-        extra_spans.push(SpanFromMir::new(after, covspan.visible_macro, covspan.bcb));
-        false // Discard the original covspan that we just split.
-    });
-
-    // The newly-split spans are added at the end, so any previous sorting
-    // is not preserved.
-    covspans.extend(extra_spans);
-}
-
-/// Uses the holes to divide the given covspans into buckets, such that:
-/// - No span in any hole overlaps a bucket (truncating the spans if necessary).
-/// - The spans in each bucket are strictly after all spans in previous buckets,
-///   and strictly before all spans in subsequent buckets.
-///
-/// The resulting buckets are sorted relative to each other, but might not be
-/// internally sorted.
-#[instrument(level = "debug")]
-fn divide_spans_into_buckets(input_covspans: Vec<Covspan>, holes: &[Hole]) -> Vec<Vec<Covspan>> {
-    debug_assert!(input_covspans.is_sorted_by(|a, b| compare_spans(a.span, b.span).is_le()));
+/// The lists of covspans and holes must be sorted, and any holes that overlap
+/// with each other must have already been merged.
+fn discard_spans_overlapping_holes(covspans: &mut Vec<Covspan>, holes: &[Hole]) {
+    debug_assert!(covspans.is_sorted_by(|a, b| compare_spans(a.span, b.span).is_le()));
     debug_assert!(holes.is_sorted_by(|a, b| compare_spans(a.span, b.span).is_le()));
+    debug_assert!(holes.array_windows().all(|[a, b]| !a.span.overlaps_or_adjacent(b.span)));
 
-    // Now we're ready to start carving holes out of the initial coverage spans,
-    // and grouping them in buckets separated by the holes.
+    let mut curr_hole = 0usize;
+    let mut overlaps_hole = |covspan: &Covspan| -> bool {
+        while let Some(hole) = holes.get(curr_hole) {
+            // Both lists are sorted, so we can permanently skip any holes that
+            // end before the start of the current span.
+            if hole.span.hi() <= covspan.span.lo() {
+                curr_hole += 1;
+                continue;
+            }
 
-    let mut input_covspans = VecDeque::from(input_covspans);
-    let mut fragments = vec![];
-
-    // For each hole:
-    // - Identify the spans that are entirely or partly before the hole.
-    // - Put those spans in a corresponding bucket, truncated to the start of the hole.
-    // - If one of those spans also extends after the hole, put the rest of it
-    //   in a "fragments" vector that is processed by the next hole.
-    let mut buckets = (0..holes.len()).map(|_| vec![]).collect::<Vec<_>>();
-    for (hole, bucket) in holes.iter().zip(&mut buckets) {
-        let fragments_from_prev = std::mem::take(&mut fragments);
-
-        // Only inspect spans that precede or overlap this hole,
-        // leaving the rest to be inspected by later holes.
-        // (This relies on the spans and holes both being sorted.)
-        let relevant_input_covspans =
-            drain_front_while(&mut input_covspans, |c| c.span.lo() < hole.span.hi());
-
-        for covspan in fragments_from_prev.into_iter().chain(relevant_input_covspans) {
-            let (before, after) = covspan.split_around_hole_span(hole.span);
-            bucket.extend(before);
-            fragments.extend(after);
+            return hole.span.overlaps(covspan.span);
         }
-    }
 
-    // After finding the spans before each hole, any remaining fragments/spans
-    // form their own final bucket, after the final hole.
-    // (If there were no holes, this will just be all of the initial spans.)
-    fragments.extend(input_covspans);
-    buckets.push(fragments);
+        // No holes left, so this covspan doesn't overlap with any holes.
+        false
+    };
 
-    buckets
+    covspans.retain(|covspan| !overlaps_hole(covspan));
 }
 
-/// Similar to `.drain(..)`, but stops just before it would remove an item not
-/// satisfying the predicate.
-fn drain_front_while<'a, T>(
-    queue: &'a mut VecDeque<T>,
-    mut pred_fn: impl FnMut(&T) -> bool,
-) -> impl Iterator<Item = T> + Captures<'a> {
-    std::iter::from_fn(move || if pred_fn(queue.front()?) { queue.pop_front() } else { None })
-}
-
-/// Takes one of the buckets of (sorted) spans extracted from MIR, and "refines"
+/// Takes a list of sorted spans extracted from MIR, and "refines"
 /// those spans by removing spans that overlap in unwanted ways.
 #[instrument(level = "debug")]
 fn remove_unwanted_overlapping_spans(sorted_spans: Vec<Covspan>) -> Vec<Covspan> {
@@ -219,35 +243,21 @@ struct Covspan {
 }
 
 impl Covspan {
-    /// Splits this covspan into 0-2 parts:
-    /// - The part that is strictly before the hole span, if any.
-    /// - The part that is strictly after the hole span, if any.
-    fn split_around_hole_span(&self, hole_span: Span) -> (Option<Self>, Option<Self>) {
-        let before = try {
-            let span = self.span.trim_end(hole_span)?;
-            Self { span, ..*self }
-        };
-        let after = try {
-            let span = self.span.trim_start(hole_span)?;
-            Self { span, ..*self }
-        };
-
-        (before, after)
-    }
-
-    /// If `self` and `other` can be merged (i.e. they have the same BCB),
-    /// mutates `self.span` to also include `other.span` and returns true.
+    /// If `self` and `other` can be merged, mutates `self.span` to also
+    /// include `other.span` and returns true.
     ///
-    /// Note that compatible covspans can be merged even if their underlying
-    /// spans are not overlapping/adjacent; any space between them will also be
-    /// part of the merged covspan.
+    /// Two covspans can be merged if they have the same BCB, and they are
+    /// overlapping or adjacent.
     fn merge_if_eligible(&mut self, other: &Self) -> bool {
-        if self.bcb != other.bcb {
-            return false;
-        }
+        let eligible_for_merge =
+            |a: &Self, b: &Self| (a.bcb == b.bcb) && a.span.overlaps_or_adjacent(b.span);
 
-        self.span = self.span.to(other.span);
-        true
+        if eligible_for_merge(self, other) {
+            self.span = self.span.to(other.span);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -261,4 +271,27 @@ fn compare_spans(a: Span, b: Span) -> std::cmp::Ordering {
         // - Span A extends further left, or
         // - Both have the same start and span A extends further right
         .then_with(|| Ord::cmp(&a.hi(), &b.hi()).reverse())
+}
+
+fn ensure_non_empty_span(source_map: &SourceMap, span: Span) -> Option<Span> {
+    if !span.is_empty() {
+        return Some(span);
+    }
+
+    // The span is empty, so try to enlarge it to cover an adjacent '{' or '}'.
+    source_map
+        .span_to_source(span, |src, start, end| try {
+            // Adjusting span endpoints by `BytePos(1)` is normally a bug,
+            // but in this case we have specifically checked that the character
+            // we're skipping over is one of two specific ASCII characters, so
+            // adjusting by exactly 1 byte is correct.
+            if src.as_bytes().get(end).copied() == Some(b'{') {
+                Some(span.with_hi(span.hi() + BytePos(1)))
+            } else if start > 0 && src.as_bytes()[start - 1] == b'}' {
+                Some(span.with_lo(span.lo() - BytePos(1)))
+            } else {
+                None
+            }
+        })
+        .ok()?
 }

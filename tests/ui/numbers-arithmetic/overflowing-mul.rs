@@ -1,7 +1,7 @@
 //@ run-fail
-//@ error-pattern:thread 'main' panicked
-//@ error-pattern:attempt to multiply with overflow
-//@ ignore-emscripten no processes
+//@ regex-error-pattern: thread 'main'.*panicked
+//@ error-pattern: attempt to multiply with overflow
+//@ needs-subprocess
 //@ compile-flags: -C debug-assertions
 
 #![allow(arithmetic_overflow)]

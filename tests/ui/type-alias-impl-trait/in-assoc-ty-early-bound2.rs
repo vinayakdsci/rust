@@ -6,14 +6,14 @@ trait Foo {
 }
 
 impl Foo for () {
-    type Assoc<'a> = impl Sized; //~ ERROR unconstrained opaque type
+    type Assoc<'a> = impl Sized;
     fn bar<'a: 'a>()
     where
         Self::Assoc<'a>:,
     {
         let _ = |x: &'a ()| {
             let _: Self::Assoc<'a> = x;
-            //~^ ERROR `<() as Foo>::Assoc<'a>` captures lifetime that does not appear in bound
+            //~^ ERROR expected generic lifetime parameter, found `'_`
         };
     }
 }

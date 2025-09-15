@@ -1,7 +1,8 @@
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:18:5
+  --> tests/ui/iter_over_hash_type.rs:21:5
    |
 LL | /     for x in &hash_set {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^
@@ -10,65 +11,46 @@ LL | |     }
    = help: to override `-D warnings` add `#[allow(clippy::iter_over_hash_type)]`
 
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:21:5
+  --> tests/ui/iter_over_hash_type.rs:25:5
    |
 LL | /     for x in hash_set.iter() {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^
 
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:24:5
+  --> tests/ui/iter_over_hash_type.rs:29:5
    |
 LL | /     for x in hash_set.clone() {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^
 
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:27:5
+  --> tests/ui/iter_over_hash_type.rs:33:5
    |
 LL | /     for x in hash_set.drain() {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^
 
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:32:5
+  --> tests/ui/iter_over_hash_type.rs:39:5
    |
 LL | /     for (x, y) in &hash_map {
+LL | |
 LL | |         let _ = (x, y);
 LL | |     }
    | |_____^
 
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:35:5
+  --> tests/ui/iter_over_hash_type.rs:43:5
    |
 LL | /     for x in hash_map.keys() {
-LL | |         let _ = x;
-LL | |     }
-   | |_____^
-
-error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:38:5
-   |
-LL | /     for x in hash_map.values() {
-LL | |         let _ = x;
-LL | |     }
-   | |_____^
-
-error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:41:5
-   |
-LL | /     for x in hash_map.values_mut() {
-LL | |         *x += 1;
-LL | |     }
-   | |_____^
-
-error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:44:5
-   |
-LL | /     for x in hash_map.iter() {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^
@@ -76,31 +58,62 @@ LL | |     }
 error: iteration over unordered hash-based type
   --> tests/ui/iter_over_hash_type.rs:47:5
    |
-LL | /     for x in hash_map.clone() {
+LL | /     for x in hash_map.values() {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^
 
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:50:5
+  --> tests/ui/iter_over_hash_type.rs:51:5
    |
-LL | /     for x in hash_map.drain() {
-LL | |         let _ = x;
+LL | /     for x in hash_map.values_mut() {
+LL | |
+LL | |         *x += 1;
 LL | |     }
    | |_____^
 
 error: iteration over unordered hash-based type
   --> tests/ui/iter_over_hash_type.rs:55:5
    |
-LL | /     for x in fx_hash_set {
+LL | /     for x in hash_map.iter() {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^
 
 error: iteration over unordered hash-based type
-  --> tests/ui/iter_over_hash_type.rs:58:5
+  --> tests/ui/iter_over_hash_type.rs:59:5
+   |
+LL | /     for x in hash_map.clone() {
+LL | |
+LL | |         let _ = x;
+LL | |     }
+   | |_____^
+
+error: iteration over unordered hash-based type
+  --> tests/ui/iter_over_hash_type.rs:63:5
+   |
+LL | /     for x in hash_map.drain() {
+LL | |
+LL | |         let _ = x;
+LL | |     }
+   | |_____^
+
+error: iteration over unordered hash-based type
+  --> tests/ui/iter_over_hash_type.rs:69:5
+   |
+LL | /     for x in fx_hash_set {
+LL | |
+LL | |         let _ = x;
+LL | |     }
+   | |_____^
+
+error: iteration over unordered hash-based type
+  --> tests/ui/iter_over_hash_type.rs:73:5
    |
 LL | /     for x in fx_hash_map {
+LL | |
 LL | |         let _ = x;
 LL | |     }
    | |_____^

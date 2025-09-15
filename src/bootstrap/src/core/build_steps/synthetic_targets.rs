@@ -7,10 +7,10 @@
 //! one of the target specs already defined in this module, or create new ones by adding a new step
 //! that calls create_synthetic_target.
 
+use crate::Compiler;
 use crate::core::builder::{Builder, ShouldRun, Step};
 use crate::core::config::TargetSelection;
 use crate::utils::exec::command;
-use crate::Compiler;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MirOptPanicAbortSyntheticTarget {
@@ -21,7 +21,6 @@ pub(crate) struct MirOptPanicAbortSyntheticTarget {
 impl Step for MirOptPanicAbortSyntheticTarget {
     type Output = TargetSelection;
     const DEFAULT: bool = true;
-    const ONLY_HOSTS: bool = false;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.never()
@@ -64,7 +63,7 @@ fn create_synthetic_target(
     // we cannot use nightly features. So `RUSTC_BOOTSTRAP` is needed here.
     cmd.env("RUSTC_BOOTSTRAP", "1");
 
-    let output = cmd.capture().run(builder).stdout();
+    let output = cmd.run_capture(builder).stdout();
     let mut spec: serde_json::Value = serde_json::from_slice(output.as_bytes()).unwrap();
     let spec_map = spec.as_object_mut().unwrap();
 

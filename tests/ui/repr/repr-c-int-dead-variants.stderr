@@ -1,10 +1,17 @@
 error: layout_of(UnivariantU8) = Layout {
            size: Size(1 bytes),
-           align: AbiAndPrefAlign {
+           align: AbiAlign {
                abi: Align(1 bytes),
-               pref: $SOME_ALIGN,
            },
-           abi: Uninhabited,
+           backend_repr: Scalar(
+               Initialized {
+                   value: Int(
+                       I8,
+                       false,
+                   ),
+                   valid_range: 0..=0,
+               },
+           ),
            fields: Arbitrary {
                offsets: [
                    Size(0 bytes),
@@ -23,6 +30,7 @@ error: layout_of(UnivariantU8) = Layout {
                    valid_range: 0..=0,
                },
            ),
+           uninhabited: true,
            variants: Multiple {
                tag: Initialized {
                    value: Int(
@@ -36,11 +44,18 @@ error: layout_of(UnivariantU8) = Layout {
                variants: [
                    Layout {
                        size: Size(1 bytes),
-                       align: AbiAndPrefAlign {
+                       align: AbiAlign {
                            abi: Align(1 bytes),
-                           pref: $SOME_ALIGN,
                        },
-                       abi: Uninhabited,
+                       backend_repr: Scalar(
+                           Initialized {
+                               value: Int(
+                                   I8,
+                                   false,
+                               ),
+                               valid_range: 0..=0,
+                           },
+                       ),
                        fields: Arbitrary {
                            offsets: [
                                Size(1 bytes),
@@ -50,29 +65,31 @@ error: layout_of(UnivariantU8) = Layout {
                            ],
                        },
                        largest_niche: None,
+                       uninhabited: true,
                        variants: Single {
                            index: 0,
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(1 bytes),
+                       randomization_seed: $SEED,
                    },
                ],
            },
            max_repr_align: None,
            unadjusted_abi_align: Align(1 bytes),
+           randomization_seed: $SEED,
        }
-  --> $DIR/repr-c-int-dead-variants.rs:14:1
+  --> $DIR/repr-c-int-dead-variants.rs:15:1
    |
 LL | enum UnivariantU8 {
    | ^^^^^^^^^^^^^^^^^
 
 error: layout_of(TwoVariantsU8) = Layout {
            size: Size(2 bytes),
-           align: AbiAndPrefAlign {
+           align: AbiAlign {
                abi: Align(1 bytes),
-               pref: $SOME_ALIGN,
            },
-           abi: ScalarPair(
+           backend_repr: ScalarPair(
                Initialized {
                    value: Int(
                        I8,
@@ -105,6 +122,7 @@ error: layout_of(TwoVariantsU8) = Layout {
                    valid_range: 0..=1,
                },
            ),
+           uninhabited: false,
            variants: Multiple {
                tag: Initialized {
                    value: Int(
@@ -117,34 +135,11 @@ error: layout_of(TwoVariantsU8) = Layout {
                tag_field: 0,
                variants: [
                    Layout {
-                       size: Size(1 bytes),
-                       align: AbiAndPrefAlign {
-                           abi: Align(1 bytes),
-                           pref: $SOME_ALIGN,
-                       },
-                       abi: Uninhabited,
-                       fields: Arbitrary {
-                           offsets: [
-                               Size(1 bytes),
-                           ],
-                           memory_index: [
-                               0,
-                           ],
-                       },
-                       largest_niche: None,
-                       variants: Single {
-                           index: 0,
-                       },
-                       max_repr_align: None,
-                       unadjusted_abi_align: Align(1 bytes),
-                   },
-                   Layout {
                        size: Size(2 bytes),
-                       align: AbiAndPrefAlign {
+                       align: AbiAlign {
                            abi: Align(1 bytes),
-                           pref: $SOME_ALIGN,
                        },
-                       abi: ScalarPair(
+                       backend_repr: ScalarPair(
                            Initialized {
                                value: Int(
                                    I8,
@@ -168,29 +163,68 @@ error: layout_of(TwoVariantsU8) = Layout {
                            ],
                        },
                        largest_niche: None,
+                       uninhabited: true,
+                       variants: Single {
+                           index: 0,
+                       },
+                       max_repr_align: None,
+                       unadjusted_abi_align: Align(1 bytes),
+                       randomization_seed: $SEED,
+                   },
+                   Layout {
+                       size: Size(2 bytes),
+                       align: AbiAlign {
+                           abi: Align(1 bytes),
+                       },
+                       backend_repr: ScalarPair(
+                           Initialized {
+                               value: Int(
+                                   I8,
+                                   false,
+                               ),
+                               valid_range: 0..=1,
+                           },
+                           Union {
+                               value: Int(
+                                   I8,
+                                   false,
+                               ),
+                           },
+                       ),
+                       fields: Arbitrary {
+                           offsets: [
+                               Size(1 bytes),
+                           ],
+                           memory_index: [
+                               0,
+                           ],
+                       },
+                       largest_niche: None,
+                       uninhabited: false,
                        variants: Single {
                            index: 1,
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(1 bytes),
+                       randomization_seed: $SEED,
                    },
                ],
            },
            max_repr_align: None,
            unadjusted_abi_align: Align(1 bytes),
+           randomization_seed: $SEED,
        }
-  --> $DIR/repr-c-int-dead-variants.rs:21:1
+  --> $DIR/repr-c-int-dead-variants.rs:22:1
    |
 LL | enum TwoVariantsU8 {
    | ^^^^^^^^^^^^^^^^^^
 
 error: layout_of(DeadBranchHasOtherFieldU8) = Layout {
            size: Size(16 bytes),
-           align: AbiAndPrefAlign {
+           align: AbiAlign {
                abi: Align(8 bytes),
-               pref: $SOME_ALIGN,
            },
-           abi: Aggregate {
+           backend_repr: Memory {
                sized: true,
            },
            fields: Arbitrary {
@@ -211,6 +245,7 @@ error: layout_of(DeadBranchHasOtherFieldU8) = Layout {
                    valid_range: 0..=1,
                },
            ),
+           uninhabited: false,
            variants: Multiple {
                tag: Initialized {
                    value: Int(
@@ -224,11 +259,12 @@ error: layout_of(DeadBranchHasOtherFieldU8) = Layout {
                variants: [
                    Layout {
                        size: Size(16 bytes),
-                       align: AbiAndPrefAlign {
+                       align: AbiAlign {
                            abi: Align(8 bytes),
-                           pref: $SOME_ALIGN,
                        },
-                       abi: Uninhabited,
+                       backend_repr: Memory {
+                           sized: true,
+                       },
                        fields: Arbitrary {
                            offsets: [
                                Size(8 bytes),
@@ -240,6 +276,7 @@ error: layout_of(DeadBranchHasOtherFieldU8) = Layout {
                            ],
                        },
                        largest_niche: None,
+                       uninhabited: true,
                        variants: Single {
                            index: 0,
                        },
@@ -247,14 +284,14 @@ error: layout_of(DeadBranchHasOtherFieldU8) = Layout {
                            Align(8 bytes),
                        ),
                        unadjusted_abi_align: Align(8 bytes),
+                       randomization_seed: $SEED,
                    },
                    Layout {
                        size: Size(16 bytes),
-                       align: AbiAndPrefAlign {
+                       align: AbiAlign {
                            abi: Align(8 bytes),
-                           pref: $SOME_ALIGN,
                        },
-                       abi: Aggregate {
+                       backend_repr: Memory {
                            sized: true,
                        },
                        fields: Arbitrary {
@@ -266,11 +303,13 @@ error: layout_of(DeadBranchHasOtherFieldU8) = Layout {
                            ],
                        },
                        largest_niche: None,
+                       uninhabited: false,
                        variants: Single {
                            index: 1,
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(8 bytes),
+                       randomization_seed: $SEED,
                    },
                ],
            },
@@ -278,8 +317,9 @@ error: layout_of(DeadBranchHasOtherFieldU8) = Layout {
                Align(8 bytes),
            ),
            unadjusted_abi_align: Align(8 bytes),
+           randomization_seed: $SEED,
        }
-  --> $DIR/repr-c-int-dead-variants.rs:33:1
+  --> $DIR/repr-c-int-dead-variants.rs:34:1
    |
 LL | enum DeadBranchHasOtherFieldU8 {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

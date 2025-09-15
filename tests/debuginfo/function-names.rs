@@ -2,6 +2,7 @@
 //@ min-gdb-version: 10.1
 
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
@@ -37,7 +38,7 @@
 // Const generic parameter
 // gdb-command:info functions -q function_names::const_generic_fn.*
 // gdb-check:[...]static fn function_names::const_generic_fn_bool<false>();
-// gdb-check:[...]static fn function_names::const_generic_fn_non_int<{CONST#a70c39591cb5f53d}>();
+// gdb-check:[...]static fn function_names::const_generic_fn_non_int<{CONST#ffa3db4ca1d52dce}>();
 // gdb-check:[...]static fn function_names::const_generic_fn_signed_int<-7>();
 // gdb-check:[...]static fn function_names::const_generic_fn_unsigned_int<14>();
 
@@ -78,8 +79,6 @@
 // cdb-check:[...] a!function_names::const_generic_fn_bool<false> (void)
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 #![feature(adt_const_params, coroutines, coroutine_trait, stmt_expr_attributes)]
 #![allow(incomplete_features)]
 

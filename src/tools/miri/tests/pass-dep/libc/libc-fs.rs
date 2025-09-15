@@ -1,11 +1,11 @@
-//@ignore-target-windows: File handling is not implemented yet
+//@ignore-target: windows # File handling is not implemented yet
 //@compile-flags: -Zmiri-disable-isolation
 
 #![feature(io_error_more)]
 #![feature(io_error_uncategorized)]
 
 use std::ffi::{CStr, CString, OsString};
-use std::fs::{canonicalize, remove_file, File};
+use std::fs::{File, canonicalize, remove_file};
 use std::io::{Error, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
@@ -13,6 +13,9 @@ use std::path::PathBuf;
 
 #[path = "../../utils/mod.rs"]
 mod utils;
+
+#[path = "../../utils/libc.rs"]
+mod libc_utils;
 
 fn main() {
     test_dup();
@@ -37,6 +40,9 @@ fn main() {
     test_sync_file_range();
     test_isatty();
     test_read_and_uninit();
+    test_nofollow_not_symlink();
+    #[cfg(target_os = "macos")]
+    test_ioctl();
 }
 
 fn test_file_open_unix_allow_two_args() {
@@ -71,8 +77,8 @@ fn test_dup_stdout_stderr() {
     unsafe {
         let new_stdout = libc::fcntl(1, libc::F_DUPFD, 0);
         let new_stderr = libc::fcntl(2, libc::F_DUPFD, 0);
-        libc::write(new_stdout, bytes.as_ptr() as *const libc::c_void, bytes.len());
-        libc::write(new_stderr, bytes.as_ptr() as *const libc::c_void, bytes.len());
+        libc_utils::write_all(new_stdout, bytes.as_ptr() as *const libc::c_void, bytes.len());
+        libc_utils::write_all(new_stderr, bytes.as_ptr() as *const libc::c_void, bytes.len());
     }
 }
 
@@ -85,19 +91,28 @@ fn test_dup() {
     let name_ptr = name.as_bytes().as_ptr().cast::<libc::c_char>();
     unsafe {
         let fd = libc::open(name_ptr, libc::O_RDONLY);
-        let mut first_buf = [0u8; 4];
-        libc::read(fd, first_buf.as_mut_ptr() as *mut libc::c_void, 4);
-        assert_eq!(&first_buf, b"dup ");
-
         let new_fd = libc::dup(fd);
-        let mut second_buf = [0u8; 4];
-        libc::read(new_fd, second_buf.as_mut_ptr() as *mut libc::c_void, 4);
-        assert_eq!(&second_buf, b"and ");
-
         let new_fd2 = libc::dup2(fd, 8);
+
+        let mut first_buf = [0u8; 4];
+        let first_len = libc::read(fd, first_buf.as_mut_ptr() as *mut libc::c_void, 4);
+        assert!(first_len > 0);
+        let first_len = first_len as usize;
+        assert_eq!(first_buf[..first_len], bytes[..first_len]);
+        let remaining_bytes = &bytes[first_len..];
+
+        let mut second_buf = [0u8; 4];
+        let second_len = libc::read(new_fd, second_buf.as_mut_ptr() as *mut libc::c_void, 4);
+        assert!(second_len > 0);
+        let second_len = second_len as usize;
+        assert_eq!(second_buf[..second_len], remaining_bytes[..second_len]);
+        let remaining_bytes = &remaining_bytes[second_len..];
+
         let mut third_buf = [0u8; 4];
-        libc::read(new_fd2, third_buf.as_mut_ptr() as *mut libc::c_void, 4);
-        assert_eq!(&third_buf, b"dup2");
+        let third_len = libc::read(new_fd2, third_buf.as_mut_ptr() as *mut libc::c_void, 4);
+        assert!(third_len > 0);
+        let third_len = third_len as usize;
+        assert_eq!(third_buf[..third_len], remaining_bytes[..third_len]);
     }
 }
 
@@ -141,7 +156,7 @@ fn test_ftruncate<T: From<i32>>(
     let bytes = b"hello";
     let path = utils::prepare("miri_test_libc_fs_ftruncate.txt");
     let mut file = File::create(&path).unwrap();
-    file.write(bytes).unwrap();
+    file.write_all(bytes).unwrap();
     file.sync_all().unwrap();
     assert_eq!(file.metadata().unwrap().len(), 5);
 
@@ -168,7 +183,7 @@ fn test_ftruncate<T: From<i32>>(
 
 #[cfg(target_os = "linux")]
 fn test_o_tmpfile_flag() {
-    use std::fs::{create_dir, OpenOptions};
+    use std::fs::{OpenOptions, create_dir};
     use std::os::unix::fs::OpenOptionsExt;
     let dir_path = utils::prepare_dir("miri_test_fs_dir");
     create_dir(&dir_path).unwrap();
@@ -229,8 +244,7 @@ fn test_posix_mkstemp() {
 
 /// Test allocating variant of `realpath`.
 fn test_posix_realpath_alloc() {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     let buf;
     let path = utils::tmp().join("miri_test_libc_posix_realpath_alloc");
@@ -399,10 +413,10 @@ fn test_read_and_uninit() {
         unsafe {
             let fd = libc::open(cpath.as_ptr(), libc::O_RDONLY);
             assert_ne!(fd, -1);
-            let mut buf: MaybeUninit<[u8; 2]> = std::mem::MaybeUninit::uninit();
-            assert_eq!(libc::read(fd, buf.as_mut_ptr().cast::<std::ffi::c_void>(), 2), 2);
+            let mut buf: MaybeUninit<u8> = std::mem::MaybeUninit::uninit();
+            assert_eq!(libc::read(fd, buf.as_mut_ptr().cast::<std::ffi::c_void>(), 1), 1);
             let buf = buf.assume_init();
-            assert_eq!(buf, [1, 2]);
+            assert_eq!(buf, 1);
             assert_eq!(libc::close(fd), 0);
         }
         remove_file(&path).unwrap();
@@ -410,16 +424,50 @@ fn test_read_and_uninit() {
     {
         // We test that if we requested to read 4 bytes, but actually read 3 bytes, then
         // 3 bytes (not 4) will be overwritten, and remaining byte will be left as-is.
-        let path = utils::prepare_with_content("pass-libc-read-and-uninit-2.txt", &[1u8, 2, 3]);
+        let data = [1u8, 2, 3];
+        let path = utils::prepare_with_content("pass-libc-read-and-uninit-2.txt", &data);
         let cpath = CString::new(path.clone().into_os_string().into_encoded_bytes()).unwrap();
         unsafe {
             let fd = libc::open(cpath.as_ptr(), libc::O_RDONLY);
             assert_ne!(fd, -1);
             let mut buf = [42u8; 5];
-            assert_eq!(libc::read(fd, buf.as_mut_ptr().cast::<std::ffi::c_void>(), 4), 3);
-            assert_eq!(buf, [1, 2, 3, 42, 42]);
+            let res = libc::read(fd, buf.as_mut_ptr().cast::<std::ffi::c_void>(), 4);
+            assert!(res > 0 && res < 4);
+            for i in 0..buf.len() {
+                assert_eq!(
+                    buf[i],
+                    if i < res as usize { data[i] } else { 42 },
+                    "wrong result at pos {i}"
+                );
+            }
             assert_eq!(libc::close(fd), 0);
         }
         remove_file(&path).unwrap();
+    }
+}
+
+fn test_nofollow_not_symlink() {
+    let bytes = b"Hello, World!\n";
+    let path = utils::prepare_with_content("test_nofollow_not_symlink.txt", bytes);
+    let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let ret = unsafe { libc::open(cpath.as_ptr(), libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    assert!(ret >= 0);
+}
+
+#[cfg(target_os = "macos")]
+fn test_ioctl() {
+    let path = utils::prepare_with_content("miri_test_libc_ioctl.txt", &[]);
+
+    let mut name = path.into_os_string();
+    name.push("\0");
+    let name_ptr = name.as_bytes().as_ptr().cast::<libc::c_char>();
+    unsafe {
+        // 100 surely is an invalid FD.
+        assert_eq!(libc::ioctl(100, libc::FIOCLEX), -1);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        assert_eq!(errno, libc::EBADF);
+
+        let fd = libc::open(name_ptr, libc::O_RDONLY);
+        assert_eq!(libc::ioctl(fd, libc::FIOCLEX), 0);
     }
 }

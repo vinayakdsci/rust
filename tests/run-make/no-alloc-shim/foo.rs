@@ -1,4 +1,4 @@
-#![feature(default_alloc_error_handler)]
+#![feature(rustc_attrs)]
 #![no_std]
 #![no_main]
 
@@ -12,7 +12,13 @@ fn panic_handler(_: &core::panic::PanicInfo) -> ! {
 }
 
 #[no_mangle]
-extern "C" fn rust_eh_personality() {
+extern "C" fn rust_eh_personality(
+    _version: i32,
+    _actions: i32,
+    _exception_class: u64,
+    _exception_object: *mut (),
+    _context: *mut (),
+) -> i32 {
     loop {}
 }
 
@@ -31,11 +37,11 @@ unsafe impl GlobalAlloc for Alloc {
 }
 
 #[cfg(not(check_feature_gate))]
-#[no_mangle]
-static __rust_no_alloc_shim_is_unstable: u8 = 0;
+#[rustc_std_internal_symbol]
+fn __rust_no_alloc_shim_is_unstable_v2() {}
 
 #[no_mangle]
-extern "C" fn main(_argc: usize, _argv: *const *const i8) -> i32 {
+extern "C" fn main(_argc: core::ffi::c_int, _argv: *const *const i8) -> i32 {
     unsafe {
         assert_eq!(alloc::alloc::alloc(Layout::new::<()>()), core::ptr::null_mut());
     }

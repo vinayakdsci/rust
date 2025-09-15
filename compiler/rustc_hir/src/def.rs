@@ -1,18 +1,19 @@
-use crate::definitions::DefPathData;
-use crate::hir;
+use std::array::IntoIter;
+use std::borrow::Cow;
+use std::fmt::Debug;
 
 use rustc_ast as ast;
 use rustc_ast::NodeId;
 use rustc_data_structures::stable_hasher::ToStableHashKey;
 use rustc_data_structures::unord::UnordMap;
+use rustc_error_messages::{DiagArgValue, IntoDiagArg};
 use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_span::Symbol;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::MacroKind;
-use rustc_span::symbol::kw;
-use rustc_span::Symbol;
 
-use std::array::IntoIter;
-use std::fmt::Debug;
+use crate::definitions::DefPathData;
+use crate::hir;
 
 /// Encodes if a `DefKind::Ctor` is the constructor of an enum variant or a struct.
 #[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
@@ -30,6 +31,53 @@ pub enum CtorKind {
     Fn,
     /// Constructor constant automatically created by a unit struct/variant.
     Const,
+}
+
+/// A set of macro kinds, for macros that can have more than one kind
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encodable, Decodable, Hash, Debug)]
+#[derive(HashStable_Generic)]
+pub struct MacroKinds(u8);
+bitflags::bitflags! {
+    impl MacroKinds: u8 {
+        const BANG = 1 << 0;
+        const ATTR = 1 << 1;
+        const DERIVE = 1 << 2;
+    }
+}
+
+impl From<MacroKind> for MacroKinds {
+    fn from(kind: MacroKind) -> Self {
+        match kind {
+            MacroKind::Bang => Self::BANG,
+            MacroKind::Attr => Self::ATTR,
+            MacroKind::Derive => Self::DERIVE,
+        }
+    }
+}
+
+impl MacroKinds {
+    /// Convert the MacroKinds to a static string.
+    ///
+    /// This hardcodes all the possibilities, in order to return a static string.
+    pub fn descr(self) -> &'static str {
+        match self {
+            // FIXME: change this to "function-like macro" and fix all tests
+            Self::BANG => "macro",
+            Self::ATTR => "attribute macro",
+            Self::DERIVE => "derive macro",
+            _ if self == (Self::ATTR | Self::BANG) => "attribute/function macro",
+            _ if self == (Self::DERIVE | Self::BANG) => "derive/function macro",
+            _ if self == (Self::ATTR | Self::DERIVE) => "attribute/derive macro",
+            _ if self.is_all() => "attribute/derive/function macro",
+            _ if self.is_empty() => "useless macro",
+            _ => unreachable!(),
+        }
+    }
+
+    /// Return an indefinite article (a/an) for use with `descr()`
+    pub fn article(self) -> &'static str {
+        if self.contains(Self::ATTR) { "an" } else { "a" }
+    }
 }
 
 /// An attribute that is not a macro; e.g., `#[inline]` or `#[rustfmt::skip]`.
@@ -102,14 +150,23 @@ pub enum DefKind {
     AssocConst,
 
     // Macro namespace
-    Macro(MacroKind),
+    Macro(MacroKinds),
 
     // Not namespaced (or they are, but we don't treat them so)
     ExternCrate,
     Use,
     /// An `extern` block.
     ForeignMod,
-    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]`
+    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]`.
+    ///
+    /// Not all anon-consts are actually still relevant in the HIR. We lower
+    /// trivial const-arguments directly to `hir::ConstArgKind::Path`, at which
+    /// point the definition for the anon-const ends up unused and incomplete.
+    ///
+    /// We do not provide any a `Span` for the definition and pretty much all other
+    /// queries also ICE when using this `DefId`. Given that the `DefId` of such
+    /// constants should only be reachable by iterating all definitions of a
+    /// given crate, you should not have to worry about this.
     AnonConst,
     /// An inline constant, e.g. `const { 1 + 2 }`
     InlineConst,
@@ -133,6 +190,9 @@ pub enum DefKind {
     /// we treat them all the same, and code which needs to distinguish them can match
     /// or `hir::ClosureKind` or `type_of`.
     Closure,
+    /// The definition of a synthetic coroutine body created by the lowering of a
+    /// coroutine-closure, such as an async closure.
+    SyntheticCoroutineBody,
 }
 
 impl DefKind {
@@ -166,7 +226,7 @@ impl DefKind {
             DefKind::AssocConst => "associated constant",
             DefKind::TyParam => "type parameter",
             DefKind::ConstParam => "const parameter",
-            DefKind::Macro(macro_kind) => macro_kind.descr(),
+            DefKind::Macro(kinds) => kinds.descr(),
             DefKind::LifetimeParam => "lifetime parameter",
             DefKind::Use => "import",
             DefKind::ForeignMod => "foreign module",
@@ -177,6 +237,7 @@ impl DefKind {
             DefKind::Closure => "closure",
             DefKind::ExternCrate => "extern crate",
             DefKind::GlobalAsm => "global assembly block",
+            DefKind::SyntheticCoroutineBody => "synthetic mir body",
         }
     }
 
@@ -196,7 +257,7 @@ impl DefKind {
             | DefKind::Use
             | DefKind::InlineConst
             | DefKind::ExternCrate => "an",
-            DefKind::Macro(macro_kind) => macro_kind.article(),
+            DefKind::Macro(kinds) => kinds.article(),
             _ => "a",
         }
     }
@@ -236,13 +297,15 @@ impl DefKind {
             | DefKind::ForeignMod
             | DefKind::GlobalAsm
             | DefKind::Impl { .. }
-            | DefKind::OpaqueTy => None,
+            | DefKind::OpaqueTy
+            | DefKind::SyntheticCoroutineBody => None,
         }
     }
 
-    pub fn def_path_data(self, name: Symbol) -> DefPathData {
+    // Some `DefKind`s require a name, some don't. Panics if one is needed but
+    // not provided. (`AssocTy` is an exception, see below.)
+    pub fn def_path_data(self, name: Option<Symbol>) -> DefPathData {
         match self {
-            DefKind::Struct | DefKind::Union if name == kw::Empty => DefPathData::AnonAdt,
             DefKind::Mod
             | DefKind::Struct
             | DefKind::Union
@@ -252,21 +315,22 @@ impl DefKind {
             | DefKind::TyAlias
             | DefKind::ForeignTy
             | DefKind::TraitAlias
-            | DefKind::AssocTy
             | DefKind::TyParam
-            | DefKind::ExternCrate => DefPathData::TypeNs(name),
-            // It's not exactly an anon const, but wrt DefPathData, there
-            // is no difference.
-            DefKind::Static { nested: true, .. } => DefPathData::AnonConst,
+            | DefKind::ExternCrate => DefPathData::TypeNs(name.unwrap()),
+
+            // An associated type name will be missing for an RPITIT (DefPathData::AnonAssocTy),
+            // but those provide their own DefPathData.
+            DefKind::AssocTy => DefPathData::TypeNs(name.unwrap()),
+
             DefKind::Fn
             | DefKind::Const
             | DefKind::ConstParam
             | DefKind::Static { .. }
             | DefKind::AssocFn
             | DefKind::AssocConst
-            | DefKind::Field => DefPathData::ValueNs(name),
-            DefKind::Macro(..) => DefPathData::MacroNs(name),
-            DefKind::LifetimeParam => DefPathData::LifetimeNs(name),
+            | DefKind::Field => DefPathData::ValueNs(name.unwrap()),
+            DefKind::Macro(..) => DefPathData::MacroNs(name.unwrap()),
+            DefKind::LifetimeParam => DefPathData::LifetimeNs(name.unwrap()),
             DefKind::Ctor(..) => DefPathData::Ctor,
             DefKind::Use => DefPathData::Use,
             DefKind::ForeignMod => DefPathData::ForeignMod,
@@ -276,12 +340,68 @@ impl DefKind {
             DefKind::GlobalAsm => DefPathData::GlobalAsm,
             DefKind::Impl { .. } => DefPathData::Impl,
             DefKind::Closure => DefPathData::Closure,
+            DefKind::SyntheticCoroutineBody => DefPathData::SyntheticCoroutineBody,
         }
+    }
+
+    pub fn is_assoc(self) -> bool {
+        matches!(self, DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy)
+    }
+
+    /// This is a "module" in name resolution sense.
+    #[inline]
+    pub fn is_module_like(self) -> bool {
+        matches!(self, DefKind::Mod | DefKind::Enum | DefKind::Trait)
+    }
+
+    #[inline]
+    pub fn is_adt(self) -> bool {
+        matches!(self, DefKind::Struct | DefKind::Union | DefKind::Enum)
     }
 
     #[inline]
     pub fn is_fn_like(self) -> bool {
-        matches!(self, DefKind::Fn | DefKind::AssocFn | DefKind::Closure)
+        matches!(
+            self,
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::SyntheticCoroutineBody
+        )
+    }
+
+    /// Whether the corresponding item has generic parameters, ie. the `generics_of` query works.
+    pub fn has_generics(self) -> bool {
+        match self {
+            DefKind::AnonConst
+            | DefKind::AssocConst
+            | DefKind::AssocFn
+            | DefKind::AssocTy
+            | DefKind::Closure
+            | DefKind::Const
+            | DefKind::Ctor(..)
+            | DefKind::Enum
+            | DefKind::Field
+            | DefKind::Fn
+            | DefKind::ForeignTy
+            | DefKind::Impl { .. }
+            | DefKind::InlineConst
+            | DefKind::OpaqueTy
+            | DefKind::Static { .. }
+            | DefKind::Struct
+            | DefKind::SyntheticCoroutineBody
+            | DefKind::Trait
+            | DefKind::TraitAlias
+            | DefKind::TyAlias
+            | DefKind::Union
+            | DefKind::Variant => true,
+            DefKind::ConstParam
+            | DefKind::ExternCrate
+            | DefKind::ForeignMod
+            | DefKind::GlobalAsm
+            | DefKind::LifetimeParam
+            | DefKind::Macro(_)
+            | DefKind::Mod
+            | DefKind::TyParam
+            | DefKind::Use => false,
+        }
     }
 
     /// Whether `query get_codegen_attrs` should be used with this definition.
@@ -291,7 +411,8 @@ impl DefKind {
             | DefKind::AssocFn
             | DefKind::Ctor(..)
             | DefKind::Closure
-            | DefKind::Static { .. } => true,
+            | DefKind::Static { .. }
+            | DefKind::SyntheticCoroutineBody => true,
             DefKind::Mod
             | DefKind::Struct
             | DefKind::Union
@@ -319,6 +440,43 @@ impl DefKind {
             | DefKind::ExternCrate => false,
         }
     }
+
+    /// Returns `true` if `self` is a kind of definition that does not have its own
+    /// type-checking context, i.e. closure, coroutine or inline const.
+    #[inline]
+    pub fn is_typeck_child(self) -> bool {
+        match self {
+            DefKind::Closure | DefKind::InlineConst | DefKind::SyntheticCoroutineBody => true,
+            DefKind::Mod
+            | DefKind::Struct
+            | DefKind::Union
+            | DefKind::Enum
+            | DefKind::Variant
+            | DefKind::Trait
+            | DefKind::TyAlias
+            | DefKind::ForeignTy
+            | DefKind::TraitAlias
+            | DefKind::AssocTy
+            | DefKind::TyParam
+            | DefKind::Fn
+            | DefKind::Const
+            | DefKind::ConstParam
+            | DefKind::Static { .. }
+            | DefKind::Ctor(_, _)
+            | DefKind::AssocFn
+            | DefKind::AssocConst
+            | DefKind::Macro(_)
+            | DefKind::ExternCrate
+            | DefKind::Use
+            | DefKind::ForeignMod
+            | DefKind::AnonConst
+            | DefKind::OpaqueTy
+            | DefKind::Field
+            | DefKind::LifetimeParam
+            | DefKind::GlobalAsm
+            | DefKind::Impl { .. } => false,
+        }
+    }
 }
 
 /// The resolution of a path or export.
@@ -330,7 +488,7 @@ impl DefKind {
 /// For example, everything prefixed with `/* Res */` in this example has
 /// an associated `Res`:
 ///
-/// ```
+/// ```ignore (illustrative)
 /// fn str_to_string(s: & /* Res */ str) -> /* Res */ String {
 ///     /* Res */ String::from(/* Res */ s)
 /// }
@@ -391,7 +549,7 @@ pub enum Res<Id = hir::HirId> {
     /// }
     ///
     /// impl Foo for Bar {
-    ///     fn foo() -> Box<Self> { // SelfTyAlias
+    ///     fn foo() -> Box<Self /* SelfTyAlias */> {
     ///         let _: Self;        // SelfTyAlias
     ///
     ///         todo!()
@@ -412,7 +570,7 @@ pub enum Res<Id = hir::HirId> {
         /// mention any generic parameters to allow the following with `min_const_generics`:
         /// ```
         /// # struct Foo;
-        /// impl Foo { fn test() -> [u8; std::mem::size_of::<Self>()] { todo!() } }
+        /// impl Foo { fn test() -> [u8; size_of::<Self>()] { todo!() } }
         ///
         /// struct Bar([u8; baz::<Self>()]);
         /// const fn baz<T>() -> usize { 10 }
@@ -422,7 +580,7 @@ pub enum Res<Id = hir::HirId> {
         /// compat lint:
         /// ```
         /// fn foo<T>() {
-        ///     let _bar = [1_u8; std::mem::size_of::<*mut T>()];
+        ///     let _bar = [1_u8; size_of::<*mut T>()];
         /// }
         /// ```
         // FIXME(generic_const_exprs): Remove this bodge once that feature is stable.
@@ -465,6 +623,12 @@ pub enum Res<Id = hir::HirId> {
     ///
     /// **Not bound to a specific namespace.**
     Err,
+}
+
+impl<Id> IntoDiagArg for Res<Id> {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Borrowed(self.descr()))
+    }
 }
 
 /// The result of resolving a path before lowering to HIR,
@@ -554,6 +718,12 @@ impl Namespace {
     }
 }
 
+impl IntoDiagArg for Namespace {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        DiagArgValue::Str(Cow::Borrowed(self.descr()))
+    }
+}
+
 impl<CTX: crate::HashStableContext> ToStableHashKey<CTX> for Namespace {
     type KeyType = Namespace;
 
@@ -564,7 +734,7 @@ impl<CTX: crate::HashStableContext> ToStableHashKey<CTX> for Namespace {
 }
 
 /// Just a helper ‒ separate structure for each namespace.
-#[derive(Copy, Clone, Default, Debug)]
+#[derive(Copy, Clone, Default, Debug, HashStable_Generic)]
 pub struct PerNS<T> {
     pub value_ns: T,
     pub type_ns: T,
@@ -576,10 +746,16 @@ impl<T> PerNS<T> {
         PerNS { value_ns: f(self.value_ns), type_ns: f(self.type_ns), macro_ns: f(self.macro_ns) }
     }
 
+    /// Note: Do you really want to use this? Often you know which namespace a
+    /// name will belong in, and you can consider just that namespace directly,
+    /// rather than iterating through all of them.
     pub fn into_iter(self) -> IntoIter<T, 3> {
         [self.value_ns, self.type_ns, self.macro_ns].into_iter()
     }
 
+    /// Note: Do you really want to use this? Often you know which namespace a
+    /// name will belong in, and you can consider just that namespace directly,
+    /// rather than iterating through all of them.
     pub fn iter(&self) -> IntoIter<&T, 3> {
         [&self.value_ns, &self.type_ns, &self.macro_ns].into_iter()
     }
@@ -614,6 +790,10 @@ impl<T> PerNS<Option<T>> {
     }
 
     /// Returns an iterator over the items which are `Some`.
+    ///
+    /// Note: Do you really want to use this? Often you know which namespace a
+    /// name will belong in, and you can consider just that namespace directly,
+    /// rather than iterating through all of them.
     pub fn present_items(self) -> impl Iterator<Item = T> {
         [self.type_ns, self.value_ns, self.macro_ns].into_iter().flatten()
     }
@@ -690,6 +870,15 @@ impl<Id> Res<Id> {
         }
     }
 
+    /// If this is a "module" in name resolution sense, return its `DefId`.
+    #[inline]
+    pub fn module_like_def_id(&self) -> Option<DefId> {
+        match self {
+            Res::Def(def_kind, def_id) if def_kind.is_module_like() => Some(*def_id),
+            _ => None,
+        }
+    }
+
     /// A human readable name for the res kind ("function", "module", etc.).
     pub fn descr(&self) -> &'static str {
         match *self {
@@ -754,10 +943,10 @@ impl<Id> Res<Id> {
         )
     }
 
-    pub fn macro_kind(self) -> Option<MacroKind> {
+    pub fn macro_kinds(self) -> Option<MacroKinds> {
         match self {
-            Res::Def(DefKind::Macro(kind), _) => Some(kind),
-            Res::NonMacroAttr(..) => Some(MacroKind::Attr),
+            Res::Def(DefKind::Macro(kinds), _) => Some(kinds),
+            Res::NonMacroAttr(..) => Some(MacroKinds::ATTR),
             _ => None,
         }
     }
@@ -777,7 +966,7 @@ impl<Id> Res<Id> {
 
     /// Always returns `true` if `self` is `Res::Err`
     pub fn matches_ns(&self, ns: Namespace) -> bool {
-        self.ns().map_or(true, |actual_ns| actual_ns == ns)
+        self.ns().is_none_or(|actual_ns| actual_ns == ns)
     }
 
     /// Returns whether such a resolved path can occur in a tuple struct/variant pattern
@@ -801,7 +990,7 @@ pub enum LifetimeRes {
         /// Id of the introducing place. That can be:
         /// - an item's id, for the item's generic parameters;
         /// - a TraitRef's ref_id, identifying the `for<...>` binder;
-        /// - a BareFn type's id.
+        /// - a FnPtr type's id.
         ///
         /// This information is used for impl-trait lifetime captures, to know when to or not to
         /// capture any given lifetime.
@@ -821,7 +1010,7 @@ pub enum LifetimeRes {
     /// This variant is used for anonymous lifetimes that we did not resolve during
     /// late resolution. Those lifetimes will be inferred by typechecking.
     Infer,
-    /// Explicit `'static` lifetime.
+    /// `'static` lifetime.
     Static,
     /// Resolution failure.
     Error,

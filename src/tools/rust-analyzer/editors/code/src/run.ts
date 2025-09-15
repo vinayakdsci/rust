@@ -5,10 +5,9 @@ import * as tasks from "./tasks";
 
 import type { CtxInit } from "./ctx";
 import { makeDebugConfig } from "./debug";
-import type { Config, RunnableEnvCfg, RunnableEnvCfgItem } from "./config";
+import type { Config } from "./config";
 import type { LanguageClient } from "vscode-languageclient/node";
-import { unwrapUndefinable, type RustEditor } from "./util";
-import * as toolchain from "./toolchain";
+import { Env, log, unwrapUndefinable, type RustEditor } from "./util";
 
 const quickPickButtons = [
     { iconPath: new vscode.ThemeIcon("save"), tooltip: "Save as a launch.json configuration." },
@@ -19,9 +18,14 @@ export async function selectRunnable(
     prevRunnable?: RunnableQuickPick,
     debuggeeOnly = false,
     showButtons: boolean = true,
+    mode?: "cursor",
 ): Promise<RunnableQuickPick | undefined> {
-    const editor = ctx.activeRustEditor;
+    const editor = ctx.activeRustEditor ?? ctx.activeCargoTomlEditor;
     if (!editor) return;
+
+    if (mode === "cursor") {
+        return selectRunnableAtCursor(ctx, editor, prevRunnable);
+    }
 
     // show a placeholder while we get the runnables from the server
     const quickPick = vscode.window.createQuickPick();
@@ -37,7 +41,7 @@ export async function selectRunnable(
 
     if (runnables.length === 0) {
         // it is the debug case, run always has at least 'cargo check ...'
-        // see crates\rust-analyzer\src\main_loop\handlers.rs, handle_runnables
+        // see crates\rust-analyzer\src\handlers\request.rs, handle_runnables
         await vscode.window.showErrorMessage("There's no debug target!");
         quickPick.dispose();
         return;
@@ -55,6 +59,58 @@ export async function selectRunnable(
     );
 }
 
+async function selectRunnableAtCursor(
+    ctx: CtxInit,
+    editor: RustEditor,
+    prevRunnable?: RunnableQuickPick,
+): Promise<RunnableQuickPick | undefined> {
+    const runnableQuickPicks = await getRunnables(ctx.client, editor, prevRunnable, false);
+    let runnableQuickPickAtCursor = null;
+    const cursorPosition = ctx.client.code2ProtocolConverter.asPosition(editor.selection.active);
+    for (const runnableQuickPick of runnableQuickPicks) {
+        if (!runnableQuickPick.runnable.location?.targetRange) {
+            continue;
+        }
+        const runnableQuickPickRange = runnableQuickPick.runnable.location.targetRange;
+        if (
+            runnableQuickPickAtCursor?.runnable?.location?.targetRange != null &&
+            rangeContainsOtherRange(
+                runnableQuickPickRange,
+                runnableQuickPickAtCursor.runnable.location.targetRange,
+            )
+        ) {
+            continue;
+        }
+        if (rangeContainsPosition(runnableQuickPickRange, cursorPosition)) {
+            runnableQuickPickAtCursor = runnableQuickPick;
+        }
+    }
+    if (runnableQuickPickAtCursor == null) {
+        return;
+    }
+    return Promise.resolve(runnableQuickPickAtCursor);
+}
+
+function rangeContainsPosition(range: lc.Range, position: lc.Position): boolean {
+    return (
+        (position.line > range.start.line ||
+            (position.line === range.start.line && position.character >= range.start.character)) &&
+        (position.line < range.end.line ||
+            (position.line === range.end.line && position.character <= range.end.character))
+    );
+}
+
+function rangeContainsOtherRange(range: lc.Range, otherRange: lc.Range) {
+    return (
+        (range.start.line < otherRange.start.line ||
+            (range.start.line === otherRange.start.line &&
+                range.start.character <= otherRange.start.character)) &&
+        (range.end.line > otherRange.end.line ||
+            (range.end.line === otherRange.end.line &&
+                range.end.character >= otherRange.end.character))
+    );
+}
+
 export class RunnableQuickPick implements vscode.QuickPickItem {
     public label: string;
     public description?: string | undefined;
@@ -66,42 +122,22 @@ export class RunnableQuickPick implements vscode.QuickPickItem {
     }
 }
 
-export function prepareBaseEnv(base?: Record<string, string>): Record<string, string> {
-    const env: Record<string, string> = { RUST_BACKTRACE: "short" };
-    Object.assign(env, process.env);
+export function prepareBaseEnv(inheritEnv: boolean, base?: Env): Env {
+    const env: Env = { RUST_BACKTRACE: "short" };
+    if (inheritEnv) {
+        Object.assign(env, process.env);
+    }
     if (base) {
         Object.assign(env, base);
     }
     return env;
 }
 
-export function prepareEnv(
-    label: string,
-    runnableArgs: ra.CargoRunnableArgs,
-    runnableEnvCfg?: RunnableEnvCfg,
-): Record<string, string> {
-    const env = prepareBaseEnv(runnableArgs.environment);
-    const platform = process.platform;
-
-    const checkPlatform = (it: RunnableEnvCfgItem) => {
-        if (it.platform) {
-            const platforms = Array.isArray(it.platform) ? it.platform : [it.platform];
-            return platforms.indexOf(platform) >= 0;
-        }
-        return true;
-    };
+export function prepareEnv(inheritEnv: boolean, runnableEnv?: Env, runnableEnvCfg?: Env): Env {
+    const env = prepareBaseEnv(inheritEnv, runnableEnv);
 
     if (runnableEnvCfg) {
-        if (Array.isArray(runnableEnvCfg)) {
-            for (const it of runnableEnvCfg) {
-                const masked = !it.mask || new RegExp(it.mask).test(label);
-                if (masked && checkPlatform(it)) {
-                    Object.assign(env, it.env);
-                }
-            }
-        } else {
-            Object.assign(env, runnableEnvCfg);
-        }
+        Object.assign(env, runnableEnvCfg);
     }
 
     return env;
@@ -115,7 +151,7 @@ export async function createTaskFromRunnable(
 
     let definition: tasks.TaskDefinition;
     let options;
-    let cargo;
+    let cargo = "cargo";
     if (runnable.kind === "cargo") {
         const runnableArgs = runnable.args;
         let args = createCargoArgs(runnableArgs);
@@ -126,8 +162,6 @@ export async function createTaskFromRunnable(
 
             cargo = unwrapUndefinable(cargoParts[0]);
             args = [...cargoParts.slice(1), ...args];
-        } else {
-            cargo = await toolchain.cargoPath();
         }
 
         definition = {
@@ -137,7 +171,11 @@ export async function createTaskFromRunnable(
         };
         options = {
             cwd: runnableArgs.workspaceRoot || ".",
-            env: prepareEnv(runnable.label, runnableArgs, config.runnablesExtraEnv),
+            env: prepareEnv(
+                true,
+                runnableArgs.environment,
+                config.runnablesExtraEnv(runnable.label),
+            ),
         };
     } else {
         const runnableArgs = runnable.args;
@@ -148,7 +186,7 @@ export async function createTaskFromRunnable(
         };
         options = {
             cwd: runnableArgs.cwd,
-            env: prepareBaseEnv(),
+            env: prepareBaseEnv(true),
         };
     }
 
@@ -187,10 +225,17 @@ async function getRunnables(
         uri: editor.document.uri.toString(),
     };
 
-    const runnables = await client.sendRequest(ra.runnables, {
-        textDocument,
-        position: client.code2ProtocolConverter.asPosition(editor.selection.active),
-    });
+    const runnables = await client
+        .sendRequest(ra.runnables, {
+            textDocument,
+            position: client.code2ProtocolConverter.asPosition(editor.selection.active),
+        })
+        .catch((err) => {
+            // If this command is run for a virtual manifest at the workspace root, then this request
+            // will fail as we do not watch this file.
+            log.error(`${err}`);
+            return [];
+        });
     const items: RunnableQuickPick[] = [];
     if (prevRunnable) {
         items.push(prevRunnable);
@@ -200,7 +245,7 @@ async function getRunnables(
             continue;
         }
 
-        if (debuggeeOnly && (r.label.startsWith("doctest") || r.label.startsWith("cargo"))) {
+        if (debuggeeOnly && r.label.startsWith("doctest")) {
             continue;
         }
         items.push(new RunnableQuickPick(r));

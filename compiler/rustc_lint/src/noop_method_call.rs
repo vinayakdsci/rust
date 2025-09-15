@@ -1,15 +1,15 @@
-use crate::context::LintContext;
-use crate::lints::{
-    NoopMethodCallDiag, SuspiciousDoubleRefCloneDiag, SuspiciousDoubleRefDerefDiag,
-};
-use crate::LateContext;
-use crate::LateLintPass;
 use rustc_hir::def::DefKind;
 use rustc_hir::{Expr, ExprKind};
 use rustc_middle::ty;
 use rustc_middle::ty::adjustment::Adjust;
 use rustc_session::{declare_lint, declare_lint_pass};
-use rustc_span::symbol::sym;
+use rustc_span::sym;
+
+use crate::context::LintContext;
+use crate::lints::{
+    NoopMethodCallDiag, SuspiciousDoubleRefCloneDiag, SuspiciousDoubleRefDerefDiag,
+};
+use crate::{LateContext, LateLintPass};
 
 declare_lint! {
     /// The `noop_method_call` lint detects specific calls to noop methods
@@ -84,7 +84,7 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
             return;
         };
 
-        let Some(trait_id) = cx.tcx.trait_of_item(did) else { return };
+        let Some(trait_id) = cx.tcx.trait_of_assoc(did) else { return };
 
         let Some(trait_) = cx.tcx.get_diagnostic_name(trait_id) else { return };
 
@@ -94,9 +94,9 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
 
         let args = cx
             .tcx
-            .normalize_erasing_regions(cx.param_env, cx.typeck_results().node_args(expr.hir_id));
+            .normalize_erasing_regions(cx.typing_env(), cx.typeck_results().node_args(expr.hir_id));
         // Resolve the trait method instance.
-        let Ok(Some(i)) = ty::Instance::try_resolve(cx.tcx, cx.param_env, did, args) else {
+        let Ok(Some(i)) = ty::Instance::try_resolve(cx.tcx, cx.typing_env(), did, args) else {
             return;
         };
         // (Re)check that it implements the noop diagnostic.
@@ -132,7 +132,7 @@ impl<'tcx> LateLintPass<'tcx> for NoopMethodCall {
                 NOOP_METHOD_CALL,
                 span,
                 NoopMethodCallDiag {
-                    method: call.ident.name,
+                    method: call.ident,
                     orig_ty,
                     trait_,
                     label: span,

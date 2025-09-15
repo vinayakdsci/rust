@@ -39,6 +39,13 @@ impl VfsPath {
         }
     }
 
+    pub fn into_abs_path(self) -> Option<AbsPathBuf> {
+        match self.0 {
+            VfsPathRepr::PathBuf(it) => Some(it),
+            VfsPathRepr::VirtualPath(_) => None,
+        }
+    }
+
     /// Creates a new `VfsPath` with `path` adjoined to `self`.
     pub fn join(&self, path: &str) -> Option<VfsPath> {
         match &self.0 {
@@ -59,7 +66,7 @@ impl VfsPath {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// # use vfs::{AbsPathBuf, VfsPath};
     /// let mut path = VfsPath::from(AbsPathBuf::assert("/foo/bar".into()));
     /// assert!(path.pop());
@@ -97,11 +104,7 @@ impl VfsPath {
     /// Returns [`None`] if the path is a root or prefix.
     pub fn parent(&self) -> Option<VfsPath> {
         let mut parent = self.clone();
-        if parent.pop() {
-            Some(parent)
-        } else {
-            None
-        }
+        if parent.pop() { Some(parent) } else { None }
     }
 
     /// Returns `self`'s base name and file extension.
@@ -310,6 +313,20 @@ impl fmt::Debug for VfsPathRepr {
             VfsPathRepr::PathBuf(it) => it.fmt(f),
             VfsPathRepr::VirtualPath(VirtualPath(it)) => it.fmt(f),
         }
+    }
+}
+
+impl PartialEq<AbsPath> for VfsPath {
+    fn eq(&self, other: &AbsPath) -> bool {
+        match &self.0 {
+            VfsPathRepr::PathBuf(lhs) => lhs == other,
+            VfsPathRepr::VirtualPath(_) => false,
+        }
+    }
+}
+impl PartialEq<VfsPath> for AbsPath {
+    fn eq(&self, other: &VfsPath) -> bool {
+        other == self
     }
 }
 

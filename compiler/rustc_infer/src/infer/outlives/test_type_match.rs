@@ -2,8 +2,8 @@ use std::collections::hash_map::Entry;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::TypeVisitableExt;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
+use tracing::instrument;
 
 use crate::infer::region_constraints::VerifyIfEq;
 use crate::infer::relate::{self as relate, Relate, RelateResult, TypeRelation};
@@ -76,7 +76,7 @@ pub(super) fn can_match_erased_ty<'tcx>(
     erased_ty: Ty<'tcx>,
 ) -> bool {
     assert!(!outlives_predicate.has_escaping_bound_vars());
-    let erased_outlives_predicate = tcx.erase_regions(outlives_predicate);
+    let erased_outlives_predicate = tcx.erase_and_anonymize_regions(outlives_predicate);
     let outlives_ty = erased_outlives_predicate.skip_binder().0;
     if outlives_ty == erased_ty {
         // pointless micro-optimization

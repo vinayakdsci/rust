@@ -244,37 +244,30 @@ See the [Clang ControlFlowIntegrity documentation][clang-cfi] for more details.
 
 ## Example 1: Redirecting control flow using an indirect branch/call to an invalid destination
 
-```rust,ignore (making doc tests pass cross-platform is hard)
-#![feature(naked_functions)]
-
-use std::arch::asm;
-use std::mem;
-
+```rust
 fn add_one(x: i32) -> i32 {
     x + 1
 }
 
-#[naked]
-pub extern "C" fn add_two(x: i32) {
+#[unsafe(naked)]
+# #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub extern "sysv64" fn add_two(x: i32) {
     // x + 2 preceded by a landing pad/nop block
-    unsafe {
-        asm!(
-            "
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             nop
-             lea eax, [rdi+2]
-             ret
-        ",
-            options(noreturn)
-        );
-    }
+    std::arch::naked_asm!(
+        "
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         nop
+         lea eax, [rdi+2]
+         ret
+        "
+    );
 }
 
 fn do_twice(f: fn(i32) -> i32, arg: i32) -> i32 {
@@ -286,16 +279,18 @@ fn main() {
 
     println!("The answer is: {}", answer);
 
-    println!("With CFI enabled, you should not see the next answer");
-    let f: fn(i32) -> i32 = unsafe {
-        // Offset 0 is a valid branch/call destination (i.e., the function entry
-        // point), but offsets 1-8 within the landing pad/nop block are invalid
-        // branch/call destinations (i.e., within the body of the function).
-        mem::transmute::<*const u8, fn(i32) -> i32>((add_two as *const u8).offset(5))
-    };
-    let next_answer = do_twice(f, 5);
+#   #[cfg(all(target_os = "linux", target_arch = "x86_64"))] {
+        println!("With CFI enabled, you should not see the next answer");
+        let f: fn(i32) -> i32 = unsafe {
+            // Offset 0 is a valid branch/call destination (i.e., the function entry
+            // point), but offsets 1-8 within the landing pad/nop block are invalid
+            // branch/call destinations (i.e., within the body of the function).
+            std::mem::transmute::<*const u8, fn(i32) -> i32>((add_two as *const u8).offset(5))
+        };
+        let next_answer = do_twice(f, 5);
 
-    println!("The next answer is: {}", next_answer);
+        println!("The next answer is: {}", next_answer);
+#   }
 }
 ```
 Fig. 1. Redirecting control flow using an indirect branch/call to an invalid
@@ -690,7 +685,6 @@ LeakSanitizer is run-time memory leak detector.
 
 LeakSanitizer is supported on the following targets:
 
-* `aarch64-apple-darwin`
 * `aarch64-unknown-linux-gnu`
 * `x86_64-apple-darwin`
 * `x86_64-unknown-linux-gnu`
@@ -775,17 +769,46 @@ See the [Clang SafeStack documentation][clang-safestack] for more details.
 
 # ShadowCallStack
 
-ShadowCallStack provides backward edge control flow protection by storing a function's return address in a separately allocated 'shadow call stack' and loading the return address from that shadow call stack.
-
-ShadowCallStack requires a platform ABI which reserves `x18` as the instrumentation makes use of this register.
+ShadowCallStack provides backward edge control flow protection by storing a function's return address in a separately allocated 'shadow call stack'
+and loading the return address from that shadow call stack.
+AArch64 and RISC-V both have a platform register defined in their ABIs, which is `x18` and `x3`/`gp` respectively, that can optionally be reserved for this purpose.
+Software support from the operating system and runtime may be required depending on the target platform which is detailed in the remaining section.
+See the [Clang ShadowCallStack documentation][clang-scs] for more details.
 
 ShadowCallStack can be enabled with `-Zsanitizer=shadow-call-stack` option and is supported on the following targets:
 
-* `aarch64-linux-android`
+## AArch64 family
 
+ShadowCallStack requires the use of the ABI defined platform register, `x18`, which is required for code generation purposes.
+When `x18` is not reserved, and is instead used as a scratch register subsequently, enabling ShadowCallStack would lead to undefined behaviour
+due to corruption of return address or invalid memory access when the instrumentation restores return register to the link register `lr` from the
+already clobbered `x18` register.
+In other words, code that is calling into or called by functions instrumented with ShadowCallStack must reserve the `x18` register or preserve its value.
+
+### `aarch64-linux-android` and `aarch64-unknown-fuchsia`/`aarch64-fuchsia`
+
+This target already reserves the `x18` register.
 A runtime must be provided by the application or operating system.
+If `bionic` is used on this target, the software support is provided.
+Otherwise, a runtime needs to prepare a memory region and points `x18` to the region which serves as the shadow call stack.
 
-See the [Clang ShadowCallStack documentation][clang-scs] for more details.
+### `aarch64-unknown-none`
+
+In addition to support from a runtime by the application or operating system, the `-Zfixed-x18` flag is also mandatory.
+
+## RISC-V 64 family
+
+ShadowCallStack uses either the `gp` register for software shadow stack, also known as `x3`, or the `ssp` register if [`Zicfiss`][riscv-zicfiss] extension is available.
+`gp`/`x3` is currently always reserved and available for ShadowCallStack instrumentation, and `ssp` in case of `Zicfiss` is only accessible through its dedicated shadow stack instructions.
+
+Support from the runtime and operating system is required when `gp`/`x3` is used for software shadow stack.
+A runtime must prepare a memory region and point `gp`/`x3` to the region before executing the code.
+
+The following targets support ShadowCallStack.
+
+* `riscv64imac-unknown-none-elf`
+* `riscv64gc-unknown-none-elf`
+* `riscv64gc-unknown-fuchsia`
 
 # ThreadSanitizer
 
@@ -908,3 +931,4 @@ Sanitizers produce symbolized stacktraces when llvm-symbolizer binary is in `PAT
 [clang-tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html
 [linux-kasan]: https://www.kernel.org/doc/html/latest/dev-tools/kasan.html
 [llvm-memtag]: https://llvm.org/docs/MemTagSanitizer.html
+[riscv-zicfiss]: https://github.com/riscv/riscv-cfi/blob/3f8e450c481ac303bd5643444f7a89672f24476e/src/cfi_backward.adoc

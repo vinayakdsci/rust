@@ -1,24 +1,24 @@
 //! Code specific to the coverage test suites.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use camino::{Utf8Path, Utf8PathBuf};
 use glob::glob;
 
-use crate::common::{UI_COVERAGE, UI_COVERAGE_MAP};
+use crate::common::{TestSuite, UI_COVERAGE, UI_COVERAGE_MAP};
 use crate::runtest::{Emit, ProcRes, TestCx, WillExecute};
 use crate::util::static_regex;
 
 impl<'test> TestCx<'test> {
-    fn coverage_dump_path(&self) -> &Path {
+    fn coverage_dump_path(&self) -> &Utf8Path {
         self.config
             .coverage_dump_path
             .as_deref()
             .unwrap_or_else(|| self.fatal("missing --coverage-dump"))
     }
 
-    pub(crate) fn run_coverage_map_test(&self) {
+    pub(super) fn run_coverage_map_test(&self) {
         let coverage_dump_path = self.coverage_dump_path();
 
         let (proc_res, llvm_ir_path) = self.compile_test_and_save_ir();
@@ -39,18 +39,22 @@ impl<'test> TestCx<'test> {
         let expected_coverage_dump = self.load_expected_output(kind);
         let actual_coverage_dump = self.normalize_output(&proc_res.stdout, &[]);
 
-        let coverage_dump_errors =
-            self.compare_output(kind, &actual_coverage_dump, &expected_coverage_dump);
+        let coverage_dump_compare_outcome = self.compare_output(
+            kind,
+            &actual_coverage_dump,
+            &proc_res.stdout,
+            &expected_coverage_dump,
+        );
 
-        if coverage_dump_errors > 0 {
+        if coverage_dump_compare_outcome.should_error() {
             self.fatal_proc_rec(
-                &format!("{coverage_dump_errors} errors occurred comparing coverage output."),
+                &format!("an error occurred comparing coverage output."),
                 &proc_res,
             );
         }
     }
 
-    pub(crate) fn run_coverage_run_test(&self) {
+    pub(super) fn run_coverage_run_test(&self) {
         let should_run = self.run_if_enabled();
         let proc_res = self.compile_test(should_run, Emit::None);
 
@@ -75,10 +79,8 @@ impl<'test> TestCx<'test> {
             std::fs::remove_file(&profdata_path).unwrap();
         }
 
-        let proc_res = self.exec_compiled_test_general(
-            &[("LLVM_PROFILE_FILE", &profraw_path.to_str().unwrap())],
-            false,
-        );
+        let proc_res =
+            self.exec_compiled_test_general(&[("LLVM_PROFILE_FILE", profraw_path.as_str())], false);
         if self.props.failure_status.is_some() {
             self.check_correct_failure_status(&proc_res);
         } else if !proc_res.status.success() {
@@ -89,7 +91,7 @@ impl<'test> TestCx<'test> {
         let mut profraw_paths = vec![profraw_path];
         let mut bin_paths = vec![self.make_exe_name()];
 
-        if self.config.suite == "coverage-run-rustdoc" {
+        if self.config.suite == TestSuite::CoverageRunRustdoc {
             self.run_doctests_for_coverage(&mut profraw_paths, &mut bin_paths);
         }
 
@@ -135,12 +137,16 @@ impl<'test> TestCx<'test> {
                 self.fatal_proc_rec(&err, &proc_res);
             });
 
-        let coverage_errors =
-            self.compare_output(kind, &normalized_actual_coverage, &expected_coverage);
+        let coverage_dump_compare_outcome = self.compare_output(
+            kind,
+            &normalized_actual_coverage,
+            &proc_res.stdout,
+            &expected_coverage,
+        );
 
-        if coverage_errors > 0 {
+        if coverage_dump_compare_outcome.should_error() {
             self.fatal_proc_rec(
-                &format!("{} errors occurred comparing coverage output.", coverage_errors),
+                &format!("an error occurred comparing coverage output."),
                 &proc_res,
             );
         }
@@ -150,8 +156,8 @@ impl<'test> TestCx<'test> {
     /// `.profraw` files and doctest executables to the given vectors.
     fn run_doctests_for_coverage(
         &self,
-        profraw_paths: &mut Vec<PathBuf>,
-        bin_paths: &mut Vec<PathBuf>,
+        profraw_paths: &mut Vec<Utf8PathBuf>,
+        bin_paths: &mut Vec<Utf8PathBuf>,
     ) {
         // Put .profraw files and doctest executables in dedicated directories,
         // to make it easier to glob them all later.
@@ -191,15 +197,14 @@ impl<'test> TestCx<'test> {
 
         rustdoc_cmd.arg(&self.testpaths.file);
 
-        let proc_res = self.compose_and_run_compiler(rustdoc_cmd, None);
+        let proc_res = self.compose_and_run_compiler(rustdoc_cmd, None, self.testpaths);
         if !proc_res.status.success() {
             self.fatal_proc_rec("rustdoc --test failed!", &proc_res)
         }
 
-        fn glob_iter(path: impl AsRef<Path>) -> impl Iterator<Item = PathBuf> {
-            let path_str = path.as_ref().to_str().unwrap();
-            let iter = glob(path_str).unwrap();
-            iter.map(Result::unwrap)
+        fn glob_iter(path: impl AsRef<Utf8Path>) -> impl Iterator<Item = Utf8PathBuf> {
+            let iter = glob(path.as_ref().as_str()).unwrap();
+            iter.map(Result::unwrap).map(Utf8PathBuf::try_from).map(Result::unwrap)
         }
 
         // Find all profraw files in the profraw directory.
@@ -352,9 +357,9 @@ impl<'test> TestCx<'test> {
                 // Add this line to the current subview.
                 subviews
                     .last_mut()
-                    .ok_or(format!(
-                        "unexpected subview line outside of a subview on line {line_num}"
-                    ))?
+                    .ok_or_else(|| {
+                        format!("unexpected subview line outside of a subview on line {line_num}")
+                    })?
                     .push(line);
             } else {
                 // This line is not part of a subview, so sort and print any

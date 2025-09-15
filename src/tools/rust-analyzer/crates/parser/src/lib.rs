@@ -25,7 +25,6 @@ extern crate ra_ap_rustc_lexer as rustc_lexer;
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_lexer;
 
-mod edition;
 mod event;
 mod grammar;
 mod input;
@@ -36,13 +35,16 @@ mod shortcuts;
 mod syntax_kind;
 mod token_set;
 
+pub use T_ as T;
+
 #[cfg(test)]
 mod tests;
 
 pub(crate) use token_set::TokenSet;
 
+pub use edition::Edition;
+
 pub use crate::{
-    edition::Edition,
     input::Input,
     lexed_str::LexedStr,
     output::{Output, Step},
@@ -59,7 +61,7 @@ pub use crate::{
 ///
 /// That is, for something like
 ///
-/// ```
+/// ```ignore
 /// quick_check! {
 ///    fn prop() {}
 /// }
@@ -82,8 +84,6 @@ pub enum TopEntryPoint {
     /// Edge case -- macros generally don't expand to attributes, with the
     /// exception of `cfg_attr` which does!
     MetaItem,
-    /// Edge case 2 -- eager macros expand their input to a delimited list of comma separated expressions
-    MacroEagerInput,
 }
 
 impl TopEntryPoint {
@@ -97,7 +97,6 @@ impl TopEntryPoint {
             TopEntryPoint::Type => grammar::entry::top::type_,
             TopEntryPoint::Expr => grammar::entry::top::expr,
             TopEntryPoint::MetaItem => grammar::entry::top::meta_item,
-            TopEntryPoint::MacroEagerInput => grammar::entry::top::eager_macro_input,
         };
         let mut p = parser::Parser::new(input, edition);
         entry_point(&mut p);

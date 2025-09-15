@@ -1,9 +1,11 @@
-use crate::spec::{cvs, Cc, LinkerFlavor, PanicStrategy, RelocModel, Target, TargetOptions};
+use crate::spec::{
+    Cc, LinkerFlavor, PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions, cvs,
+};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "msp430-none-elf".into(),
-        metadata: crate::spec::TargetMetadata {
+        metadata: TargetMetadata {
             description: Some("16-bit MSP430 microcontrollers".into()),
             tier: Some(3),
             host_tools: Some(false),
@@ -14,7 +16,7 @@ pub fn target() -> Target {
         arch: "msp430".into(),
 
         options: TargetOptions {
-            c_int_width: "16".into(),
+            c_int_width: 16,
 
             // The LLVM backend currently can't generate object files. To
             // workaround this LLVM generates assembly files which then we feed

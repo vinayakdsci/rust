@@ -1,10 +1,14 @@
-//! Analysis of patterns, notably match exhaustiveness checking.
+//! Analysis of patterns, notably match exhaustiveness checking. The main entrypoint for this crate
+//! is [`usefulness::compute_match_usefulness`]. For rustc-specific types and entrypoints, see the
+//! [`rustc`] module.
 
 // tidy-alphabetical-start
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
+#![allow(unused_crate_dependencies)]
 // tidy-alphabetical-end
 
+pub(crate) mod checks;
 pub mod constructor;
 #[cfg(feature = "rustc")]
 pub mod errors;
@@ -23,14 +27,8 @@ use std::fmt;
 
 pub use rustc_index::{Idx, IndexVec}; // re-exported to avoid rustc_index version issues
 
-#[cfg(feature = "rustc")]
-use rustc_middle::ty::Ty;
-#[cfg(feature = "rustc")]
-use rustc_span::ErrorGuaranteed;
-
 use crate::constructor::{Constructor, ConstructorSet, IntRange};
 use crate::pat::DeconstructedPat;
-use crate::pat_column::PatternColumn;
 
 pub trait Captures<'a> {}
 impl<'a, T: ?Sized> Captures<'a> for T {}
@@ -58,17 +56,23 @@ pub trait PatCx: Sized + fmt::Debug {
     type PatData: Clone;
 
     fn is_exhaustive_patterns_feature_on(&self) -> bool;
-    fn is_min_exhaustive_patterns_feature_on(&self) -> bool;
+
+    /// Whether to ensure the non-exhaustiveness witnesses we report for a complete set. This is
+    /// `false` by default to avoid some exponential blowup cases such as
+    /// <https://github.com/rust-lang/rust/issues/118437>.
+    fn exhaustive_witnesses(&self) -> bool {
+        false
+    }
 
     /// The number of fields for this constructor.
     fn ctor_arity(&self, ctor: &Constructor<Self>, ty: &Self::Ty) -> usize;
 
     /// The types of the fields for this constructor. The result must contain `ctor_arity()` fields.
-    fn ctor_sub_tys<'a>(
-        &'a self,
-        ctor: &'a Constructor<Self>,
-        ty: &'a Self::Ty,
-    ) -> impl Iterator<Item = (Self::Ty, PrivateUninhabitedField)> + ExactSizeIterator + Captures<'a>;
+    fn ctor_sub_tys(
+        &self,
+        ctor: &Constructor<Self>,
+        ty: &Self::Ty,
+    ) -> impl Iterator<Item = (Self::Ty, PrivateUninhabitedField)> + ExactSizeIterator;
 
     /// The set of all the constructors for `ty`.
     ///
@@ -111,6 +115,20 @@ pub trait PatCx: Sized + fmt::Debug {
         _gapped_with: &[&DeconstructedPat<Self>],
     ) {
     }
+
+    /// Check if we may need to perform additional deref-pattern-specific validation.
+    fn match_may_contain_deref_pats(&self) -> bool {
+        true
+    }
+
+    /// The current implementation of deref patterns requires that they can't match on the same
+    /// place as a normal constructor. Since this isn't caught by type-checking, we check it in the
+    /// `PatCx` before running the analysis. This reports an error if the check fails.
+    fn report_mixed_deref_pat_ctors(
+        &self,
+        deref_pat: &DeconstructedPat<Self>,
+        normal_pat: &DeconstructedPat<Self>,
+    ) -> Self::Error;
 }
 
 /// The arm of a match expression.
@@ -128,30 +146,3 @@ impl<'p, Cx: PatCx> Clone for MatchArm<'p, Cx> {
 }
 
 impl<'p, Cx: PatCx> Copy for MatchArm<'p, Cx> {}
-
-/// The entrypoint for this crate. Computes whether a match is exhaustive and which of its arms are
-/// useful, and runs some lints.
-#[cfg(feature = "rustc")]
-pub fn analyze_match<'p, 'tcx>(
-    tycx: &rustc::RustcPatCtxt<'p, 'tcx>,
-    arms: &[rustc::MatchArm<'p, 'tcx>],
-    scrut_ty: Ty<'tcx>,
-    pattern_complexity_limit: Option<usize>,
-) -> Result<rustc::UsefulnessReport<'p, 'tcx>, ErrorGuaranteed> {
-    use lints::lint_nonexhaustive_missing_variants;
-    use usefulness::{compute_match_usefulness, PlaceValidity};
-
-    let scrut_ty = tycx.reveal_opaque_ty(scrut_ty);
-    let scrut_validity = PlaceValidity::from_bool(tycx.known_valid_scrutinee);
-    let report =
-        compute_match_usefulness(tycx, arms, scrut_ty, scrut_validity, pattern_complexity_limit)?;
-
-    // Run the non_exhaustive_omitted_patterns lint. Only run on refutable patterns to avoid hitting
-    // `if let`s. Only run if the match is exhaustive otherwise the error is redundant.
-    if tycx.refutable && report.non_exhaustiveness_witnesses.is_empty() {
-        let pat_column = PatternColumn::new(arms);
-        lint_nonexhaustive_missing_variants(tycx, arms, &pat_column, scrut_ty)?;
-    }
-
-    Ok(report)
-}

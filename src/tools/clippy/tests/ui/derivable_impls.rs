@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#![feature(const_trait_impl)]
+#![feature(const_default)]
 
 use std::collections::HashMap;
 
@@ -18,6 +20,7 @@ struct FooDefault<'a> {
 }
 
 impl std::default::Default for FooDefault<'_> {
+    //~^ derivable_impls
     fn default() -> Self {
         Self {
             a: false,
@@ -39,6 +42,7 @@ impl std::default::Default for FooDefault<'_> {
 struct TupleDefault(bool, i32, u64);
 
 impl std::default::Default for TupleDefault {
+    //~^ derivable_impls
     fn default() -> Self {
         Self(false, 0, 0u64)
     }
@@ -91,6 +95,7 @@ impl Default for FooNDVec {
 struct StrDefault<'a>(&'a str);
 
 impl Default for StrDefault<'_> {
+    //~^ derivable_impls
     fn default() -> Self {
         Self("")
     }
@@ -117,6 +122,7 @@ mac!(0);
 
 struct Y(u32);
 impl Default for Y {
+    //~^ derivable_impls
     fn default() -> Self {
         Self(mac!())
     }
@@ -156,6 +162,7 @@ struct WithoutSelfCurly {
 }
 
 impl Default for WithoutSelfCurly {
+    //~^ derivable_impls
     fn default() -> Self {
         WithoutSelfCurly { a: false }
     }
@@ -164,6 +171,7 @@ impl Default for WithoutSelfCurly {
 struct WithoutSelfParan(bool);
 
 impl Default for WithoutSelfParan {
+    //~^ derivable_impls
     fn default() -> Self {
         WithoutSelfParan(false)
     }
@@ -178,6 +186,58 @@ pub struct SpecializedImpl2<T> {
 impl Default for SpecializedImpl2<String> {
     fn default() -> Self {
         Self { v: Vec::new() }
+    }
+}
+
+pub struct DirectDefaultDefaultCall {
+    v: Vec<i32>,
+}
+
+impl Default for DirectDefaultDefaultCall {
+    //~^ derivable_impls
+    fn default() -> Self {
+        // When calling `Default::default()` in all fields, we know it is the same as deriving.
+        Self { v: Default::default() }
+    }
+}
+
+pub struct EquivalentToDefaultDefaultCallVec {
+    v: Vec<i32>,
+}
+
+impl Default for EquivalentToDefaultDefaultCallVec {
+    //~^ derivable_impls
+    fn default() -> Self {
+        // The body of `<Vec as Default>::default()` is `Vec::new()`, so they are equivalent.
+        Self { v: Vec::new() }
+    }
+}
+
+pub struct S {
+    x: i32,
+}
+
+impl S {
+    fn new() -> S {
+        S { x: 42 }
+    }
+}
+
+impl Default for S {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct EquivalentToDefaultDefaultCallLocal {
+    v: S,
+}
+
+impl Default for EquivalentToDefaultDefaultCallLocal {
+    //~^ derivable_impls
+    fn default() -> Self {
+        // The body of `<S as Default>::default()` is `S::new()`, so they are equivalent.
+        Self { v: S::new() }
     }
 }
 
@@ -214,6 +274,7 @@ pub struct RepeatDefault1 {
 }
 
 impl Default for RepeatDefault1 {
+    //~^ derivable_impls
     fn default() -> Self {
         RepeatDefault1 { a: [0; 32] }
     }
@@ -248,6 +309,7 @@ pub enum SimpleEnum {
 }
 
 impl Default for SimpleEnum {
+    //~^ derivable_impls
     fn default() -> Self {
         SimpleEnum::Bar
     }
@@ -332,6 +394,45 @@ mod issue11368 {
         #[track_caller]
         fn default() -> Self {
             Self { a: 0 }
+        }
+    }
+}
+
+mod issue15493 {
+    #[derive(Copy, Clone)]
+    #[repr(transparent)]
+    struct Foo(u64);
+
+    impl const Default for Foo {
+        fn default() -> Self {
+            Self(0)
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    enum Bar {
+        A,
+        B,
+    }
+
+    impl const Default for Bar {
+        fn default() -> Self {
+            Bar::A
+        }
+    }
+}
+
+mod issue15536 {
+    #[derive(Copy, Clone)]
+    enum Bar {
+        A,
+        B,
+    }
+
+    impl Default for Bar {
+        //~^ derivable_impls
+        fn default() -> Self {
+            Self::A
         }
     }
 }

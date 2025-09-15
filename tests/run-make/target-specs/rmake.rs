@@ -4,22 +4,21 @@
 // with the target flag's bundle of new features to check that compilation either succeeds while
 // using them correctly, or fails with the right error message when using them improperly.
 // See https://github.com/rust-lang/rust/pull/16156
+//@ needs-llvm-components: x86
 
 use run_make_support::{diff, rfs, rustc};
 
 fn main() {
-    rustc().input("foo.rs").target("my-awesome-platform.json").crate_type("lib").emit("asm").run();
-    assert!(!rfs::read_to_string("foo.s").contains("morestack"));
     rustc()
         .input("foo.rs")
         .target("my-invalid-platform.json")
         .run_fail()
-        .assert_stderr_contains("Error loading target specification");
+        .assert_stderr_contains("error loading target specification");
     rustc()
         .input("foo.rs")
         .target("my-incomplete-platform.json")
         .run_fail()
-        .assert_stderr_contains("Field llvm-target");
+        .assert_stderr_contains("missing field `llvm-target`");
     rustc()
         .env("RUST_TARGET_PATH", ".")
         .input("foo.rs")
@@ -54,11 +53,6 @@ fn main() {
         .run();
     rustc()
         .input("foo.rs")
-        .target("definitely-not-builtin-target")
-        .run_fail()
-        .assert_stderr_contains("may not set is_builtin");
-    rustc()
-        .input("foo.rs")
         .target("endianness-mismatch")
         .run_fail()
         .assert_stderr_contains(r#""data-layout" claims architecture is little-endian"#);
@@ -68,4 +62,17 @@ fn main() {
         .crate_type("lib")
         .run_fail()
         .assert_stderr_contains("data-layout for target");
+    rustc()
+        .input("foo.rs")
+        .target("require-explicit-cpu")
+        .crate_type("lib")
+        .run_fail()
+        .assert_stderr_contains("target requires explicitly specifying a cpu");
+    rustc()
+        .input("foo.rs")
+        .target("require-explicit-cpu")
+        .crate_type("lib")
+        .arg("-Ctarget-cpu=generic")
+        .run();
+    rustc().target("require-explicit-cpu").arg("--print=target-cpus").run();
 }

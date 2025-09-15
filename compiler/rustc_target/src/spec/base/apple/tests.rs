@@ -1,3 +1,4 @@
+use super::OSVersion;
 use crate::spec::targets::{
     aarch64_apple_darwin, aarch64_apple_ios_sim, aarch64_apple_visionos_sim,
     aarch64_apple_watchos_sim, i686_apple_darwin, x86_64_apple_darwin, x86_64_apple_ios,
@@ -5,7 +6,7 @@ use crate::spec::targets::{
 };
 
 #[test]
-fn simulator_targets_set_abi() {
+fn simulator_targets_set_env() {
     let all_sim_targets = [
         x86_64_apple_ios::target(),
         x86_64_apple_tvos::target(),
@@ -17,7 +18,9 @@ fn simulator_targets_set_abi() {
     ];
 
     for target in &all_sim_targets {
-        assert_eq!(target.abi, "sim")
+        assert_eq!(target.env, "sim");
+        // Ensure backwards compat
+        assert_eq!(target.abi, "sim");
     }
 }
 
@@ -41,4 +44,12 @@ fn macos_link_environment_unmodified() {
             ],
         );
     }
+}
+
+#[test]
+fn test_parse_version() {
+    assert_eq!("10".parse(), Ok(OSVersion::new(10, 0, 0)));
+    assert_eq!("10.12".parse(), Ok(OSVersion::new(10, 12, 0)));
+    assert_eq!("10.12.6".parse(), Ok(OSVersion::new(10, 12, 6)));
+    assert_eq!("9999.99.99".parse(), Ok(OSVersion::new(9999, 99, 99)));
 }

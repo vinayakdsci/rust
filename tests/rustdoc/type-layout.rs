@@ -37,7 +37,8 @@ pub struct Y(u8);
 pub struct Z;
 
 // We can't compute layout for generic types.
-//@ hasraw type_layout/struct.Generic.html 'Unable to compute type layout, possibly due to this type having generic parameters'
+//@ hasraw type_layout/struct.Generic.html 'Unable to compute type layout, possibly due to this type having generic parameters.'
+//@ hasraw type_layout/struct.Generic.html 'Layout can only be computed for concrete, fully-instantiated types.'
 //@ !hasraw - 'Size: '
 pub struct Generic<T>(T);
 
@@ -60,7 +61,7 @@ pub type TypeAlias = X;
 pub type GenericTypeAlias = (Generic<(u32, ())>, Generic<u32>);
 
 // Regression test for the rustdoc equivalent of #85103.
-//@ hasraw type_layout/type.Edges.html 'Encountered an error during type layout; the type failed to be normalized.'
+//@ hasraw type_layout/type.Edges.html 'Unable to compute type layout, possibly due to this type having generic parameters. Layout can only be computed for concrete, fully-instantiated types.'
 pub type Edges<'a, E> = std::borrow::Cow<'a, [E]>;
 
 //@ !hasraw type_layout/trait.MyTrait.html 'Size: '
@@ -85,9 +86,15 @@ pub enum WithNiche {
 }
 
 //@ hasraw type_layout/enum.Uninhabited.html 'Size: '
-//@ hasraw - '0 bytes (<a href="https://doc.rust-lang.org/stable/reference/glossary.html#uninhabited">uninhabited</a>)'
+//@ hasraw - '0 bytes (<a href="{{channel}}/reference/glossary.html#uninhabited">uninhabited</a>)'
 pub enum Uninhabited {}
 
 //@ hasraw type_layout/struct.Uninhabited2.html 'Size: '
-//@ hasraw - '8 bytes (<a href="https://doc.rust-lang.org/stable/reference/glossary.html#uninhabited">uninhabited</a>)'
+//@ hasraw - '8 bytes (<a href="{{channel}}/reference/glossary.html#uninhabited">uninhabited</a>)'
 pub struct Uninhabited2(std::convert::Infallible, u64);
+
+pub trait Project { type Assoc; }
+// We can't compute layout. A `LayoutError::Unknown` is returned.
+//@ hasraw type_layout/struct.Unknown.html 'Unable to compute type layout.'
+//@ !hasraw - 'Size: '
+pub struct Unknown(<() as Project>::Assoc) where for<'a> (): Project;

@@ -1,4 +1,4 @@
-error: expected unsuffixed literal, found `test`
+error: expected a literal (`1u8`, `1.0f32`, `"string"`, etc.) here, found `test`
   --> $DIR/issue-66340-deprecated-attr-non-meta-grammar.rs:9:21
    |
 LL | #[deprecated(note = test)]

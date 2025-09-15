@@ -1,5 +1,6 @@
 //@compile-flags: -Zmiri-permissive-provenance
-#![feature(strict_provenance)]
+
+#![allow(integer_to_ptr_transmutes)]
 
 use std::mem;
 

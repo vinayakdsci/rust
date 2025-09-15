@@ -2,52 +2,61 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 use crate::command::Command;
-use crate::env::{env_var, env_var_os};
-use crate::util::set_host_rpath;
+use crate::env::env_var;
+use crate::target;
+use crate::util::set_host_compiler_dylib_path;
 
-/// Construct a plain `rustdoc` invocation with no flags set.
-#[track_caller]
-pub fn bare_rustdoc() -> Rustdoc {
-    Rustdoc::bare()
-}
-
-/// Construct a new `rustdoc` invocation with `-L $(TARGET_RPATH_DIR)` set.
+/// Construct a new `rustdoc` invocation with target automatically set to cross-compile target and
+/// with host compiler runtime libs configured. Use [`bare_rustdoc`] to avoid automatically setting
+/// cross-compile target.
 #[track_caller]
 pub fn rustdoc() -> Rustdoc {
     Rustdoc::new()
+}
+
+/// Bare `rustdoc` invocation, no args set.
+#[track_caller]
+pub fn bare_rustdoc() -> Rustdoc {
+    Rustdoc::bare()
 }
 
 #[derive(Debug)]
 #[must_use]
 pub struct Rustdoc {
     cmd: Command,
+    target: Option<String>,
 }
 
-crate::macros::impl_common_helpers!(Rustdoc);
+// Only fill in the target just before execution, so that it can be overridden.
+crate::macros::impl_common_helpers!(Rustdoc, |rustdoc: &mut Rustdoc| {
+    if let Some(target) = &rustdoc.target {
+        rustdoc.cmd.arg(&format!("--target={target}"));
+    }
+});
 
 #[track_caller]
 fn setup_common() -> Command {
     let rustdoc = env_var("RUSTDOC");
     let mut cmd = Command::new(rustdoc);
-    set_host_rpath(&mut cmd);
+    set_host_compiler_dylib_path(&mut cmd);
     cmd
 }
 
 impl Rustdoc {
-    /// Construct a bare `rustdoc` invocation.
+    /// Construct a new `rustdoc` invocation with target automatically set to cross-compile target
+    /// and with host compiler runtime libs configured. Use [`bare_rustdoc`] to avoid automatically
+    /// setting cross-compile target.
+    #[track_caller]
+    pub fn new() -> Self {
+        let cmd = setup_common();
+        Self { cmd, target: Some(target()) }
+    }
+
+    /// Bare `rustdoc` invocation, no args set.
     #[track_caller]
     pub fn bare() -> Self {
         let cmd = setup_common();
-        Self { cmd }
-    }
-
-    /// Construct a `rustdoc` invocation with `-L $(TARGET_RPATH_DIR)` set.
-    #[track_caller]
-    pub fn new() -> Self {
-        let mut cmd = setup_common();
-        let target_rpath_dir = env_var_os("TARGET_RPATH_DIR");
-        cmd.arg(format!("-L{}", target_rpath_dir.to_string_lossy()));
-        Self { cmd }
+        Self { cmd, target: None }
     }
 
     /// Specify where an external library is located.
@@ -71,14 +80,8 @@ impl Rustdoc {
         self
     }
 
-    /// Specify path to the output folder.
-    pub fn output<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
-        self.cmd.arg("-o");
-        self.cmd.arg(path.as_ref());
-        self
-    }
-
     /// Specify output directory.
+    #[doc(alias = "output")]
     pub fn out_dir<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
         self.cmd.arg("--out-dir").arg(path.as_ref());
         self
@@ -91,9 +94,9 @@ impl Rustdoc {
         self
     }
 
-    /// Specify a stdin input
-    pub fn stdin<I: AsRef<[u8]>>(&mut self, input: I) -> &mut Self {
-        self.cmd.stdin(input);
+    /// Specify a stdin input buffer.
+    pub fn stdin_buf<I: AsRef<[u8]>>(&mut self, input: I) -> &mut Self {
+        self.cmd.stdin_buf(input);
         self
     }
 
@@ -106,8 +109,9 @@ impl Rustdoc {
 
     /// Specify the target triple, or a path to a custom target json spec file.
     pub fn target<S: AsRef<str>>(&mut self, target: S) -> &mut Self {
-        let target = target.as_ref();
-        self.cmd.arg(format!("--target={target}"));
+        // We store the target as a separate field, so that it can be specified multiple times.
+        // This is in particular useful to override the default target set in `Rustdoc::new()`.
+        self.target = Some(target.as_ref().to_string());
         self
     }
 
@@ -137,6 +141,13 @@ impl Rustdoc {
     pub fn output_format(&mut self, format: &str) -> &mut Self {
         self.cmd.arg("--output-format");
         self.cmd.arg(format);
+        self
+    }
+
+    /// Specify type(s) of output files to generate.
+    pub fn emit<S: AsRef<str>>(&mut self, kinds: S) -> &mut Self {
+        let kinds = kinds.as_ref();
+        self.cmd.arg(format!("--emit={kinds}"));
         self
     }
 }

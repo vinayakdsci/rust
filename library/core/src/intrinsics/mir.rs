@@ -213,7 +213,7 @@
 //!  - All other locals need to be declared with `let` somewhere and then can be accessed by name.
 //!
 //! #### Places
-//!  - Locals implicit convert to places.
+//!  - Locals implicitly convert to places.
 //!  - Field accesses, derefs, and indexing work normally.
 //!  - Fields in variants can be accessed via the [`Variant`] and [`Field`] associated functions,
 //!    see their documentation for details.
@@ -247,6 +247,41 @@
 //!       otherwise branch.
 //!  - [`Call`] has an associated function as well, with special syntax:
 //!    `Call(ret_val = function(arg1, arg2, ...), ReturnTo(next_block), UnwindContinue())`.
+//!  - [`TailCall`] does not have a return destination or next block, so its syntax is just
+//!    `TailCall(function(arg1, arg2, ...))`.
+//!
+//! #### Debuginfo
+//!
+//! Debuginfo associates source code variable names (of variables that may not exist any more) with
+//! MIR expressions that indicate where the value of that variable is stored. The syntax to do so
+//! is:
+//! ```text
+//! debug source_var_name => expression;
+//! ```
+//! Both places and constants are supported in the `expression`.
+//!
+//! ```rust
+//! #![allow(internal_features)]
+//! #![feature(core_intrinsics, custom_mir)]
+//!
+//! use core::intrinsics::mir::*;
+//!
+//! #[custom_mir(dialect = "built")]
+//! fn debuginfo(arg: Option<&i32>) {
+//!     mir!(
+//!         // Debuginfo for a source variable `plain_local` that just duplicates `arg`.
+//!         debug plain_local => arg;
+//!         // Debuginfo for a source variable `projection` that can be computed by dereferencing
+//!         // a field of `arg`.
+//!         debug projection => *Field::<&i32>(Variant(arg, 1), 0);
+//!         // Debuginfo for a source variable `constant` that always holds the value `5`.
+//!         debug constant => 5_usize;
+//!         {
+//!             Return()
+//!         }
+//!     )
+//! }
+//! ```
 
 #![unstable(
     feature = "custom_mir",
@@ -276,8 +311,7 @@ pub enum UnwindTerminateReason {
     InCleanup,
 }
 
-pub use UnwindTerminateReason::Abi as ReasonAbi;
-pub use UnwindTerminateReason::InCleanup as ReasonInCleanup;
+pub use UnwindTerminateReason::{Abi as ReasonAbi, InCleanup as ReasonInCleanup};
 
 macro_rules! define {
     ($name:literal, $( #[ $meta:meta ] )* fn $($sig:tt)*) => {
@@ -297,7 +331,7 @@ define!(
 );
 define!(
     "mir_unwind_unreachable",
-    /// An unwind action that triggers undefined behaviour.
+    /// An unwind action that triggers undefined behavior.
     fn UnwindUnreachable() -> UnwindActionArg
 );
 define!(
@@ -309,7 +343,7 @@ define!(
 );
 define!(
     "mir_unwind_cleanup",
-    /// An unwind action that continues execution in a given basic blok.
+    /// An unwind action that continues execution in a given basic block.
     fn UnwindCleanup(goto: BasicBlock) -> UnwindActionArg
 );
 
@@ -350,6 +384,12 @@ define!("mir_call",
     /// - [`UnwindTerminate`]
     /// - [`UnwindCleanup`]
     fn Call(call: (), goto: ReturnToArg, unwind_action: UnwindActionArg)
+);
+define!("mir_tail_call",
+    /// Call a function.
+    ///
+    /// The argument must be of the form `fun(arg1, arg2, ...)`.
+    fn TailCall<T>(call: T)
 );
 define!("mir_unwind_resume",
     /// A terminator that resumes the unwinding.

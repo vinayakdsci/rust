@@ -16,15 +16,14 @@
 //! [`BlockMarker`]: rustc_middle::mir::coverage::CoverageKind::BlockMarker
 //! [`SpanMarker`]: rustc_middle::mir::coverage::CoverageKind::SpanMarker
 
-use crate::MirPass;
 use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::{Body, BorrowKind, CastKind, Rvalue, StatementKind, TerminatorKind};
-use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::adjustment::PointerCoercion;
 
-pub struct CleanupPostBorrowck;
+pub(super) struct CleanupPostBorrowck;
 
-impl<'tcx> MirPass<'tcx> for CleanupPostBorrowck {
+impl<'tcx> crate::MirPass<'tcx> for CleanupPostBorrowck {
     fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         for basic_block in body.basic_blocks.as_mut() {
             for statement in basic_block.statements.iter_mut() {
@@ -36,13 +35,15 @@ impl<'tcx> MirPass<'tcx> for CleanupPostBorrowck {
                         // MIR building, and are not needed after InstrumentCoverage.
                         CoverageKind::BlockMarker { .. } | CoverageKind::SpanMarker { .. },
                     )
-                    | StatementKind::FakeRead(..) => statement.make_nop(),
+                    | StatementKind::FakeRead(..)
+                    | StatementKind::BackwardIncompatibleDropHint { .. } => statement.make_nop(),
                     StatementKind::Assign(box (
                         _,
                         Rvalue::Cast(
                             ref mut cast_kind @ CastKind::PointerCoercion(
                                 PointerCoercion::ArrayToPointer
                                 | PointerCoercion::MutToConstPointer,
+                                _,
                             ),
                             ..,
                         ),
@@ -71,5 +72,9 @@ impl<'tcx> MirPass<'tcx> for CleanupPostBorrowck {
         for decl in &mut body.local_decls {
             decl.user_ty = None;
         }
+    }
+
+    fn is_required(&self) -> bool {
+        true
     }
 }

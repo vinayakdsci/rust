@@ -1,4 +1,6 @@
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
+// We need this feature as it changes `dylib` linking behavior and allows us to link to
+// `rustc_driver`.
+#![feature(rustc_private)]
 // warn on lints, that are included in `rust-lang/rust`s bootstrap
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
@@ -105,7 +107,7 @@ impl ClippyCmd {
     }
 
     fn into_std_cmd(self) -> Command {
-        let mut cmd = Command::new(env::var("CARGO").unwrap_or("cargo".into()));
+        let mut cmd = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         let clippy_args: String = self
             .clippy_args
             .iter()

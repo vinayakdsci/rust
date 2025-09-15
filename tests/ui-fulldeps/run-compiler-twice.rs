@@ -17,9 +17,8 @@ extern crate rustc_span;
 
 use std::path::{Path, PathBuf};
 
-use rustc_interface::Linker;
-use rustc_interface::interface;
-use rustc_session::config::{Input, Options, OutFileName, OutputType, OutputTypes};
+use rustc_interface::{Linker, interface};
+use rustc_session::config::{Input, Options, OutFileName, OutputType, OutputTypes, Sysroot};
 use rustc_span::FileName;
 
 fn main() {
@@ -33,7 +32,7 @@ fn main() {
         panic!("expected sysroot (and optional linker)");
     }
 
-    let sysroot = PathBuf::from(&args[1]);
+    let sysroot = Sysroot::new(Some(PathBuf::from(&args[1])));
     let linker = args.get(2).map(PathBuf::from);
 
     // compiletest sets the current dir to `output_base_dir` when running.
@@ -44,10 +43,10 @@ fn main() {
     compile(src.to_string(), tmpdir.join("out"), sysroot.clone(), linker.as_deref());
 }
 
-fn compile(code: String, output: PathBuf, sysroot: PathBuf, linker: Option<&Path>) {
+fn compile(code: String, output: PathBuf, sysroot: Sysroot, linker: Option<&Path>) {
     let mut opts = Options::default();
     opts.output_types = OutputTypes::new(&[(OutputType::Exe, None)]);
-    opts.maybe_sysroot = Some(sysroot);
+    opts.sysroot = sysroot;
 
     if let Some(linker) = linker {
         opts.cg.linker = Some(linker.to_owned());
@@ -65,25 +64,25 @@ fn compile(code: String, output: PathBuf, sysroot: PathBuf, linker: Option<&Path
         output_dir: None,
         ice_file: None,
         file_loader: None,
-        locale_resources: &[],
+        locale_resources: Vec::new(),
         lint_caps: Default::default(),
         psess_created: None,
         hash_untracked_state: None,
         register_lints: None,
         override_queries: None,
+        extra_symbols: Vec::new(),
         make_codegen_backend: None,
         registry: rustc_driver::diagnostics_registry(),
-        using_internal_features: std::sync::Arc::default(),
+        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
         expanded_args: Default::default(),
     };
 
     interface::run_compiler(config, |compiler| {
-        let linker = compiler.enter(|queries| {
-            queries.global_ctxt()?.enter(|tcx| {
-                tcx.analysis(())?;
-                Linker::codegen_and_build_linker(tcx, &*compiler.codegen_backend)
-            })
+        let krate = rustc_interface::passes::parse(&compiler.sess);
+        let linker = rustc_interface::create_and_enter_global_ctxt(&compiler, krate, |tcx| {
+            let _ = tcx.analysis(());
+            Linker::codegen_and_build_linker(tcx, &*compiler.codegen_backend)
         });
-        linker.unwrap().link(&compiler.sess, &*compiler.codegen_backend).unwrap();
+        linker.link(&compiler.sess, &*compiler.codegen_backend);
     });
 }

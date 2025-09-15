@@ -1,19 +1,17 @@
 //! This module contains the hybrid top-level loop combining bottom-up Mergesort with top-down
 //! Quicksort.
 
-use crate::cmp;
-use crate::intrinsics;
 use crate::mem::MaybeUninit;
-
 use crate::slice::sort::shared::find_existing_run;
 use crate::slice::sort::shared::smallsort::StableSmallSortTypeImpl;
 use crate::slice::sort::stable::merge::merge;
 use crate::slice::sort::stable::quicksort::quicksort;
+use crate::{cmp, intrinsics};
 
 /// Sorts `v` based on comparison function `is_less`. If `eager_sort` is true,
 /// it will only do small-sorts and physical merges, ensuring O(N * log(N))
-/// worst-case complexity. `scratch.len()` must be at least `max(v.len() / 2,
-/// MIN_SMALL_SORT_SCRATCH_LEN)` otherwise the implementation may abort.
+/// worst-case complexity. `scratch.len()` must be at least
+/// `max(v.len() - v.len() / 2, SMALL_SORT_GENERAL_SCRATCH_LEN)` otherwise the implementation may abort.
 /// Fully ascending and descending inputs will be sorted with exactly N - 1
 /// comparisons.
 ///
@@ -160,7 +158,7 @@ fn merge_tree_scale_factor(n: usize) -> u64 {
         panic!("Platform not supported");
     }
 
-    ((1 << 62) + n as u64 - 1) / n as u64
+    (1u64 << 62).div_ceil(n as u64)
 }
 
 // Note: merge_tree_depth output is < 64 when left < right as f*x and f*y must
@@ -184,7 +182,7 @@ fn sqrt_approx(n: usize) -> usize {
     // Finally we note that the exponentiation / division can be done directly
     // with shifts. We OR with 1 to avoid zero-checks in the integer log.
     let ilog = (n | 1).ilog2();
-    let shift = (1 + ilog) / 2;
+    let shift = ilog.div_ceil(2);
     ((1 << shift) + (n >> shift)) / 2
 }
 
@@ -273,7 +271,7 @@ fn stable_quicksort<T, F: FnMut(&T, &T) -> bool>(
 }
 
 /// Compactly stores the length of a run, and whether or not it is sorted. This
-/// can always fit in a usize because the maximum slice length is isize::MAX.
+/// can always fit in a `usize` because the maximum slice length is [`isize::MAX`].
 #[derive(Copy, Clone)]
 struct DriftsortRun(usize);
 

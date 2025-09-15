@@ -18,7 +18,7 @@ pub trait AsyncIterator {
     /// The type of items yielded by the async iterator.
     type Item;
 
-    /// Attempt to pull out the next value of this async iterator, registering the
+    /// Attempts to pull out the next value of this async iterator, registering the
     /// current task for wakeup if the value is not yet available, and returning
     /// `None` if the async iterator is exhausted.
     ///
@@ -28,15 +28,15 @@ pub trait AsyncIterator {
     /// async iterator state:
     ///
     /// - `Poll::Pending` means that this async iterator's next value is not ready
-    /// yet. Implementations will ensure that the current task will be notified
-    /// when the next value may be ready.
+    ///   yet. Implementations will ensure that the current task will be notified
+    ///   when the next value may be ready.
     ///
     /// - `Poll::Ready(Some(val))` means that the async iterator has successfully
-    /// produced a value, `val`, and may produce further values on subsequent
-    /// `poll_next` calls.
+    ///   produced a value, `val`, and may produce further values on subsequent
+    ///   `poll_next` calls.
     ///
     /// - `Poll::Ready(None)` means that the async iterator has terminated, and
-    /// `poll_next` should not be invoked again.
+    ///   `poll_next` should not be invoked again.
     ///
     /// # Panics
     ///
@@ -139,7 +139,7 @@ impl<T> Poll<Option<T>> {
     pub const FINISHED: Self = Poll::Ready(None);
 }
 
-/// Convert something into an async iterator
+/// Converts something into an async iterator
 #[unstable(feature = "async_iterator", issue = "79024")]
 pub trait IntoAsyncIterator {
     /// The type of the item yielded by the iterator

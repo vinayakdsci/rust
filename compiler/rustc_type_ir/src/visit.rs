@@ -41,13 +41,16 @@
 //! - u.visit_with(visitor)
 //! ```
 
-use rustc_ast_ir::visit::VisitorResult;
-use rustc_ast_ir::{try_visit, walk_visitable_list};
-use rustc_index::{Idx, IndexVec};
 use std::fmt;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
-use crate::data_structures::Lrc;
+pub use rustc_ast_ir::visit::VisitorResult;
+pub use rustc_ast_ir::{try_visit, walk_visitable_list};
+use rustc_index::{Idx, IndexVec};
+use smallvec::SmallVec;
+use thin_vec::ThinVec;
+
 use crate::inherent::*;
 use crate::{self as ty, Interner, TypeFlags};
 
@@ -56,7 +59,7 @@ use crate::{self as ty, Interner, TypeFlags};
 ///
 /// To implement this conveniently, use the derive macro located in
 /// `rustc_macros`.
-pub trait TypeVisitable<I: Interner>: fmt::Debug + Clone {
+pub trait TypeVisitable<I: Interner>: fmt::Debug {
     /// The entry point for visiting. To visit a value `t` with a visitor `v`
     /// call: `t.visit_with(v)`.
     ///
@@ -117,8 +120,8 @@ pub trait TypeVisitor<I: Interner>: Sized {
         p.super_visit_with(self)
     }
 
-    fn visit_clauses(&mut self, p: I::Clauses) -> Self::Result {
-        p.super_visit_with(self)
+    fn visit_clauses(&mut self, c: I::Clauses) -> Self::Result {
+        c.super_visit_with(self)
     }
 
     fn visit_error(&mut self, _guar: I::ErrorGuaranteed) -> Self::Result {
@@ -164,7 +167,7 @@ impl<I: Interner, T: TypeVisitable<I>, E: TypeVisitable<I>> TypeVisitable<I> for
     }
 }
 
-impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Lrc<T> {
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Arc<T> {
     fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
         (**self).visit_with(visitor)
     }
@@ -177,6 +180,20 @@ impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Box<T> {
 }
 
 impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Vec<T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
+        walk_visitable_list!(visitor, self.iter());
+        V::Result::output()
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for ThinVec<T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
+        walk_visitable_list!(visitor, self.iter());
+        V::Result::output()
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>, const N: usize> TypeVisitable<I> for SmallVec<[T; N]> {
     fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
         walk_visitable_list!(visitor, self.iter());
         V::Result::output()
@@ -201,6 +218,13 @@ impl<I: Interner, T: TypeVisitable<I>> TypeVisitable<I> for Box<[T]> {
 }
 
 impl<I: Interner, T: TypeVisitable<I>, Ix: Idx> TypeVisitable<I> for IndexVec<Ix, T> {
+    fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
+        walk_visitable_list!(visitor, self.iter());
+        V::Result::output()
+    }
+}
+
+impl<I: Interner, T: TypeVisitable<I>, S> TypeVisitable<I> for indexmap::IndexSet<T, S> {
     fn visit_with<V: TypeVisitor<I>>(&self, visitor: &mut V) -> V::Result {
         walk_visitable_list!(visitor, self.iter());
         V::Result::output()
@@ -241,16 +265,12 @@ pub trait TypeVisitableExt<I: Interner>: TypeVisitable<I> {
         self.has_type_flags(TypeFlags::HAS_ALIAS)
     }
 
-    fn has_inherent_projections(&self) -> bool {
-        self.has_type_flags(TypeFlags::HAS_TY_INHERENT)
-    }
-
     fn has_opaque_types(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_TY_OPAQUE)
     }
 
     fn has_coroutines(&self) -> bool {
-        self.has_type_flags(TypeFlags::HAS_TY_COROUTINE)
+        self.has_type_flags(TypeFlags::HAS_TY_CORO)
     }
 
     fn references_error(&self) -> bool {
@@ -378,9 +398,9 @@ impl std::fmt::Debug for HasTypeFlagsVisitor {
 // looks, particular for `Ty`/`Predicate` where it's just a field access.
 //
 // N.B. The only case where this isn't totally true is binders, which also
-// add `HAS_{RE,TY,CT}_LATE_BOUND` flag depending on the *bound variables* that
+// add `HAS_BINDER_VARS` flag depending on the *bound variables* that
 // are present, regardless of whether those bound variables are used. This
-// is important for anonymization of binders in `TyCtxt::erase_regions`. We
+// is important for anonymization of binders in `TyCtxt::erase_and_anonymize_regions`. We
 // specifically detect this case in `visit_binder`.
 impl<I: Interner> TypeVisitor<I> for HasTypeFlagsVisitor {
     type Result = ControlFlow<FoundFlags>;

@@ -35,7 +35,7 @@
 // different implementations.
 //
 // Unfortunately, NT Keyed Events are an undocumented Windows API. However:
-// - This API is relatively simple with obvious behaviour, and there are
+// - This API is relatively simple with obvious behavior, and there are
 //   several (unofficial) articles documenting the details. [1]
 // - `parking_lot` has been using this API for years (on Windows versions
 //   before Windows 8). [2] Many big projects extensively use parking_lot,
@@ -43,7 +43,7 @@
 // - It is the underlying API used by Windows SRW locks and Windows critical
 //   sections. [3] [4]
 // - The source code of the implementations of Wine, ReactOs, and Windows XP
-//   are available and match the expected behaviour.
+//   are available and match the expected behavior.
 // - The main risk with an undocumented API is that it might change in the
 //   future. But since we only use it for older versions of Windows, that's not
 //   a problem.
@@ -57,17 +57,16 @@
 // [3]: https://docs.microsoft.com/en-us/archive/msdn-magazine/2012/november/windows-with-c-the-evolution-of-synchronization-in-windows-and-c
 // [4]: Windows Internals, Part 1, ISBN 9780735671300
 
-use crate::pin::Pin;
-use crate::sync::atomic::{
-    AtomicI8,
-    Ordering::{Acquire, Release},
-};
-use crate::sys::{c, dur2timeout};
-use crate::time::Duration;
 use core::ffi::c_void;
 
+use crate::pin::Pin;
+use crate::sync::atomic::Ordering::{Acquire, Release};
+use crate::sync::atomic::{Atomic, AtomicI8};
+use crate::sys::{c, dur2timeout};
+use crate::time::Duration;
+
 pub struct Parker {
-    state: AtomicI8,
+    state: Atomic<i8>,
 }
 
 const PARKED: i8 = -1;
@@ -95,7 +94,7 @@ const NOTIFIED: i8 = 1;
 // Ordering::Release when writing NOTIFIED (the 'token') in unpark(), and using
 // Ordering::Acquire when reading this state in park() after waking up.
 impl Parker {
-    /// Construct the Windows parker. The UNIX parker implementation
+    /// Constructs the Windows parker. The UNIX parker implementation
     /// requires this to happen in-place.
     pub unsafe fn new_in_place(parker: *mut Parker) {
         parker.write(Self { state: AtomicI8::new(EMPTY) });
@@ -179,25 +178,24 @@ impl Parker {
     }
 
     fn ptr(&self) -> *const c_void {
-        core::ptr::addr_of!(self.state).cast::<c_void>()
+        (&raw const self.state).cast::<c_void>()
     }
 }
 
 #[cfg(target_vendor = "win7")]
 mod keyed_events {
-    use super::{Parker, EMPTY, NOTIFIED};
-    use crate::sys::c;
     use core::pin::Pin;
     use core::ptr;
-    use core::sync::atomic::{
-        AtomicPtr,
-        Ordering::{Acquire, Relaxed},
-    };
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    use core::sync::atomic::{Atomic, AtomicPtr};
     use core::time::Duration;
+
+    use super::{EMPTY, NOTIFIED, Parker};
+    use crate::sys::c;
 
     pub unsafe fn park(parker: Pin<&Parker>) {
         // Wait for unpark() to produce this event.
-        c::NtWaitForKeyedEvent(keyed_event_handle(), parker.ptr(), 0, ptr::null_mut());
+        c::NtWaitForKeyedEvent(keyed_event_handle(), parker.ptr(), false, ptr::null_mut());
         // Set the state back to EMPTY (from either PARKED or NOTIFIED).
         // Note that we don't just write EMPTY, but use swap() to also
         // include an acquire-ordered read to synchronize with unpark()'s
@@ -220,7 +218,7 @@ mod keyed_events {
 
         // Wait for unpark() to produce this event.
         let unparked =
-            c::NtWaitForKeyedEvent(handle, parker.ptr(), 0, &mut timeout) == c::STATUS_SUCCESS;
+            c::NtWaitForKeyedEvent(handle, parker.ptr(), false, &mut timeout) == c::STATUS_SUCCESS;
 
         // Set the state back to EMPTY (from either PARKED or NOTIFIED).
         let prev_state = parker.state.swap(EMPTY, Acquire);
@@ -230,7 +228,7 @@ mod keyed_events {
             // was set to NOTIFIED, which means we *just* missed an
             // unpark(), which is now blocked on us to wait for it.
             // Wait for it to consume the event and unblock that thread.
-            c::NtWaitForKeyedEvent(handle, parker.ptr(), 0, ptr::null_mut());
+            c::NtWaitForKeyedEvent(handle, parker.ptr(), false, ptr::null_mut());
         }
     }
     pub unsafe fn unpark(parker: Pin<&Parker>) {
@@ -241,12 +239,12 @@ mod keyed_events {
         // To prevent this thread from blocking indefinitely in that case,
         // park_impl() will, after seeing the state set to NOTIFIED after
         // waking up, call NtWaitForKeyedEvent again to unblock us.
-        c::NtReleaseKeyedEvent(keyed_event_handle(), parker.ptr(), 0, ptr::null_mut());
+        c::NtReleaseKeyedEvent(keyed_event_handle(), parker.ptr(), false, ptr::null_mut());
     }
 
     fn keyed_event_handle() -> c::HANDLE {
         const INVALID: c::HANDLE = ptr::without_provenance_mut(!0);
-        static HANDLE: AtomicPtr<crate::ffi::c_void> = AtomicPtr::new(INVALID);
+        static HANDLE: Atomic<*mut crate::ffi::c_void> = AtomicPtr::new(INVALID);
         match HANDLE.load(Relaxed) {
             INVALID => {
                 let mut handle = c::INVALID_HANDLE_VALUE;

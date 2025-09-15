@@ -13,6 +13,11 @@ use crate::sync::Once;
 /// Where OnceLock shines is when LazyLock is too simple to support a given case, as LazyLock
 /// doesn't allow additional inputs to its function after you call [`LazyLock::new(|| ...)`].
 ///
+/// A `OnceLock` can be thought of as a safe abstraction over uninitialized data that becomes
+/// initialized once written.
+///
+/// Unlike [`Mutex`](crate::sync::Mutex), `OnceLock` is never poisoned on panic.
+///
 /// [`OnceCell`]: crate::cell::OnceCell
 /// [`LazyLock<T, F>`]: crate::sync::LazyLock
 /// [`LazyLock::new(|| ...)`]: crate::sync::LazyLock::new
@@ -101,6 +106,7 @@ use crate::sync::Once;
 /// ```
 #[stable(feature = "once_cell", since = "1.70.0")]
 pub struct OnceLock<T> {
+    // FIXME(nonpoison_once): switch to nonpoison version once it is available
     once: Once,
     // Whether or not the value is initialized is tracked by `once.is_completed()`.
     value: UnsafeCell<MaybeUninit<T>>,
@@ -125,7 +131,7 @@ pub struct OnceLock<T> {
 }
 
 impl<T> OnceLock<T> {
-    /// Creates a new empty cell.
+    /// Creates a new uninitialized cell.
     #[inline]
     #[must_use]
     #[stable(feature = "once_cell", since = "1.70.0")]
@@ -140,8 +146,8 @@ impl<T> OnceLock<T> {
 
     /// Gets the reference to the underlying value.
     ///
-    /// Returns `None` if the cell is empty, or being initialized. This
-    /// method never blocks.
+    /// Returns `None` if the cell is uninitialized, or being initialized.
+    /// This method never blocks.
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
     pub fn get(&self) -> Option<&T> {
@@ -155,7 +161,11 @@ impl<T> OnceLock<T> {
 
     /// Gets the mutable reference to the underlying value.
     ///
-    /// Returns `None` if the cell is empty. This method never blocks.
+    /// Returns `None` if the cell is uninitialized.
+    ///
+    /// This method never blocks. Since it borrows the `OnceLock` mutably,
+    /// it is statically guaranteed that no active borrows to the `OnceLock`
+    /// exist, including from other threads.
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
     pub fn get_mut(&mut self) -> Option<&mut T> {
@@ -167,12 +177,39 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Sets the contents of this cell to `value`.
+    /// Blocks the current thread until the cell is initialized.
+    ///
+    /// # Example
+    ///
+    /// Waiting for a computation on another thread to finish:
+    /// ```rust
+    /// use std::thread;
+    /// use std::sync::OnceLock;
+    ///
+    /// let value = OnceLock::new();
+    ///
+    /// thread::scope(|s| {
+    ///     s.spawn(|| value.set(1 + 1));
+    ///
+    ///     let result = value.wait();
+    ///     assert_eq!(result, &2);
+    /// })
+    /// ```
+    #[inline]
+    #[stable(feature = "once_wait", since = "1.86.0")]
+    pub fn wait(&self) -> &T {
+        self.once.wait_force();
+
+        unsafe { self.get_unchecked() }
+    }
+
+    /// Initializes the contents of the cell to `value`.
     ///
     /// May block if another thread is currently attempting to initialize the cell. The cell is
-    /// guaranteed to contain a value when set returns, though not necessarily the one provided.
+    /// guaranteed to contain a value when `set` returns, though not necessarily the one provided.
     ///
-    /// Returns `Ok(())` if the cell's value was set by this call.
+    /// Returns `Ok(())` if the cell was uninitialized and
+    /// `Err(value)` if the cell was already initialized.
     ///
     /// # Examples
     ///
@@ -201,13 +238,15 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Sets the contents of this cell to `value` if the cell was empty, then
-    /// returns a reference to it.
+    /// Initializes the contents of the cell to `value` if the cell was uninitialized,
+    /// then returns a reference to it.
     ///
     /// May block if another thread is currently attempting to initialize the cell. The cell is
-    /// guaranteed to contain a value when set returns, though not necessarily the one provided.
+    /// guaranteed to contain a value when `try_insert` returns, though not necessarily the
+    /// one provided.
     ///
-    /// Returns `Ok(&value)` if the cell was empty and `Err(&current_value, value)` if it was full.
+    /// Returns `Ok(&value)` if the cell was uninitialized and
+    /// `Err((&current_value, value))` if it was already initialized.
     ///
     /// # Examples
     ///
@@ -240,16 +279,16 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Gets the contents of the cell, initializing it with `f` if the cell
-    /// was empty.
+    /// Gets the contents of the cell, initializing it to `f()` if the cell
+    /// was uninitialized.
     ///
     /// Many threads may call `get_or_init` concurrently with different
     /// initializing functions, but it is guaranteed that only one function
-    /// will be executed.
+    /// will be executed if the function doesn't panic.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and the cell
+    /// If `f()` panics, the panic is propagated to the caller, and the cell
     /// remains uninitialized.
     ///
     /// It is an error to reentrantly initialize the cell from `f`. The
@@ -279,15 +318,15 @@ impl<T> OnceLock<T> {
     }
 
     /// Gets the mutable reference of the contents of the cell, initializing
-    /// it with `f` if the cell was empty.
+    /// it to `f()` if the cell was uninitialized.
     ///
-    /// Many threads may call `get_mut_or_init` concurrently with different
-    /// initializing functions, but it is guaranteed that only one function
-    /// will be executed.
+    /// This method never blocks. Since it borrows the `OnceLock` mutably,
+    /// it is statically guaranteed that no active borrows to the `OnceLock`
+    /// exist, including from other threads.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and the cell
+    /// If `f()` panics, the panic is propagated to the caller, and the cell
     /// remains uninitialized.
     ///
     /// # Examples
@@ -318,13 +357,13 @@ impl<T> OnceLock<T> {
         }
     }
 
-    /// Gets the contents of the cell, initializing it with `f` if
-    /// the cell was empty. If the cell was empty and `f` failed, an
-    /// error is returned.
+    /// Gets the contents of the cell, initializing it to `f()` if
+    /// the cell was uninitialized. If the cell was uninitialized
+    /// and `f()` failed, an error is returned.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and
+    /// If `f()` panics, the panic is propagated to the caller, and
     /// the cell remains uninitialized.
     ///
     /// It is an error to reentrantly initialize the cell from `f`.
@@ -370,12 +409,16 @@ impl<T> OnceLock<T> {
     }
 
     /// Gets the mutable reference of the contents of the cell, initializing
-    /// it with `f` if the cell was empty. If the cell was empty and `f` failed,
-    /// an error is returned.
+    /// it to `f()` if the cell was uninitialized. If the cell was uninitialized
+    /// and `f()` failed, an error is returned.
+    ///
+    /// This method never blocks. Since it borrows the `OnceLock` mutably,
+    /// it is statically guaranteed that no active borrows to the `OnceLock`
+    /// exist, including from other threads.
     ///
     /// # Panics
     ///
-    /// If `f` panics, the panic is propagated to the caller, and
+    /// If `f()` panics, the panic is propagated to the caller, and
     /// the cell remains uninitialized.
     ///
     /// # Examples
@@ -387,7 +430,7 @@ impl<T> OnceLock<T> {
     ///
     /// let mut cell: OnceLock<u32> = OnceLock::new();
     ///
-    /// // Failed initializers do not change the value
+    /// // Failed attempts to initialize the cell do not change its contents
     /// assert!(cell.get_mut_or_try_init(|| "not a number!".parse()).is_err());
     /// assert!(cell.get().is_none());
     ///
@@ -411,7 +454,7 @@ impl<T> OnceLock<T> {
     }
 
     /// Consumes the `OnceLock`, returning the wrapped value. Returns
-    /// `None` if the cell was empty.
+    /// `None` if the cell was uninitialized.
     ///
     /// # Examples
     ///
@@ -433,9 +476,10 @@ impl<T> OnceLock<T> {
 
     /// Takes the value out of this `OnceLock`, moving it back to an uninitialized state.
     ///
-    /// Has no effect and returns `None` if the `OnceLock` hasn't been initialized.
+    /// Has no effect and returns `None` if the `OnceLock` was uninitialized.
     ///
-    /// Safety is guaranteed by requiring a mutable reference.
+    /// Since this method borrows the `OnceLock` mutably, it is statically guaranteed that
+    /// no active borrows to the `OnceLock` exist, including from other threads.
     ///
     /// # Examples
     ///
@@ -470,6 +514,7 @@ impl<T> OnceLock<T> {
     }
 
     #[cold]
+    #[optimize(size)]
     fn initialize<F, E>(&self, f: F) -> Result<(), E>
     where
         F: FnOnce() -> Result<T, E>,
@@ -488,7 +533,7 @@ impl<T> OnceLock<T> {
                     res = Err(e);
 
                     // Treat the underlying `Once` as poisoned since we
-                    // failed to initialize our value. Calls
+                    // failed to initialize our value.
                     p.poison();
                 }
             }
@@ -498,7 +543,7 @@ impl<T> OnceLock<T> {
 
     /// # Safety
     ///
-    /// The value must be initialized
+    /// The cell must be initialized
     #[inline]
     unsafe fn get_unchecked(&self) -> &T {
         debug_assert!(self.is_initialized());
@@ -507,7 +552,7 @@ impl<T> OnceLock<T> {
 
     /// # Safety
     ///
-    /// The value must be initialized
+    /// The cell must be initialized
     #[inline]
     unsafe fn get_unchecked_mut(&mut self) -> &mut T {
         debug_assert!(self.is_initialized());
@@ -532,7 +577,7 @@ impl<T: UnwindSafe> UnwindSafe for OnceLock<T> {}
 
 #[stable(feature = "once_cell", since = "1.70.0")]
 impl<T> Default for OnceLock<T> {
-    /// Creates a new empty cell.
+    /// Creates a new uninitialized cell.
     ///
     /// # Example
     ///
@@ -578,7 +623,7 @@ impl<T: Clone> Clone for OnceLock<T> {
 
 #[stable(feature = "once_cell", since = "1.70.0")]
 impl<T> From<T> for OnceLock<T> {
-    /// Create a new cell with its contents set to `value`.
+    /// Creates a new cell with its contents set to `value`.
     ///
     /// # Example
     ///
@@ -605,6 +650,26 @@ impl<T> From<T> for OnceLock<T> {
 
 #[stable(feature = "once_cell", since = "1.70.0")]
 impl<T: PartialEq> PartialEq for OnceLock<T> {
+    /// Equality for two `OnceLock`s.
+    ///
+    /// Two `OnceLock`s are equal if they either both contain values and their
+    /// values are equal, or if neither contains a value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::OnceLock;
+    ///
+    /// let five = OnceLock::new();
+    /// five.set(5).unwrap();
+    ///
+    /// let also_five = OnceLock::new();
+    /// also_five.set(5).unwrap();
+    ///
+    /// assert!(five == also_five);
+    ///
+    /// assert!(OnceLock::<u32>::new() == OnceLock::<u32>::new());
+    /// ```
     #[inline]
     fn eq(&self, other: &OnceLock<T>) -> bool {
         self.get() == other.get()
@@ -626,6 +691,3 @@ unsafe impl<#[may_dangle] T> Drop for OnceLock<T> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

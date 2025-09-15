@@ -1,3 +1,5 @@
+//@ needs-target-std
+//
 // If a library is compiled with -C extra-filename, the rust compiler
 // will take this into account when searching for libraries. However,
 // if that library is then renamed, the rust compiler should fall back
@@ -5,8 +7,7 @@
 // the renamed library.
 // See https://github.com/rust-lang/rust/pull/49253
 
-use run_make_support::rfs;
-use run_make_support::rustc;
+use run_make_support::{rfs, rustc};
 
 fn main() {
     rustc().extra_filename("-hash").input("foo.rs").run();

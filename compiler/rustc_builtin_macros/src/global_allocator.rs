@@ -1,16 +1,16 @@
-use crate::util::check_builtin_macro_attribute;
+use rustc_ast::expand::allocator::{
+    ALLOCATOR_METHODS, AllocatorMethod, AllocatorMethodInput, AllocatorTy, global_fn_name,
+};
+use rustc_ast::{
+    self as ast, AttrVec, Expr, Fn, FnHeader, FnSig, Generics, ItemKind, Mutability, Param, Safety,
+    Stmt, StmtKind, Ty, TyKind,
+};
+use rustc_expand::base::{Annotatable, ExtCtxt};
+use rustc_span::{Ident, Span, Symbol, kw, sym};
+use thin_vec::{ThinVec, thin_vec};
 
 use crate::errors;
-use rustc_ast::expand::allocator::{
-    global_fn_name, AllocatorMethod, AllocatorMethodInput, AllocatorTy, ALLOCATOR_METHODS,
-};
-use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, AttrVec, Expr, FnHeader, FnSig, Generics, Param, StmtKind};
-use rustc_ast::{Fn, ItemKind, Mutability, Safety, Stmt, Ty, TyKind};
-use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::Span;
-use thin_vec::{thin_vec, ThinVec};
+use crate::util::check_builtin_macro_attribute;
 
 pub(crate) fn expand(
     ecx: &mut ExtCtxt<'_>,
@@ -24,15 +24,15 @@ pub(crate) fn expand(
 
     // Allow using `#[global_allocator]` on an item statement
     // FIXME - if we get deref patterns, use them to reduce duplication here
-    let (item, is_stmt, ty_span) = if let Annotatable::Item(item) = &item
-        && let ItemKind::Static(box ast::StaticItem { ty, .. }) = &item.kind
+    let (item, ident, is_stmt, ty_span) = if let Annotatable::Item(item) = &item
+        && let ItemKind::Static(box ast::StaticItem { ident, ty, .. }) = &item.kind
     {
-        (item, false, ecx.with_def_site_ctxt(ty.span))
+        (item, *ident, false, ecx.with_def_site_ctxt(ty.span))
     } else if let Annotatable::Stmt(stmt) = &item
         && let StmtKind::Item(item) = &stmt.kind
-        && let ItemKind::Static(box ast::StaticItem { ty, .. }) = &item.kind
+        && let ItemKind::Static(box ast::StaticItem { ident, ty, .. }) = &item.kind
     {
-        (item, true, ecx.with_def_site_ctxt(ty.span))
+        (item, *ident, true, ecx.with_def_site_ctxt(ty.span))
     } else {
         ecx.dcx().emit_err(errors::AllocMustStatics { span: item.span() });
         return vec![orig_item];
@@ -40,7 +40,7 @@ pub(crate) fn expand(
 
     // Generate a bunch of new items using the AllocFnFactory
     let span = ecx.with_def_site_ctxt(item.span);
-    let f = AllocFnFactory { span, ty_span, global: item.ident, cx: ecx };
+    let f = AllocFnFactory { span, ty_span, global: ident, cx: ecx };
 
     // Generate item statements for the allocator methods.
     let stmts = ALLOCATOR_METHODS.iter().map(|method| f.allocator_fn(method)).collect();
@@ -50,7 +50,7 @@ pub(crate) fn expand(
     let const_body = ecx.expr_block(ecx.block(span, stmts));
     let const_item = ecx.item_const(span, Ident::new(kw::Underscore, span), const_ty, const_body);
     let const_item = if is_stmt {
-        Annotatable::Stmt(P(ecx.stmt_item(span, const_item)))
+        Annotatable::Stmt(Box::new(ecx.stmt_item(span, const_item)))
     } else {
         Annotatable::Item(const_item)
     };
@@ -63,7 +63,7 @@ struct AllocFnFactory<'a, 'b> {
     span: Span,
     ty_span: Span,
     global: Ident,
-    cx: &'b ExtCtxt<'a>,
+    cx: &'a ExtCtxt<'b>,
 }
 
 impl AllocFnFactory<'_, '_> {
@@ -79,19 +79,17 @@ impl AllocFnFactory<'_, '_> {
         let kind = ItemKind::Fn(Box::new(Fn {
             defaultness: ast::Defaultness::Final,
             sig,
+            ident: Ident::from_str_and_span(&global_fn_name(method.name), self.span),
             generics: Generics::default(),
+            contract: None,
             body,
+            define_opaque: None,
         }));
-        let item = self.cx.item(
-            self.span,
-            Ident::from_str_and_span(&global_fn_name(method.name), self.span),
-            self.attrs(),
-            kind,
-        );
+        let item = self.cx.item(self.span, self.attrs(), kind);
         self.cx.stmt_item(self.ty_span, item)
     }
 
-    fn call_allocator(&self, method: Symbol, mut args: ThinVec<P<Expr>>) -> P<Expr> {
+    fn call_allocator(&self, method: Symbol, mut args: ThinVec<Box<Expr>>) -> Box<Expr> {
         let method = self.cx.std_path(&[sym::alloc, sym::GlobalAlloc, method]);
         let method = self.cx.expr_path(self.cx.path(self.ty_span, method));
         let allocator = self.cx.path_ident(self.ty_span, self.global);
@@ -106,7 +104,7 @@ impl AllocFnFactory<'_, '_> {
         thin_vec![self.cx.attr_word(sym::rustc_std_internal_symbol, self.span)]
     }
 
-    fn arg_ty(&self, input: &AllocatorMethodInput, args: &mut ThinVec<Param>) -> P<Expr> {
+    fn arg_ty(&self, input: &AllocatorMethodInput, args: &mut ThinVec<Param>) -> Box<Expr> {
         match input.ty {
             AllocatorTy::Layout => {
                 // If an allocator method is ever introduced having multiple
@@ -149,7 +147,7 @@ impl AllocFnFactory<'_, '_> {
         }
     }
 
-    fn ret_ty(&self, ty: &AllocatorTy) -> P<Ty> {
+    fn ret_ty(&self, ty: &AllocatorTy) -> Box<Ty> {
         match *ty {
             AllocatorTy::ResultPtr => self.ptr_u8(),
 
@@ -161,12 +159,12 @@ impl AllocFnFactory<'_, '_> {
         }
     }
 
-    fn usize(&self) -> P<Ty> {
+    fn usize(&self) -> Box<Ty> {
         let usize = self.cx.path_ident(self.span, Ident::new(sym::usize, self.span));
         self.cx.ty_path(usize)
     }
 
-    fn ptr_u8(&self) -> P<Ty> {
+    fn ptr_u8(&self) -> Box<Ty> {
         let u8 = self.cx.path_ident(self.span, Ident::new(sym::u8, self.span));
         let ty_u8 = self.cx.ty_path(u8);
         self.cx.ty_ptr(self.span, ty_u8, Mutability::Mut)

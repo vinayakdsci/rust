@@ -1,7 +1,8 @@
-use run_make_support::rfs;
+//@ needs-target-std
+
 use std::path::{Path, PathBuf};
 
-use run_make_support::{assert_dirs_are_equal, rustdoc};
+use run_make_support::{assert_dirs_are_equal, rfs, rustdoc};
 
 #[derive(PartialEq)]
 enum JsonOutput {

@@ -1,14 +1,14 @@
 //! This module contains a stable quicksort and partition implementation.
 
-use crate::intrinsics;
-use crate::mem::{self, ManuallyDrop, MaybeUninit};
-use crate::ptr;
-
+use crate::mem::{ManuallyDrop, MaybeUninit};
+use crate::slice::sort::shared::FreezeMarker;
 use crate::slice::sort::shared::pivot::choose_pivot;
 use crate::slice::sort::shared::smallsort::StableSmallSortTypeImpl;
-use crate::slice::sort::shared::FreezeMarker;
+use crate::{intrinsics, ptr};
 
 /// Sorts `v` recursively using quicksort.
+/// `scratch.len()` must be at least `max(v.len() - v.len() / 2, SMALL_SORT_GENERAL_SCRATCH_LEN)`
+/// otherwise the implementation may abort.
 ///
 /// `limit` when initialized with `c*log(v.len())` for some c ensures we do not
 /// overflow the stack or go quadratic.
@@ -37,10 +37,6 @@ pub fn quicksort<T, F: FnMut(&T, &T) -> bool>(
         limit -= 1;
 
         let pivot_pos = choose_pivot(v, is_less);
-        // SAFETY: choose_pivot promises to return a valid pivot index.
-        unsafe {
-            intrinsics::assume(pivot_pos < v.len());
-        }
 
         // SAFETY: We only access the temporary copy for Freeze types, otherwise
         // self-modifications via `is_less` would not be observed and this would
@@ -126,7 +122,7 @@ fn stable_partition<T, F: FnMut(&T, &T) -> bool>(
             // this gave significant performance boosts in benchmarks. Unrolling
             // through for _ in 0..UNROLL_LEN { .. } instead of manually improves
             // compile times but has a ~10-20% performance penalty on opt-level=s.
-            if const { mem::size_of::<T>() <= 16 } {
+            if const { size_of::<T>() <= 16 } {
                 const UNROLL_LEN: usize = 4;
                 let unroll_end = v_base.add(loop_end_pos.saturating_sub(UNROLL_LEN - 1));
                 while state.scan < unroll_end {
@@ -196,7 +192,8 @@ struct PartitionState<T> {
 
 impl<T> PartitionState<T> {
     /// # Safety
-    /// scan and scratch must point to valid disjoint buffers of length len. The
+    ///
+    /// `scan` and `scratch` must point to valid disjoint buffers of length `len`. The
     /// scan buffer must be initialized.
     unsafe fn new(scan: *const T, scratch: *mut T, len: usize) -> Self {
         // SAFETY: See function safety comment.
@@ -208,6 +205,7 @@ impl<T> PartitionState<T> {
     /// branchless core of the partition.
     ///
     /// # Safety
+    ///
     /// This function may be called at most `len` times. If it is called exactly
     /// `len` times the scratch buffer then contains a copy of each element from
     /// the scan buffer exactly once - a permutation, and num_left <= len.

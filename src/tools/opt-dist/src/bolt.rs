@@ -1,14 +1,15 @@
 use anyhow::Context;
-
-use crate::exec::cmd;
-use crate::training::BoltProfile;
 use camino::{Utf8Path, Utf8PathBuf};
 
+use crate::environment::Environment;
+use crate::exec::cmd;
+use crate::training::BoltProfile;
 use crate::utils::io::copy_file;
 
 /// Instruments an artifact at the given `path` (in-place) with BOLT and then calls `func`.
 /// After this function finishes, the original file will be restored.
 pub fn with_bolt_instrumented<F: FnOnce(&Utf8Path) -> anyhow::Result<R>, R>(
+    env: &Environment,
     path: &Utf8Path,
     func: F,
 ) -> anyhow::Result<R> {
@@ -26,7 +27,7 @@ pub fn with_bolt_instrumented<F: FnOnce(&Utf8Path) -> anyhow::Result<R>, R>(
     let profile_prefix = Utf8Path::from_path(&profile_prefix).unwrap();
 
     // Instrument the original file with BOLT, saving the result into `instrumented_path`
-    cmd(&["llvm-bolt"])
+    cmd(&[env.llvm_bolt().as_str()])
         .arg("-instrument")
         .arg(path)
         .arg(&format!("--instrumentation-file={profile_prefix}"))
@@ -46,14 +47,22 @@ pub fn with_bolt_instrumented<F: FnOnce(&Utf8Path) -> anyhow::Result<R>, R>(
 }
 
 /// Optimizes the file at `path` with BOLT in-place using the given `profile`.
-pub fn bolt_optimize(path: &Utf8Path, profile: &BoltProfile) -> anyhow::Result<()> {
+pub fn bolt_optimize(
+    path: &Utf8Path,
+    profile: &BoltProfile,
+    env: &Environment,
+) -> anyhow::Result<()> {
     // Copy the artifact to a new location, so that we do not use the same input and output file.
     // BOLT cannot handle optimizing when the input and output is the same file, because it performs
     // in-place patching.
     let temp_path = tempfile::NamedTempFile::new()?.into_temp_path();
     copy_file(path, &temp_path)?;
 
-    cmd(&["llvm-bolt"])
+    // FIXME: cdsplit in llvm-bolt is currently broken on AArch64, drop this once it's fixed upstream
+    let split_strategy =
+        if env.host_tuple().starts_with("aarch64") { "profile2" } else { "cdsplit" };
+
+    cmd(&[env.llvm_bolt().as_str()])
         .arg(temp_path.display())
         .arg("-data")
         .arg(&profile.0)
@@ -66,13 +75,13 @@ pub fn bolt_optimize(path: &Utf8Path, profile: &BoltProfile) -> anyhow::Result<(
         // Split function code into hot and code regions
         .arg("-split-functions")
         // Split using best available strategy (three-way splitting, Cache-Directed Sort)
-        .arg("-split-strategy=cdsplit")
+        .arg(format!("-split-strategy={split_strategy}"))
         // Split as many basic blocks as possible
         .arg("-split-all-cold")
         // Move jump tables to a separate section
         .arg("-jump-tables=move")
         // Fold functions with identical code
-        .arg("-icf=1")
+        .arg("-icf=all")
         // The following flag saves about 50 MiB of libLLVM.so size.
         // However, it succeeds very non-deterministically. To avoid frequent artifact size swings,
         // it is kept disabled for now.

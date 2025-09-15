@@ -1,59 +1,44 @@
-//! Implementation of lint checking.
+//! Basic types for managing and implementing lints.
 //!
-//! The lint checking is mostly consolidated into one pass which runs
-//! after all other analyses. Throughout compilation, lint warnings
-//! can be added via the `add_lint` method on the Session structure. This
-//! requires a span and an ID of the node that the lint is being added to. The
-//! lint isn't actually emitted at that time because it is unknown what the
-//! actual lint level at that location is.
-//!
-//! To actually emit lint warnings/errors, a separate pass is used.
-//! A context keeps track of the current state of all lint levels.
-//! Upon entering a node of the ast which can modify the lint settings, the
-//! previous lint state is pushed onto a stack and the ast is then recursed
-//! upon. As the ast is traversed, this keeps track of the current lint level
-//! for all lint attributes.
+//! See <https://rustc-dev-guide.rust-lang.org/diagnostics.html> for an
+//! overview of how lints are implemented.
 
-use self::TargetLint::*;
+use std::cell::Cell;
+use std::slice;
 
-use crate::levels::LintLevelsBuilder;
-use crate::passes::{EarlyLintPassObject, LateLintPassObject};
+use rustc_ast::BindingMode;
+use rustc_ast::util::parser::ExprPrecedence;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync;
 use rustc_data_structures::unord::UnordMap;
-use rustc_errors::{Diag, LintDiagnostic, MultiSpan};
+use rustc_errors::{Diag, LintBuffer, LintDiagnostic, MultiSpan};
 use rustc_feature::Features;
-use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
+use rustc_hir::{Pat, PatKind};
 use rustc_middle::bug;
+use rustc_middle::lint::LevelAndSource;
 use rustc_middle::middle::privacy::EffectiveVisibilities;
 use rustc_middle::ty::layout::{LayoutError, LayoutOfHelpers, TyAndLayout};
-use rustc_middle::ty::print::{with_no_trimmed_paths, PrintError, PrintTraitRefExt as _};
-use rustc_middle::ty::{self, print::Printer, GenericArg, RegisteredTools, Ty, TyCtxt};
-use rustc_session::lint::{BuiltinLintDiag, LintExpectationId};
-use rustc_session::lint::{FutureIncompatibleInfo, Level, Lint, LintBuffer, LintId};
-use rustc_session::{LintStoreMarker, Session};
+use rustc_middle::ty::print::{PrintError, PrintTraitRefExt as _, Printer, with_no_trimmed_paths};
+use rustc_middle::ty::{self, GenericArg, RegisteredTools, Ty, TyCtxt, TypingEnv, TypingMode};
+use rustc_session::lint::{FutureIncompatibleInfo, Lint, LintExpectationId, LintId};
+use rustc_session::{DynLintStore, Session};
 use rustc_span::edit_distance::find_best_match_for_names;
-use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::Span;
-use rustc_target::abi;
-use std::cell::Cell;
-use std::iter;
-use std::slice;
+use rustc_span::{Ident, Span, Symbol, sym};
 use tracing::debug;
+use {rustc_abi as abi, rustc_hir as hir};
 
-mod diagnostics;
+use self::TargetLint::*;
+use crate::levels::LintLevelsBuilder;
+use crate::passes::{EarlyLintPassObject, LateLintPassObject};
 
 type EarlyLintPassFactory = dyn Fn() -> EarlyLintPassObject + sync::DynSend + sync::DynSync;
 type LateLintPassFactory =
     dyn for<'tcx> Fn(TyCtxt<'tcx>) -> LateLintPassObject<'tcx> + sync::DynSend + sync::DynSync;
 
 /// Information about the registered lints.
-///
-/// This is basically the subset of `Context` that we can
-/// build early in the compile pipeline.
 pub struct LintStore {
     /// Registered lints.
     lints: Vec<&'static Lint>,
@@ -77,7 +62,13 @@ pub struct LintStore {
     lint_groups: FxIndexMap<&'static str, LintGroup>,
 }
 
-impl LintStoreMarker for LintStore {}
+impl DynLintStore for LintStore {
+    fn lint_groups_iter(&self) -> Box<dyn Iterator<Item = rustc_session::LintGroup> + '_> {
+        Box::new(self.get_lint_groups().map(|(name, lints, is_externally_loaded)| {
+            rustc_session::LintGroup { name, lints, is_externally_loaded }
+        }))
+    }
+}
 
 /// The target of the `by_name` map, which accounts for renaming/deprecation.
 #[derive(Debug)]
@@ -97,11 +88,6 @@ enum TargetLint {
     /// This is used by rustc to avoid warning about old rustdoc lints before rustdoc registers
     /// them as tool lints.
     Ignored,
-}
-
-pub enum FindLintError {
-    NotFound,
-    Removed,
 }
 
 struct LintAlias {
@@ -156,9 +142,7 @@ impl LintStore {
         &self.lints
     }
 
-    pub fn get_lint_groups<'t>(
-        &'t self,
-    ) -> impl Iterator<Item = (&'static str, Vec<LintId>, bool)> + 't {
+    pub fn get_lint_groups(&self) -> impl Iterator<Item = (&'static str, Vec<LintId>, bool)> {
         self.lint_groups
             .iter()
             .filter(|(_, LintGroup { depr, .. })| {
@@ -249,13 +233,24 @@ impl LintStore {
         }
     }
 
-    pub fn register_group_alias(&mut self, lint_name: &'static str, alias: &'static str) {
-        self.lint_groups.insert(
+    fn insert_group(&mut self, name: &'static str, group: LintGroup) {
+        let previous = self.lint_groups.insert(name, group);
+        if previous.is_some() {
+            bug!("group {name:?} already exists");
+        }
+    }
+
+    pub fn register_group_alias(&mut self, group_name: &'static str, alias: &'static str) {
+        let Some(LintGroup { lint_ids, .. }) = self.lint_groups.get(group_name) else {
+            bug!("group alias {alias:?} points to unregistered group {group_name:?}")
+        };
+
+        self.insert_group(
             alias,
             LintGroup {
-                lint_ids: vec![],
+                lint_ids: lint_ids.clone(),
                 is_externally_loaded: false,
-                depr: Some(LintAlias { name: lint_name, silent: true }),
+                depr: Some(LintAlias { name: group_name, silent: true }),
             },
         );
     }
@@ -267,24 +262,17 @@ impl LintStore {
         deprecated_name: Option<&'static str>,
         to: Vec<LintId>,
     ) {
-        let new = self
-            .lint_groups
-            .insert(name, LintGroup { lint_ids: to, is_externally_loaded, depr: None })
-            .is_none();
         if let Some(deprecated) = deprecated_name {
-            self.lint_groups.insert(
+            self.insert_group(
                 deprecated,
                 LintGroup {
-                    lint_ids: vec![],
+                    lint_ids: to.clone(),
                     is_externally_loaded,
                     depr: Some(LintAlias { name, silent: false }),
                 },
             );
         }
-
-        if !new {
-            bug!("duplicate specification of lint group {}", name);
-        }
+        self.insert_group(name, LintGroup { lint_ids: to, is_externally_loaded, depr: None });
     }
 
     /// This lint should give no warning and have no effect.
@@ -310,23 +298,15 @@ impl LintStore {
         self.by_name.insert(name.into(), Removed(reason.into()));
     }
 
-    pub fn find_lints(&self, mut lint_name: &str) -> Result<Vec<LintId>, FindLintError> {
+    pub fn find_lints(&self, lint_name: &str) -> Option<&[LintId]> {
         match self.by_name.get(lint_name) {
-            Some(&Id(lint_id)) => Ok(vec![lint_id]),
-            Some(&Renamed(_, lint_id)) => Ok(vec![lint_id]),
-            Some(&Removed(_)) => Err(FindLintError::Removed),
-            Some(&Ignored) => Ok(vec![]),
-            None => loop {
-                return match self.lint_groups.get(lint_name) {
-                    Some(LintGroup { lint_ids, depr, .. }) => {
-                        if let Some(LintAlias { name, .. }) = depr {
-                            lint_name = name;
-                            continue;
-                        }
-                        Ok(lint_ids.clone())
-                    }
-                    None => Err(FindLintError::Removed),
-                };
+            Some(Id(lint_id)) => Some(slice::from_ref(lint_id)),
+            Some(Renamed(_, lint_id)) => Some(slice::from_ref(lint_id)),
+            Some(Removed(_)) => None,
+            Some(Ignored) => Some(&[]),
+            None => match self.lint_groups.get(lint_name) {
+                Some(LintGroup { lint_ids, .. }) => Some(lint_ids),
+                None => None,
             },
         }
     }
@@ -392,8 +372,12 @@ impl LintStore {
                             CheckLintNameResult::MissingTool
                         };
                     }
-                    Some(LintGroup { lint_ids, .. }) => {
-                        return CheckLintNameResult::Tool(lint_ids, None);
+                    Some(LintGroup { lint_ids, depr, .. }) => {
+                        return if let &Some(LintAlias { name, silent: false }) = depr {
+                            CheckLintNameResult::Tool(lint_ids, Some(name.to_string()))
+                        } else {
+                            CheckLintNameResult::Tool(lint_ids, None)
+                        };
                     }
                 },
                 Some(Id(id)) => return CheckLintNameResult::Tool(slice::from_ref(id), None),
@@ -411,15 +395,11 @@ impl LintStore {
                 None => self.check_tool_name_for_backwards_compat(&complete_name, "clippy"),
                 Some(LintGroup { lint_ids, depr, .. }) => {
                     // Check if the lint group name is deprecated
-                    if let Some(LintAlias { name, silent }) = depr {
-                        let LintGroup { lint_ids, .. } = self.lint_groups.get(name).unwrap();
-                        return if *silent {
-                            CheckLintNameResult::Ok(lint_ids)
-                        } else {
-                            CheckLintNameResult::Tool(lint_ids, Some((*name).to_string()))
-                        };
+                    if let &Some(LintAlias { name, silent: false }) = depr {
+                        CheckLintNameResult::Tool(lint_ids, Some(name.to_string()))
+                    } else {
+                        CheckLintNameResult::Ok(lint_ids)
                     }
-                    CheckLintNameResult::Ok(lint_ids)
                 }
             },
             Some(Id(id)) => CheckLintNameResult::Ok(slice::from_ref(id)),
@@ -430,7 +410,7 @@ impl LintStore {
     fn no_lint_suggestion(&self, lint_name: &str, tool_name: &str) -> CheckLintNameResult<'_> {
         let name_lower = lint_name.to_lowercase();
 
-        if lint_name.chars().any(char::is_uppercase) && self.find_lints(&name_lower).is_ok() {
+        if lint_name.chars().any(char::is_uppercase) && self.find_lints(&name_lower).is_some() {
             // First check if the lint name is (partly) in upper case instead of lower case...
             return CheckLintNameResult::NoLint(Some((Symbol::intern(&name_lower), false)));
         }
@@ -473,18 +453,8 @@ impl LintStore {
             None => match self.lint_groups.get(&*complete_name) {
                 // Now we are sure, that this lint exists nowhere
                 None => self.no_lint_suggestion(lint_name, tool_name),
-                Some(LintGroup { lint_ids, depr, .. }) => {
-                    // Reaching this would be weird, but let's cover this case anyway
-                    if let Some(LintAlias { name, silent }) = depr {
-                        let LintGroup { lint_ids, .. } = self.lint_groups.get(name).unwrap();
-                        if *silent {
-                            CheckLintNameResult::Tool(lint_ids, Some(complete_name))
-                        } else {
-                            CheckLintNameResult::Tool(lint_ids, Some((*name).to_string()))
-                        }
-                    } else {
-                        CheckLintNameResult::Tool(lint_ids, Some(complete_name))
-                    }
+                Some(LintGroup { lint_ids, .. }) => {
+                    CheckLintNameResult::Tool(lint_ids, Some(complete_name))
                 }
             },
             Some(Id(id)) => CheckLintNameResult::Tool(slice::from_ref(id), Some(complete_name)),
@@ -531,24 +501,6 @@ pub struct EarlyContext<'a> {
     pub buffered: LintBuffer,
 }
 
-impl EarlyContext<'_> {
-    /// Emit a lint at the appropriate level, with an optional associated span and an existing
-    /// diagnostic.
-    ///
-    /// [`lint_level`]: rustc_middle::lint::lint_level#decorate-signature
-    #[rustc_lint_diagnostics]
-    pub fn span_lint_with_diagnostics(
-        &self,
-        lint: &'static Lint,
-        span: MultiSpan,
-        diagnostic: BuiltinLintDiag,
-    ) {
-        self.opt_span_lint(lint, Some(span), |diag| {
-            diagnostics::decorate_lint(self.sess(), diagnostic, diag);
-        });
-    }
-}
-
 pub trait LintContext {
     fn sess(&self) -> &Session;
 
@@ -558,6 +510,7 @@ pub trait LintContext {
     ///
     /// [`lint_level`]: rustc_middle::lint::lint_level#decorate-signature
     #[rustc_lint_diagnostics]
+    #[track_caller]
     fn opt_span_lint<S: Into<MultiSpan>>(
         &self,
         lint: &'static Lint,
@@ -578,10 +531,25 @@ pub trait LintContext {
         });
     }
 
+    /// Emit a lint at `span` from a lazily-constructed lint struct (some type that implements
+    /// `LintDiagnostic`, typically generated by `#[derive(LintDiagnostic)]`).
+    fn emit_span_lint_lazy<S: Into<MultiSpan>, L: for<'a> LintDiagnostic<'a, ()>>(
+        &self,
+        lint: &'static Lint,
+        span: S,
+        decorator: impl FnOnce() -> L,
+    ) {
+        self.opt_span_lint(lint, Some(span), |lint| {
+            let decorator = decorator();
+            decorator.decorate_lint(lint);
+        });
+    }
+
     /// Emit a lint at the appropriate level, with an associated span.
     ///
     /// [`lint_level`]: rustc_middle::lint::lint_level#decorate-signature
     #[rustc_lint_diagnostics]
+    #[track_caller]
     fn span_lint<S: Into<MultiSpan>>(
         &self,
         lint: &'static Lint,
@@ -608,7 +576,7 @@ pub trait LintContext {
     }
 
     /// This returns the lint level for the given lint at the current location.
-    fn get_lint_level(&self, lint: &'static Lint) -> Level;
+    fn get_lint_level(&self, lint: &'static Lint) -> LevelAndSource;
 
     /// This function can be used to manually fulfill an expectation. This can
     /// be used for lints which contain several spans, and should be suppressed,
@@ -677,8 +645,8 @@ impl<'tcx> LintContext for LateContext<'tcx> {
         }
     }
 
-    fn get_lint_level(&self, lint: &'static Lint) -> Level {
-        self.tcx.lint_level_at_node(lint, self.last_node_with_lint_attrs).0
+    fn get_lint_level(&self, lint: &'static Lint) -> LevelAndSource {
+        self.tcx.lint_level_at_node(lint, self.last_node_with_lint_attrs)
     }
 }
 
@@ -698,12 +666,32 @@ impl LintContext for EarlyContext<'_> {
         self.builder.opt_span_lint(lint, span.map(|s| s.into()), decorate)
     }
 
-    fn get_lint_level(&self, lint: &'static Lint) -> Level {
-        self.builder.lint_level(lint).0
+    fn get_lint_level(&self, lint: &'static Lint) -> LevelAndSource {
+        self.builder.lint_level(lint)
     }
 }
 
 impl<'tcx> LateContext<'tcx> {
+    /// The typing mode of the currently visited node. Use this when
+    /// building a new `InferCtxt`.
+    pub fn typing_mode(&self) -> TypingMode<'tcx> {
+        // FIXME(#132279): In case we're in a body, we should use a typing
+        // mode which reveals the opaque types defined by that body.
+        TypingMode::non_body_analysis()
+    }
+
+    pub fn typing_env(&self) -> TypingEnv<'tcx> {
+        TypingEnv { typing_mode: self.typing_mode(), param_env: self.param_env }
+    }
+
+    pub fn type_is_copy_modulo_regions(&self, ty: Ty<'tcx>) -> bool {
+        self.tcx.type_is_copy_modulo_regions(self.typing_env(), ty)
+    }
+
+    pub fn type_is_use_cloned_modulo_regions(&self, ty: Ty<'tcx>) -> bool {
+        self.tcx.type_is_use_cloned_modulo_regions(self.typing_env(), ty)
+    }
+
     /// Gets the type-checking results for the current body,
     /// or `None` if outside a body.
     pub fn maybe_typeck_results(&self) -> Option<&'tcx ty::TypeckResults<'tcx>> {
@@ -743,31 +731,16 @@ impl<'tcx> LateContext<'tcx> {
         }
     }
 
-    /// Check if a `DefId`'s path matches the given absolute type path usage.
-    ///
-    /// Anonymous scopes such as `extern` imports are matched with `kw::Empty`;
-    /// inherent `impl` blocks are matched with the name of the type.
-    ///
-    /// Instead of using this method, it is often preferable to instead use
-    /// `rustc_diagnostic_item` or a `lang_item`. This is less prone to errors
-    /// as paths get invalidated if the target definition moves.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore (no context or def id available)
-    /// if cx.match_def_path(def_id, &[sym::core, sym::option, sym::Option]) {
-    ///     // The given `def_id` is that of an `Option` type
-    /// }
-    /// ```
-    ///
-    /// Used by clippy, but should be replaced by diagnostic items eventually.
-    pub fn match_def_path(&self, def_id: DefId, path: &[Symbol]) -> bool {
-        let names = self.get_def_path(def_id);
-
-        names.len() == path.len() && iter::zip(names, path).all(|(a, &b)| a == b)
-    }
-
     /// Gets the absolute path of `def_id` as a vector of `Symbol`.
+    ///
+    /// Note that this is kinda expensive because it has to
+    /// travel the tree and pretty-print. Use sparingly.
+    ///
+    /// If you're trying to match for an item given by its path, use a
+    /// diagnostic item. If you're only interested in given sections, use more
+    /// specific functions, such as [`TyCtxt::crate_name`]
+    ///
+    /// FIXME: It would be great if this could be optimized.
     ///
     /// # Examples
     ///
@@ -778,49 +751,49 @@ impl<'tcx> LateContext<'tcx> {
     /// }
     /// ```
     pub fn get_def_path(&self, def_id: DefId) -> Vec<Symbol> {
-        struct AbsolutePathPrinter<'tcx> {
+        struct LintPathPrinter<'tcx> {
             tcx: TyCtxt<'tcx>,
             path: Vec<Symbol>,
         }
 
-        impl<'tcx> Printer<'tcx> for AbsolutePathPrinter<'tcx> {
+        impl<'tcx> Printer<'tcx> for LintPathPrinter<'tcx> {
             fn tcx(&self) -> TyCtxt<'tcx> {
                 self.tcx
             }
 
             fn print_region(&mut self, _region: ty::Region<'_>) -> Result<(), PrintError> {
-                Ok(())
+                unreachable!(); // because `print_path_with_generic_args` ignores the `GenericArgs`
             }
 
             fn print_type(&mut self, _ty: Ty<'tcx>) -> Result<(), PrintError> {
-                Ok(())
+                unreachable!(); // because `print_path_with_generic_args` ignores the `GenericArgs`
             }
 
             fn print_dyn_existential(
                 &mut self,
                 _predicates: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
             ) -> Result<(), PrintError> {
-                Ok(())
+                unreachable!(); // because `print_path_with_generic_args` ignores the `GenericArgs`
             }
 
             fn print_const(&mut self, _ct: ty::Const<'tcx>) -> Result<(), PrintError> {
-                Ok(())
+                unreachable!(); // because `print_path_with_generic_args` ignores the `GenericArgs`
             }
 
-            fn path_crate(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
+            fn print_crate_name(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
                 self.path = vec![self.tcx.crate_name(cnum)];
                 Ok(())
             }
 
-            fn path_qualified(
+            fn print_path_with_qualified(
                 &mut self,
                 self_ty: Ty<'tcx>,
                 trait_ref: Option<ty::TraitRef<'tcx>>,
             ) -> Result<(), PrintError> {
-                if trait_ref.is_none() {
-                    if let ty::Adt(def, args) = self_ty.kind() {
-                        return self.print_def_path(def.did(), args);
-                    }
+                if trait_ref.is_none()
+                    && let ty::Adt(def, args) = self_ty.kind()
+                {
+                    return self.print_def_path(def.did(), args);
                 }
 
                 // This shouldn't ever be needed, but just in case:
@@ -833,10 +806,9 @@ impl<'tcx> LateContext<'tcx> {
                 })
             }
 
-            fn path_append_impl(
+            fn print_path_with_impl(
                 &mut self,
                 print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
-                _disambiguated_data: &DisambiguatedDefPathData,
                 self_ty: Ty<'tcx>,
                 trait_ref: Option<ty::TraitRef<'tcx>>,
             ) -> Result<(), PrintError> {
@@ -859,7 +831,7 @@ impl<'tcx> LateContext<'tcx> {
                 Ok(())
             }
 
-            fn path_append(
+            fn print_path_with_simple(
                 &mut self,
                 print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
                 disambiguated_data: &DisambiguatedDefPathData,
@@ -871,11 +843,14 @@ impl<'tcx> LateContext<'tcx> {
                     return Ok(());
                 }
 
-                self.path.push(Symbol::intern(&disambiguated_data.data.to_string()));
+                self.path.push(match disambiguated_data.data.get_opt_name() {
+                    Some(sym) => sym,
+                    None => Symbol::intern(&disambiguated_data.data.to_string()),
+                });
                 Ok(())
             }
 
-            fn path_generic_args(
+            fn print_path_with_generic_args(
                 &mut self,
                 print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
                 _args: &[GenericArg<'tcx>],
@@ -884,9 +859,9 @@ impl<'tcx> LateContext<'tcx> {
             }
         }
 
-        let mut printer = AbsolutePathPrinter { tcx: self.tcx, path: vec![] };
-        printer.print_def_path(def_id, &[]).unwrap();
-        printer.path
+        let mut p = LintPathPrinter { tcx: self.tcx, path: vec![] };
+        p.print_def_path(def_id, &[]).unwrap();
+        p.path
     }
 
     /// Returns the associated type `name` for `self_ty` as an implementation of `trait_id`.
@@ -895,15 +870,30 @@ impl<'tcx> LateContext<'tcx> {
         &self,
         self_ty: Ty<'tcx>,
         trait_id: DefId,
-        name: &str,
+        name: Symbol,
     ) -> Option<Ty<'tcx>> {
         let tcx = self.tcx;
         tcx.associated_items(trait_id)
-            .find_by_name_and_kind(tcx, Ident::from_str(name), ty::AssocKind::Type, trait_id)
+            .find_by_ident_and_kind(tcx, Ident::with_dummy_span(name), ty::AssocTag::Type, trait_id)
             .and_then(|assoc| {
                 let proj = Ty::new_projection(tcx, assoc.def_id, [self_ty]);
-                tcx.try_normalize_erasing_regions(self.param_env, proj).ok()
+                tcx.try_normalize_erasing_regions(self.typing_env(), proj).ok()
             })
+    }
+
+    /// Returns the effective precedence of an expression for the purpose of
+    /// rendering diagnostic. This is not the same as the precedence that would
+    /// be used for pretty-printing HIR by rustc_hir_pretty.
+    pub fn precedence(&self, expr: &hir::Expr<'_>) -> ExprPrecedence {
+        let has_attr = |id: hir::HirId| -> bool {
+            for attr in self.tcx.hir_attrs(id) {
+                if attr.span().desugaring_kind().is_none() {
+                    return true;
+                }
+            }
+            false
+        };
+        expr.precedence(&has_attr)
     }
 
     /// If the given expression is a local binding, find the initializer expression.
@@ -931,7 +921,12 @@ impl<'tcx> LateContext<'tcx> {
             }
             && let Some(init) = match parent_node {
                 hir::Node::Expr(expr) => Some(expr),
-                hir::Node::LetStmt(hir::LetStmt { init, .. }) => *init,
+                hir::Node::LetStmt(hir::LetStmt {
+                    init,
+                    // Binding is immutable, init cannot be re-assigned
+                    pat: Pat { kind: PatKind::Binding(BindingMode::NONE, ..), .. },
+                    ..
+                }) => *init,
                 _ => None,
             }
         {
@@ -971,15 +966,20 @@ impl<'tcx> LateContext<'tcx> {
         while let hir::ExprKind::Path(ref qpath) = expr.kind
             && let Some(parent_node) = match self.qpath_res(qpath, expr.hir_id) {
                 Res::Local(hir_id) => Some(self.tcx.parent_hir_node(hir_id)),
-                Res::Def(_, def_id) => self.tcx.hir().get_if_local(def_id),
+                Res::Def(_, def_id) => self.tcx.hir_get_if_local(def_id),
                 _ => None,
             }
             && let Some(init) = match parent_node {
                 hir::Node::Expr(expr) => Some(expr),
-                hir::Node::LetStmt(hir::LetStmt { init, .. }) => *init,
+                hir::Node::LetStmt(hir::LetStmt {
+                    init,
+                    // Binding is immutable, init cannot be re-assigned
+                    pat: Pat { kind: PatKind::Binding(BindingMode::NONE, ..), .. },
+                    ..
+                }) => *init,
                 hir::Node::Item(item) => match item.kind {
                     hir::ItemKind::Const(.., body_id) | hir::ItemKind::Static(.., body_id) => {
-                        Some(self.tcx.hir().body(body_id).value)
+                        Some(self.tcx.hir_body(body_id).value)
                     }
                     _ => None,
                 },
@@ -1006,10 +1006,10 @@ impl<'tcx> ty::layout::HasTyCtxt<'tcx> for LateContext<'tcx> {
     }
 }
 
-impl<'tcx> ty::layout::HasParamEnv<'tcx> for LateContext<'tcx> {
+impl<'tcx> ty::layout::HasTypingEnv<'tcx> for LateContext<'tcx> {
     #[inline]
-    fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        self.param_env
+    fn typing_env(&self) -> ty::TypingEnv<'tcx> {
+        self.typing_env()
     }
 }
 

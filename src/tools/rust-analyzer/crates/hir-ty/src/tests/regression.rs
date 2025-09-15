@@ -275,6 +275,7 @@ fn infer_std_crash_5() {
             32..320 'for co...     }': ()
             32..320 'for co...     }': ()
             32..320 'for co...     }': ()
+            32..320 'for co...     }': ()
             36..43 'content': {unknown}
             47..60 'doesnt_matter': {unknown}
             61..320 '{     ...     }': ()
@@ -628,7 +629,7 @@ fn issue_4053_diesel_where_clauses() {
             488..522 '{     ...     }': ()
             498..502 'self': SelectStatement<F, S, D, W, O, LOf, {unknown}, {unknown}>
             498..508 'self.order': O
-            498..515 'self.o...into()': dyn QueryFragment<DB>
+            498..515 'self.o...into()': dyn QueryFragment<DB> + '?
         "#]],
     );
 }
@@ -644,7 +645,7 @@ fn issue_4953() {
         "#,
         expect![[r#"
             58..72 '{ Self(0i64) }': Foo
-            60..64 'Self': extern "rust-call" Foo(i64) -> Foo
+            60..64 'Self': fn Foo(i64) -> Foo
             60..70 'Self(0i64)': Foo
             65..69 '0i64': i64
         "#]],
@@ -658,7 +659,7 @@ fn issue_4953() {
         "#,
         expect![[r#"
             64..78 '{ Self(0i64) }': Foo<i64>
-            66..70 'Self': extern "rust-call" Foo<i64>(i64) -> Foo<i64>
+            66..70 'Self': fn Foo<i64>(i64) -> Foo<i64>
             66..76 'Self(0i64)': Foo<i64>
             71..75 '0i64': i64
         "#]],
@@ -772,7 +773,7 @@ fn issue_4800() {
         "#,
         expect![[r#"
             379..383 'self': &'? mut PeerSet<D>
-            401..424 '{     ...     }': dyn Future<Output = ()>
+            401..424 '{     ...     }': dyn Future<Output = ()> + '?
             411..418 'loop {}': !
             416..418 '{}': ()
             575..579 'self': &'? mut Self
@@ -858,7 +859,7 @@ fn main() {
             94..96 '{}': ()
             109..160 '{     ...10); }': ()
             119..120 's': S<i32>
-            123..124 'S': extern "rust-call" S<i32>() -> S<i32>
+            123..124 'S': fn S<i32>() -> S<i32>
             123..126 'S()': S<i32>
             132..133 's': S<i32>
             132..144 's.g(|_x| {})': ()
@@ -1065,7 +1066,7 @@ fn test() {
 fn bare_dyn_trait_binders_9639() {
     check_no_mismatches(
         r#"
-//- minicore: fn, coerce_unsized
+//- minicore: fn, coerce_unsized, dispatch_from_dyn
 fn infix_parse<T, S>(_state: S, _level_code: &Fn(S)) -> T {
     loop {}
 }
@@ -1241,6 +1242,7 @@ fn test() {
             16..66 'for _ ...     }': &'? mut IntoIterator::IntoIter<()>
             16..66 'for _ ...     }': fn next<IntoIterator::IntoIter<()>>(&'? mut IntoIterator::IntoIter<()>) -> Option<<IntoIterator::IntoIter<()> as Iterator>::Item>
             16..66 'for _ ...     }': Option<IntoIterator::Item<()>>
+            16..66 'for _ ...     }': ()
             16..66 'for _ ...     }': ()
             16..66 'for _ ...     }': ()
             16..66 'for _ ...     }': ()
@@ -1583,23 +1585,6 @@ type Member<U> = ConstGen<U, N>;
 }
 
 #[test]
-fn cfgd_out_self_param() {
-    cov_mark::check!(cfgd_out_self_param);
-    check_no_mismatches(
-        r#"
-struct S;
-impl S {
-    fn f(#[cfg(never)] &self) {}
-}
-
-fn f(s: S) {
-    s.f();
-}
-"#,
-    );
-}
-
-#[test]
 fn tuple_struct_pattern_with_unmatched_args_crash() {
     check_infer(
         r#"
@@ -1614,7 +1599,7 @@ fn main() {
             37..48 'S(.., a, b)': S
             43..44 'a': usize
             46..47 'b': {unknown}
-            51..52 'S': extern "rust-call" S(usize) -> S
+            51..52 'S': fn S(usize) -> S
             51..55 'S(1)': S
             53..54 '1': usize
             65..75 '(.., a, b)': (i32, {unknown})
@@ -1907,6 +1892,7 @@ fn dont_unify_on_casts() {
     // #15246
     check_types(
         r#"
+//- minicore: sized
 fn unify(_: [bool; 1]) {}
 fn casted(_: *const bool) {}
 fn default<T>() -> T { loop {} }
@@ -1926,6 +1912,7 @@ fn test() {
 fn rustc_test_issue_52437() {
     check_types(
         r#"
+    //- minicore: sized
     fn main() {
         let x = [(); &(&'static: loop { |x| {}; }) as *const _ as usize]
           //^ [(); _]
@@ -2038,6 +2025,361 @@ fn main() {
                 &Thing::new();
                //^^^^^^^^^^^^ Thing<'?, u32>
 }
+"#,
+    );
+}
+
+#[test]
+fn issue_17734() {
+    check_types(
+        r#"
+fn test() {
+    let x = S::foo::<'static, &()>(&S);
+     // ^ Wrap<'?, ()>
+    let x = S::foo::<&()>(&S);
+     // ^ Wrap<'?, ()>
+    let x = S.foo::<'static, &()>();
+     // ^ Wrap<'?, ()>
+    let x = S.foo::<&()>();
+     // ^ Wrap<'?, ()>
+}
+
+struct S;
+
+impl S {
+    pub fn foo<'a, T: Trait<'a>>(&'a self) -> T::Proj {
+        loop {}
+    }
+}
+
+struct Wrap<'a, T>(T);
+trait Trait<'a> {
+    type Proj;
+}
+impl<'a, T> Trait<'a> for &'a T {
+    type Proj = Wrap<'a, T>;
+}
+"#,
+    )
+}
+
+#[test]
+fn issue_17738() {
+    check_types(
+        r#"
+//- minicore: index
+use core::ops::{Index, IndexMut};
+
+struct Foo<K, V>(K, V);
+
+struct Bar;
+
+impl Bar {
+    fn bar(&mut self) {}
+}
+
+impl<K, V> Foo<K, V> {
+    fn new(_v: V) -> Self {
+        loop {}
+    }
+}
+
+impl<K, B, V> Index<B> for Foo<K, V> {
+    type Output = V;
+    fn index(&self, _index: B) -> &Self::Output {
+        loop {}
+    }
+}
+
+impl<K, V> IndexMut<K> for Foo<K, V> {
+    fn index_mut(&mut self, _index: K) -> &mut Self::Output {
+        loop {}
+    }
+}
+
+fn test() {
+    let mut t1 = Foo::new(Bar);
+     // ^^^^^^ Foo<&'? (), Bar>
+    t1[&()] = Bar;
+
+    let mut t2 = Foo::new(Bar);
+     // ^^^^^^ Foo<&'? (), Bar>
+    t2[&()].bar();
+}
+"#,
+    )
+}
+
+#[test]
+fn issue_17191() {
+    check_types(
+        r#"
+trait A {
+    type Item;
+}
+
+trait B<T> {}
+
+fn foo<T: B<impl A>>() {}
+
+fn test() {
+    let f = foo;
+      //^ fn foo<{unknown}>()
+}"#,
+    );
+}
+
+#[test]
+fn issue_17866() {
+    check_infer(
+        r#"
+trait T {
+    type A;
+}
+
+type Foo = <S as T>::A;
+
+fn main() {
+    Foo {};
+}
+"#,
+        expect![[r#"
+            60..75 '{     Foo {}; }': ()
+            66..72 'Foo {}': {unknown}
+        "#]],
+    );
+}
+
+#[test]
+fn issue_17711() {
+    check_infer(
+        r#"
+//- minicore: deref
+use core::ops::Deref;
+
+struct Struct<'a, T>(&'a T);
+
+trait Trait {}
+
+impl<'a, T: Deref<Target = impl Trait>> Struct<'a, T> {
+    fn foo(&self) -> &Self { self }
+
+    fn bar(&self) {
+        let _ = self.foo();
+    }
+
+}
+"#,
+        expect![[r#"
+            137..141 'self': &'? Struct<'a, T>
+            152..160 '{ self }': &'? Struct<'a, T>
+            154..158 'self': &'? Struct<'a, T>
+            174..178 'self': &'? Struct<'a, T>
+            180..215 '{     ...     }': ()
+            194..195 '_': &'? Struct<'?, T>
+            198..202 'self': &'? Struct<'a, T>
+            198..208 'self.foo()': &'? Struct<'?, T>
+        "#]],
+    );
+}
+
+#[test]
+fn issue_17767() {
+    check_infer(
+        r#"
+extern "C" {
+    type Foo<T>;
+}
+
+fn f() -> Foo {}
+"#,
+        expect![[r#"
+            47..49 '{}': Foo
+        "#]],
+    );
+}
+
+#[test]
+fn issue_17921() {
+    check_infer(
+        r#"
+//- minicore: future
+trait Foo {}
+type Bar = impl Foo;
+
+async fn f<A, B, C>() -> Bar {}
+"#,
+        expect![[r#"
+            64..66 '{}': ()
+            64..66 '{}': impl Future<Output = ()>
+        "#]],
+    );
+}
+
+#[test]
+fn issue_18109() {
+    check_infer(
+        r#"
+//- minicore: option
+struct Map<T, U>(T, U);
+
+impl<T, U> Map<T, U> {
+    fn new() -> Self { loop {} }
+    fn get(&self, _: &T) -> Option<&U> { loop {} }
+}
+
+fn test(x: bool) {
+    let map = Map::new();
+    let _ = match x {
+        true => {
+            let Some(val) = map.get(&8) else { return };
+            *val
+        }
+        false => return,
+        _ => 42,
+    };
+}
+"#,
+        expect![[r#"
+            69..80 '{ loop {} }': Map<T, U>
+            71..78 'loop {}': !
+            76..78 '{}': ()
+            93..97 'self': &'? Map<T, U>
+            99..100 '_': &'? T
+            120..131 '{ loop {} }': Option<&'? U>
+            122..129 'loop {}': !
+            127..129 '{}': ()
+            143..144 'x': bool
+            152..354 '{     ...  }; }': ()
+            162..165 'map': Map<i32, i32>
+            168..176 'Map::new': fn new<i32, i32>() -> Map<i32, i32>
+            168..178 'Map::new()': Map<i32, i32>
+            188..189 '_': i32
+            192..351 'match ...     }': i32
+            198..199 'x': bool
+            210..214 'true': bool
+            210..214 'true': bool
+            218..303 '{     ...     }': i32
+            236..245 'Some(val)': Option<&'? i32>
+            241..244 'val': &'? i32
+            248..251 'map': Map<i32, i32>
+            248..259 'map.get(&8)': Option<&'? i32>
+            256..258 '&8': &'? i32
+            257..258 '8': i32
+            265..275 '{ return }': !
+            267..273 'return': !
+            289..293 '*val': i32
+            290..293 'val': &'? i32
+            312..317 'false': bool
+            312..317 'false': bool
+            321..327 'return': !
+            337..338 '_': bool
+            342..344 '42': i32
+        "#]],
+    );
+}
+
+#[test]
+fn issue_19730() {
+    check_infer(
+        r#"
+trait Trait<T = Self> {}
+
+trait Foo {
+    type Bar<A, B>: Trait;
+
+    fn foo<A, B>(bar: Self::Bar<A, B>) {
+        let _ = bar;
+    }
+}
+"#,
+        expect![[r#"
+            83..86 'bar': Foo::Bar<Self, A, B>
+            105..133 '{     ...     }': ()
+            119..120 '_': Foo::Bar<Self, A, B>
+            123..126 'bar': Foo::Bar<Self, A, B>
+        "#]],
+    );
+}
+
+#[test]
+fn no_panic_on_recursive_const() {
+    check_infer(
+        r#"
+struct Foo<const N: usize> {}
+impl<const N: Foo<N>> Foo<N> {
+    fn foo(self) {}
+}
+
+fn test() {
+    let _ = N;
+}
+"#,
+        expect![[r#"
+            72..76 'self': Foo<N>
+            78..80 '{}': ()
+            94..112 '{     ...= N; }': ()
+            104..105 '_': {unknown}
+            108..109 'N': {unknown}
+        "#]],
+    );
+
+    check_infer(
+        r#"
+struct Foo<const N: usize>;
+const N: Foo<N> = Foo;
+
+impl<const N: usize> Foo<N> {
+    fn foo(self) -> usize {
+        N
+    }
+}
+
+fn test() {
+    let _ = N;
+}
+"#,
+        expect![[r#"
+            93..97 'self': Foo<N>
+            108..125 '{     ...     }': usize
+            118..119 'N': usize
+            139..157 '{     ...= N; }': ()
+            149..150 '_': Foo<_>
+            153..154 'N': Foo<_>
+        "#]],
+    );
+}
+
+#[test]
+fn rust_destruct_option_clone() {
+    check_types(
+        r#"
+//- minicore: option, drop
+fn test(o: &Option<i32>) {
+    o.my_clone();
+  //^^^^^^^^^^^^ Option<i32>
+}
+pub trait MyClone: Sized {
+    fn my_clone(&self) -> Self;
+}
+impl<T> const MyClone for Option<T>
+where
+    T: ~const MyClone + ~const Destruct,
+{
+    fn my_clone(&self) -> Self {
+        match self {
+            Some(x) => Some(x.my_clone()),
+            None => None,
+        }
+    }
+}
+impl const MyClone for i32 {
+    fn my_clone(&self) -> Self {
+        *self
+    }
+}
+#[lang = "destruct"]
+pub trait Destruct {}
 "#,
     );
 }

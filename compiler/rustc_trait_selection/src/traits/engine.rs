@@ -1,16 +1,6 @@
 use std::cell::RefCell;
 use std::fmt::Debug;
 
-use super::{FromSolverError, TraitEngine};
-use super::{FulfillmentContext, ScrubbedTraitError};
-use crate::error_reporting::traits::TypeErrCtxtExt;
-use crate::regions::InferCtxtRegionExt;
-use crate::solve::FulfillmentCtxt as NextFulfillmentCtxt;
-use crate::solve::NextSolverError;
-use crate::traits::fulfill::OldSolverError;
-use crate::traits::NormalizeExt;
-use crate::traits::StructurallyNormalizeExt;
-use crate::traits::{FulfillmentError, Obligation, ObligationCause, PredicateObligation};
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -18,17 +8,24 @@ use rustc_infer::infer::at::ToTrace;
 use rustc_infer::infer::canonical::{
     Canonical, CanonicalQueryResponse, CanonicalVarValues, QueryResponse,
 };
-use rustc_infer::infer::outlives::env::OutlivesEnvironment;
-use rustc_infer::infer::RegionResolutionError;
-use rustc_infer::infer::{DefineOpaqueTypes, InferCtxt, InferOk};
+use rustc_infer::infer::{DefineOpaqueTypes, InferCtxt, InferOk, RegionResolutionError, TypeTrace};
+use rustc_infer::traits::PredicateObligations;
 use rustc_macros::extension;
 use rustc_middle::arena::ArenaAllocatable;
 use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::TypeFoldable;
-use rustc_middle::ty::Upcast;
-use rustc_middle::ty::Variance;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::relate::Relate;
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, Upcast, Variance};
+
+use super::{FromSolverError, FulfillmentContext, ScrubbedTraitError, TraitEngine};
+use crate::error_reporting::InferCtxtErrorExt;
+use crate::regions::InferCtxtRegionExt;
+use crate::solve::{FulfillmentCtxt as NextFulfillmentCtxt, NextSolverError};
+use crate::traits::fulfill::OldSolverError;
+use crate::traits::{
+    FulfillmentError, NormalizeExt, Obligation, ObligationCause, PredicateObligation,
+    StructurallyNormalizeExt,
+};
 
 #[extension(pub trait TraitEngineExt<'tcx, E>)]
 impl<'tcx, E> dyn TraitEngine<'tcx, E>
@@ -39,10 +36,8 @@ where
         if infcx.next_trait_solver() {
             Box::new(NextFulfillmentCtxt::new(infcx))
         } else {
-            let new_solver_globally =
-                infcx.tcx.sess.opts.unstable_opts.next_solver.map_or(false, |c| c.globally);
             assert!(
-                !new_solver_globally,
+                !infcx.tcx.next_trait_solver_globally(),
                 "using old solver even though new solver is enabled globally"
             );
             Box::new(FulfillmentContext::new(infcx))
@@ -137,6 +132,20 @@ where
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
     }
 
+    pub fn eq_trace<T: Relate<TyCtxt<'tcx>>>(
+        &self,
+        cause: &ObligationCause<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+        trace: TypeTrace<'tcx>,
+        expected: T,
+        actual: T,
+    ) -> Result<(), TypeError<'tcx>> {
+        self.infcx
+            .at(cause, param_env)
+            .eq_trace(DefineOpaqueTypes::Yes, trace, expected, actual)
+            .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
+    }
+
     /// Checks whether `expected` is a subtype of `actual`: `expected <: actual`.
     pub fn sub<T: ToTrace<'tcx>>(
         &self,
@@ -179,6 +188,20 @@ where
             .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
     }
 
+    /// Computes the least-upper-bound, or mutual supertype, of two values.
+    pub fn lub<T: ToTrace<'tcx>>(
+        &self,
+        cause: &ObligationCause<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+        expected: T,
+        actual: T,
+    ) -> Result<T, TypeError<'tcx>> {
+        self.infcx
+            .at(cause, param_env)
+            .lub(expected, actual)
+            .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
+    }
+
     #[must_use]
     pub fn select_where_possible(&self) -> Vec<E> {
         self.engine.borrow_mut().select_where_possible(self.infcx)
@@ -197,7 +220,7 @@ where
     /// getting ignored. You can make a new `ObligationCtxt` if this
     /// needs to be done in a loop, for example.
     #[must_use]
-    pub fn into_pending_obligations(self) -> Vec<PredicateObligation<'tcx>> {
+    pub fn into_pending_obligations(self) -> PredicateObligations<'tcx> {
         self.engine.borrow().pending_obligations()
     }
 
@@ -207,14 +230,15 @@ where
     /// will result in region constraints getting ignored.
     pub fn resolve_regions_and_report_errors(
         self,
-        generic_param_scope: LocalDefId,
-        outlives_env: &OutlivesEnvironment<'tcx>,
+        body_id: LocalDefId,
+        param_env: ty::ParamEnv<'tcx>,
+        assumed_wf_tys: impl IntoIterator<Item = Ty<'tcx>>,
     ) -> Result<(), ErrorGuaranteed> {
-        let errors = self.infcx.resolve_regions(outlives_env);
+        let errors = self.infcx.resolve_regions(body_id, param_env, assumed_wf_tys);
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(self.infcx.err_ctxt().report_region_errors(generic_param_scope, &errors))
+            Err(self.infcx.err_ctxt().report_region_errors(body_id, &errors))
         }
     }
 
@@ -225,9 +249,11 @@ where
     #[must_use]
     pub fn resolve_regions(
         self,
-        outlives_env: &OutlivesEnvironment<'tcx>,
+        body_id: LocalDefId,
+        param_env: ty::ParamEnv<'tcx>,
+        assumed_wf_tys: impl IntoIterator<Item = Ty<'tcx>>,
     ) -> Vec<RegionResolutionError<'tcx>> {
-        self.infcx.resolve_regions(outlives_env)
+        self.infcx.resolve_regions(body_id, param_env, assumed_wf_tys)
     }
 }
 
@@ -309,7 +335,7 @@ where
         self.infcx.at(cause, param_env).deeply_normalize(value, &mut **self.engine.borrow_mut())
     }
 
-    pub fn structurally_normalize(
+    pub fn structurally_normalize_ty(
         &self,
         cause: &ObligationCause<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
@@ -317,6 +343,28 @@ where
     ) -> Result<Ty<'tcx>, Vec<E>> {
         self.infcx
             .at(cause, param_env)
-            .structurally_normalize(value, &mut **self.engine.borrow_mut())
+            .structurally_normalize_ty(value, &mut **self.engine.borrow_mut())
+    }
+
+    pub fn structurally_normalize_const(
+        &self,
+        cause: &ObligationCause<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+        value: ty::Const<'tcx>,
+    ) -> Result<ty::Const<'tcx>, Vec<E>> {
+        self.infcx
+            .at(cause, param_env)
+            .structurally_normalize_const(value, &mut **self.engine.borrow_mut())
+    }
+
+    pub fn structurally_normalize_term(
+        &self,
+        cause: &ObligationCause<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+        value: ty::Term<'tcx>,
+    ) -> Result<ty::Term<'tcx>, Vec<E>> {
+        self.infcx
+            .at(cause, param_env)
+            .structurally_normalize_term(value, &mut **self.engine.borrow_mut())
     }
 }

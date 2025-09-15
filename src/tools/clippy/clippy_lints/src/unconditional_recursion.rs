@@ -5,17 +5,17 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::intravisit::{walk_body, walk_expr, FnKind, Visitor};
+use rustc_hir::intravisit::{FnKind, Visitor, walk_body, walk_expr};
 use rustc_hir::{Body, Expr, ExprKind, FnDecl, HirId, Item, ItemKind, Node, QPath, TyKind};
 use rustc_hir_analysis::lower_ty;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::{self, AssocKind, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::{kw, Ident};
-use rustc_span::{sym, Span};
+use rustc_span::symbol::{Ident, kw};
+use rustc_span::{Span, sym};
 use rustc_trait_selection::error_reporting::traits::suggestions::ReturnsVisitor;
+use std::ops::ControlFlow;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -23,8 +23,8 @@ declare_clippy_lint! {
     /// implementations.
     ///
     /// ### Why is this bad?
-    /// This is a hard to find infinite recursion that will crash any code
-    /// using it.
+    /// Infinite recursion in trait implementation will either cause crashes
+    /// or result in an infinite loop, and it is hard to detect.
     ///
     /// ### Example
     /// ```no_run
@@ -39,9 +39,31 @@ declare_clippy_lint! {
     ///     }
     /// }
     /// ```
+    ///
     /// Use instead:
     ///
-    /// In such cases, either use `#[derive(PartialEq)]` or don't implement it.
+    /// ```no_run
+    /// #[derive(PartialEq)]
+    /// enum Foo {
+    ///     A,
+    ///     B,
+    /// }
+    /// ```
+    ///
+    /// As an alternative, rewrite the logic without recursion:
+    ///
+    /// ```no_run
+    /// enum Foo {
+    ///     A,
+    ///     B,
+    /// }
+    ///
+    /// impl PartialEq for Foo {
+    ///     fn eq(&self, other: &Self) -> bool {
+    ///         matches!((self, other), (Foo::A, Foo::A) | (Foo::B, Foo::B))
+    ///     }
+    /// }
+    /// ```
     #[clippy::version = "1.77.0"]
     pub UNCONDITIONAL_RECURSION,
     suspicious,
@@ -111,13 +133,13 @@ fn get_impl_trait_def_id(cx: &LateContext<'_>, method_def_id: LocalDefId) -> Opt
             owner_id,
             ..
         }),
-    )) = cx.tcx.hir().parent_iter(hir_id).next()
+    )) = cx.tcx.hir_parent_iter(hir_id).next()
         // We exclude `impl` blocks generated from rustc's proc macros.
-        && !cx.tcx.has_attr(*owner_id, sym::automatically_derived)
+        && !cx.tcx.is_automatically_derived(owner_id.to_def_id())
         // It is a implementation of a trait.
-        && let Some(trait_) = impl_.of_trait
+        && let Some(of_trait) = impl_.of_trait
     {
-        trait_.trait_def_id()
+        of_trait.trait_ref.trait_def_id()
     } else {
         None
     }
@@ -184,7 +206,7 @@ fn check_partial_eq(cx: &LateContext<'_>, method_span: Span, method_def_id: Loca
                 let arg_ty = cx.typeck_results().expr_ty_adjusted(arg);
 
                 if let Some(fn_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
-                    && let Some(trait_id) = cx.tcx.trait_of_item(fn_id)
+                    && let Some(trait_id) = cx.tcx.trait_of_assoc(fn_id)
                     && trait_id == trait_def_id
                     && matches_ty(receiver_ty, arg_ty, self_arg, other_arg)
                 {
@@ -216,19 +238,19 @@ fn check_to_string(cx: &LateContext<'_>, method_span: Span, method_def_id: Local
                 owner_id,
                 ..
             }),
-        )) = cx.tcx.hir().parent_iter(hir_id).next()
+        )) = cx.tcx.hir_parent_iter(hir_id).next()
         // We exclude `impl` blocks generated from rustc's proc macros.
-        && !cx.tcx.has_attr(*owner_id, sym::automatically_derived)
+        && !cx.tcx.is_automatically_derived(owner_id.to_def_id())
         // It is a implementation of a trait.
-        && let Some(trait_) = impl_.of_trait
-        && let Some(trait_def_id) = trait_.trait_def_id()
+        && let Some(of_trait) = impl_.of_trait
+        && let Some(trait_def_id) = of_trait.trait_ref.trait_def_id()
         // The trait is `ToString`.
         && cx.tcx.is_diagnostic_item(sym::ToString, trait_def_id)
     {
         let is_bad = match expr.kind {
             ExprKind::MethodCall(segment, _receiver, &[_arg], _) if segment.ident.name == name.name => {
                 if let Some(fn_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
-                    && let Some(trait_id) = cx.tcx.trait_of_item(fn_id)
+                    && let Some(trait_id) = cx.tcx.trait_of_assoc(fn_id)
                     && trait_id == trait_def_id
                 {
                     true
@@ -274,9 +296,7 @@ fn is_default_method_on_current_ty<'tcx>(tcx: TyCtxt<'tcx>, qpath: QPath<'tcx>, 
 
 struct CheckCalls<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
-    map: Map<'tcx>,
     implemented_ty_id: DefId,
-    found_default_call: bool,
     method_span: Span,
 }
 
@@ -285,27 +305,26 @@ where
     'tcx: 'a,
 {
     type NestedFilter = nested_filter::OnlyBodies;
+    type Result = ControlFlow<()>;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.map
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.cx.tcx
     }
 
-    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if self.found_default_call {
-            return;
-        }
-        walk_expr(self, expr);
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) -> ControlFlow<()> {
+        walk_expr(self, expr)?;
 
         if let ExprKind::Call(f, _) = expr.kind
             && let ExprKind::Path(qpath) = f.kind
             && is_default_method_on_current_ty(self.cx.tcx, qpath, self.implemented_ty_id)
             && let Some(method_def_id) = path_def_id(self.cx, f)
-            && let Some(trait_def_id) = self.cx.tcx.trait_of_item(method_def_id)
+            && let Some(trait_def_id) = self.cx.tcx.trait_of_assoc(method_def_id)
             && self.cx.tcx.is_diagnostic_item(sym::Default, trait_def_id)
         {
-            self.found_default_call = true;
             span_error(self.cx, self.method_span, expr);
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
     }
 }
 
@@ -318,24 +337,24 @@ impl UnconditionalRecursion {
             for (ty, impl_def_ids) in impls.non_blanket_impls() {
                 let Some(self_def_id) = ty.def() else { continue };
                 for impl_def_id in impl_def_ids {
-                    if !cx.tcx.has_attr(*impl_def_id, sym::automatically_derived) &&
+                    if !cx.tcx.is_automatically_derived(*impl_def_id) &&
                         let Some(assoc_item) = cx
                             .tcx
                             .associated_items(impl_def_id)
                             .in_definition_order()
                             // We're not interested in foreign implementations of the `Default` trait.
                             .find(|item| {
-                                item.kind == AssocKind::Fn && item.def_id.is_local() && item.name == kw::Default
+                                item.is_fn() && item.def_id.is_local() && item.name() == kw::Default
                             })
-                        && let Some(body_node) = cx.tcx.hir().get_if_local(assoc_item.def_id)
+                        && let Some(body_node) = cx.tcx.hir_get_if_local(assoc_item.def_id)
                         && let Some(body_id) = body_node.body_id()
-                        && let body = cx.tcx.hir().body(body_id)
+                        && let body = cx.tcx.hir_body(body_id)
                         // We don't want to keep it if it has conditional return.
                         && let [return_expr] = get_return_calls_in_body(body).as_slice()
                         && let ExprKind::Call(call_expr, _) = return_expr.kind
                         // We need to use typeck here to infer the actual function being called.
-                        && let body_def_id = cx.tcx.hir().enclosing_body_owner(call_expr.hir_id)
-                        && let Some(body_owner) = cx.tcx.hir().maybe_body_owned_by(body_def_id)
+                        && let body_def_id = cx.tcx.hir_enclosing_body_owner(call_expr.hir_id)
+                        && let Some(body_owner) = cx.tcx.hir_maybe_body_owned_by(body_def_id)
                         && let typeck = cx.tcx.typeck_body(body_owner.id())
                         && let Some(call_def_id) = typeck.type_dependent_def_id(call_expr.hir_id)
                     {
@@ -370,7 +389,7 @@ impl UnconditionalRecursion {
                 kind: ItemKind::Impl(impl_),
                 ..
             }),
-        )) = cx.tcx.hir().parent_iter(hir_id).next()
+        )) = cx.tcx.hir_parent_iter(hir_id).next()
             && let Some(implemented_ty_id) = get_hir_ty_def_id(cx.tcx, *impl_.self_ty)
             && {
                 self.init_default_impl_for_type_if_needed(cx);
@@ -381,12 +400,10 @@ impl UnconditionalRecursion {
         {
             let mut c = CheckCalls {
                 cx,
-                map: cx.tcx.hir(),
                 implemented_ty_id,
-                found_default_call: false,
                 method_span,
             };
-            walk_body(&mut c, body);
+            let _ = walk_body(&mut c, body);
         }
     }
 }
@@ -409,7 +426,7 @@ fn check_from(cx: &LateContext<'_>, method_span: Span, method_def_id: LocalDefId
     if let Some((fn_def_id, node_args)) = fn_def_id_with_node_args(cx, expr)
         && let [s1, s2] = **node_args
         && let (Some(s1), Some(s2)) = (s1.as_type(), s2.as_type())
-        && let Some(trait_def_id) = cx.tcx.trait_of_item(fn_def_id)
+        && let Some(trait_def_id) = cx.tcx.trait_of_assoc(fn_def_id)
         && cx.tcx.is_diagnostic_item(sym::Into, trait_def_id)
         && get_impl_trait_def_id(cx, method_def_id) == cx.tcx.get_diagnostic_item(sym::From)
         && s1 == sig.inputs()[0]

@@ -2,14 +2,16 @@
 //! outside their scopes. This pass will also generate a set of exported items
 //! which are available for use externally when compiled as a library.
 
-use crate::ty::{TyCtxt, Visibility};
+use std::hash::Hash;
+
 use rustc_data_structures::fx::{FxIndexMap, IndexEntry};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir::def::DefKind;
 use rustc_macros::HashStable;
 use rustc_query_system::ich::StableHashingContext;
-use rustc_span::def_id::{LocalDefId, CRATE_DEF_ID};
-use std::hash::Hash;
+use rustc_span::def_id::{CRATE_DEF_ID, LocalDefId};
+
+use crate::ty::{TyCtxt, Visibility};
 
 /// Represents the levels of effective visibility an item can have.
 ///
@@ -179,11 +181,7 @@ impl EffectiveVisibilities {
             // nominal visibility. For some items nominal visibility doesn't make sense so we
             // don't check this condition for them.
             let is_impl = matches!(tcx.def_kind(def_id), DefKind::Impl { .. });
-            let is_associated_item_in_trait_impl = tcx
-                .impl_of_method(def_id.to_def_id())
-                .and_then(|impl_id| tcx.trait_id_of_impl(impl_id))
-                .is_some();
-            if !is_impl && !is_associated_item_in_trait_impl {
+            if !is_impl && tcx.trait_impl_of_assoc(def_id.to_def_id()).is_none() {
                 let nominal_vis = tcx.visibility(def_id);
                 if !nominal_vis.is_at_least(ev.reachable, tcx) {
                     span_bug!(

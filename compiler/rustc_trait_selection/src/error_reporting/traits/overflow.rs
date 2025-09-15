@@ -1,21 +1,16 @@
 use std::fmt;
 
-use rustc_errors::{
-    struct_span_code_err, Diag, EmissionGuarantee, ErrorGuaranteed, FatalError, E0275,
-};
+use rustc_errors::{Diag, E0275, EmissionGuarantee, ErrorGuaranteed, struct_span_code_err};
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_infer::error_reporting::infer::TypeErrCtxt;
+use rustc_hir::limit::Limit;
 use rustc_infer::traits::{Obligation, PredicateObligation};
-use rustc_macros::extension;
 use rustc_middle::ty::print::{FmtPrinter, Print};
-use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::Limit;
+use rustc_middle::ty::{self, TyCtxt, Upcast};
 use rustc_span::Span;
-use rustc_type_ir::Upcast;
+use tracing::debug;
 
-use super::InferCtxtPrivExt;
-use crate::error_reporting::traits::suggestions::TypeErrCtxtExt;
+use crate::error_reporting::TypeErrCtxt;
 
 pub enum OverflowCause<'tcx> {
     DeeplyNormalize(ty::AliasTerm<'tcx>),
@@ -38,7 +33,6 @@ pub fn suggest_new_overflow_limit<'tcx, G: EmissionGuarantee>(
     ));
 }
 
-#[extension(pub trait TypeErrCtxtOverflowExt<'a, 'tcx>)]
 impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     /// Reports that an overflow has occurred and halts compilation. We
     /// halt compilation unconditionally because it is important that
@@ -46,7 +40,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     /// whose result could not be truly determined and thus we can't say
     /// if the program type checks or not -- and they are unusual
     /// occurrences in any case.
-    fn report_overflow_error(
+    pub fn report_overflow_error(
         &self,
         cause: OverflowCause<'tcx>,
         span: Span,
@@ -55,11 +49,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     ) -> ! {
         let mut err = self.build_overflow_error(cause, span, suggest_increasing_limit);
         mutate(&mut err);
-        err.emit();
-        FatalError.raise();
+        err.emit().raise_fatal();
     }
 
-    fn build_overflow_error(
+    pub fn build_overflow_error(
         &self,
         cause: OverflowCause<'tcx>,
         span: Span,
@@ -73,10 +66,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             if s.len() > 50 {
                 // We don't need to save the type to a file, we will be talking about this type already
                 // in a separate note when we explain the obligation, so it will be available that way.
-                let mut cx: FmtPrinter<'_, '_> =
-                    FmtPrinter::new_with_limit(tcx, Namespace::TypeNS, rustc_session::Limit(6));
-                value.print(&mut cx).unwrap();
-                cx.into_buffer()
+                let mut p: FmtPrinter<'_, '_> =
+                    FmtPrinter::new_with_limit(tcx, Namespace::TypeNS, Limit(6));
+                value.print(&mut p).unwrap();
+                p.into_buffer()
             } else {
                 s
             }
@@ -132,7 +125,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     /// whose result could not be truly determined and thus we can't say
     /// if the program type checks or not -- and they are unusual
     /// occurrences in any case.
-    fn report_overflow_obligation<T>(
+    pub fn report_overflow_obligation<T>(
         &self,
         obligation: &Obligation<'tcx, T>,
         suggest_increasing_limit: bool,
@@ -165,7 +158,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     /// that we can give a more helpful error message (and, in particular,
     /// we do not suggest increasing the overflow limit, which is not
     /// going to help).
-    fn report_overflow_obligation_cycle(&self, cycle: &[PredicateObligation<'tcx>]) -> ! {
+    pub fn report_overflow_obligation_cycle(&self, cycle: &[PredicateObligation<'tcx>]) -> ! {
         let cycle = self.resolve_vars_if_possible(cycle.to_owned());
         assert!(!cycle.is_empty());
 
@@ -179,7 +172,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         );
     }
 
-    fn report_overflow_no_abort(
+    pub fn report_overflow_no_abort(
         &self,
         obligation: PredicateObligation<'tcx>,
         suggest_increasing_limit: bool,
@@ -191,7 +184,6 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             suggest_increasing_limit,
         );
         self.note_obligation_cause(&mut err, &obligation);
-        self.point_at_returns_when_relevant(&mut err, &obligation);
         err.emit()
     }
 }

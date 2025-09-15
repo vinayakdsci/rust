@@ -5,19 +5,17 @@
 // This module is used only by x86_64-pc-windows-gnu for now, but we
 // are compiling it everywhere to avoid regressions.
 #![allow(unused)]
+#![forbid(unsafe_op_in_unsafe_fn)]
 
 #[cfg(test)]
 mod tests;
 
 pub mod eh;
 
-use core::mem;
-
 pub struct DwarfReader {
     pub ptr: *const u8,
 }
 
-#[forbid(unsafe_op_in_unsafe_fn)]
 impl DwarfReader {
     pub fn new(ptr: *const u8) -> DwarfReader {
         DwarfReader { ptr }
@@ -29,7 +27,7 @@ impl DwarfReader {
     pub unsafe fn read<T: Copy>(&mut self) -> T {
         unsafe {
             let result = self.ptr.cast::<T>().read_unaligned();
-            self.ptr = self.ptr.byte_add(mem::size_of::<T>());
+            self.ptr = self.ptr.byte_add(size_of::<T>());
             result
         }
     }

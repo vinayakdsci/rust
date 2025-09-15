@@ -1,6 +1,5 @@
-//@ min-lldb-version: 310
-
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
@@ -30,32 +29,23 @@
 // lldb-command:run
 
 // lldb-command:v x
-// lldbg-check:[...] false
-// lldbr-check:(bool) x = false
+// lldb-check:[...] false
 // lldb-command:v y
-// lldbg-check:[...] true
-// lldbr-check:(bool) y = true
+// lldb-check:[...] true
 // lldb-command:continue
 
 // lldb-command:v x
-// lldbg-check:[...] 10
-// lldbr-check:(i32) x = 10
+// lldb-check:[...] 10
 // lldb-command:v y
-// lldbg-check:[...] true
-// lldbr-check:(bool) y = true
+// lldb-check:[...] true
 // lldb-command:continue
 
 // lldb-command:v x
-// lldbg-check:[...] 10.5
-// lldbr-check:(f64) x = 10.5
+// lldb-check:[...] 10.5
 // lldb-command:v y
-// lldbg-check:[...] 20
-// lldbr-check:(i32) y = 20
+// lldb-check:[...] 20
 // lldb-command:continue
 
-
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 fn a_function(x: bool, y: bool) {
     zzz(); // #break

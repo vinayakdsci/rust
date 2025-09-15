@@ -160,7 +160,7 @@ valopt() {
     local doc="$*"
     if [ $HELP -eq 0 ]
     then
-        local uop=$(echo $op | tr 'a-z-' 'A-Z_')
+        local uop=$(echo $op | tr '[a-z]-' '[A-Z]_')
         local v="CFG_${uop}"
         eval $v="$default"
         for arg in $CFG_ARGS
@@ -206,8 +206,8 @@ opt() {
         do
             if [ "$arg" = "--${flag}-${op}" ]
             then
-                op=$(echo $op | tr 'a-z-' 'A-Z_')
-                flag=$(echo $flag | tr 'a-z' 'A-Z')
+                op=$(echo $op | tr '[a-z]-' '[A-Z]_')
+                flag=$(echo $flag | tr '[a-z]' '[A-Z]')
                 local v="CFG_${flag}_${op}"
                 eval $v=1
                 putvar $v
@@ -235,7 +235,7 @@ flag() {
         do
             if [ "$arg" = "--${op}" ]
             then
-                op=$(echo $op | tr 'a-z-' 'A-Z_')
+                op=$(echo $op | tr '[a-z]-' '[A-Z]_')
                 local v="CFG_${op}"
                 eval $v=1
                 putvar $v
@@ -584,7 +584,7 @@ install_components() {
             # HACK: Try to support overriding --docdir.  Paths with the form
             # "share/doc/$product/" can be redirected to a single --docdir
             # path. If the following detects that --docdir has been specified
-            # then it will replace everything preceeding the "$product" path
+            # then it will replace everything preceding the "$product" path
             # component. The problem here is that the combined rust installer
             # contains two "products": rust and cargo; so the contents of those
             # directories will both be dumped into the same directory; and the

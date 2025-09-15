@@ -6,7 +6,7 @@ use rustc_errors::Applicability;
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 use super::OR_THEN_UNWRAP;
 
@@ -62,7 +62,7 @@ fn get_content_if_ctor_matches(cx: &LateContext<'_>, expr: &Expr<'_>, item: Lang
     if let ExprKind::Call(some_expr, [arg]) = expr.kind
         && is_res_lang_ctor(cx, path_res(cx, some_expr), item)
     {
-        Some(arg.span)
+        Some(arg.span.source_callsite())
     } else {
         None
     }

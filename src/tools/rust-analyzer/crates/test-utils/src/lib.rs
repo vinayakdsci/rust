@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use paths::Utf8PathBuf;
 use profile::StopWatch;
 use stdx::is_ci;
 use text_size::{TextRange, TextSize};
@@ -395,16 +396,24 @@ pub fn skip_slow_tests() -> bool {
     if should_skip {
         eprintln!("ignoring slow test");
     } else {
-        let path = project_root().join("./target/.slow_tests_cookie");
+        let path = target_dir().join(".slow_tests_cookie");
         fs::write(path, ".").unwrap();
     }
     should_skip
 }
 
+pub fn target_dir() -> Utf8PathBuf {
+    match std::env::var("CARGO_TARGET_DIR") {
+        Ok(target) => Utf8PathBuf::from(target),
+        Err(_) => project_root().join("target"),
+    }
+}
+
 /// Returns the path to the root directory of `rust-analyzer` project.
-pub fn project_root() -> PathBuf {
+pub fn project_root() -> Utf8PathBuf {
     let dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(dir).parent().unwrap().parent().unwrap().to_owned()
+    Utf8PathBuf::from_path_buf(PathBuf::from(dir).parent().unwrap().parent().unwrap().to_owned())
+        .unwrap()
 }
 
 pub fn format_diff(chunks: Vec<dissimilar::Chunk<'_>>) -> String {
@@ -412,8 +421,8 @@ pub fn format_diff(chunks: Vec<dissimilar::Chunk<'_>>) -> String {
     for chunk in chunks {
         let formatted = match chunk {
             dissimilar::Chunk::Equal(text) => text.into(),
-            dissimilar::Chunk::Delete(text) => format!("\x1b[41m{text}\x1b[0m"),
-            dissimilar::Chunk::Insert(text) => format!("\x1b[42m{text}\x1b[0m"),
+            dissimilar::Chunk::Delete(text) => format!("\x1b[41m{text}\x1b[0m\x1b[K"),
+            dissimilar::Chunk::Insert(text) => format!("\x1b[42m{text}\x1b[0m\x1b[K"),
         };
         buf.push_str(&formatted);
     }

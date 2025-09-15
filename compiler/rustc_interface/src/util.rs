@@ -1,50 +1,94 @@
-use crate::errors;
-use rustc_ast as ast;
-use rustc_codegen_ssa::traits::CodegenBackend;
-#[cfg(parallel_compiler)]
-use rustc_data_structures::sync;
-use rustc_metadata::{load_symbol_from_dylib, DylibError};
-use rustc_middle::ty::CurrentGcx;
-use rustc_parse::validate_attr;
-use rustc_session::config::{host_triple, Cfg, OutFileName, OutputFilenames, OutputTypes};
-use rustc_session::filesearch::sysroot_candidates;
-use rustc_session::lint::{self, BuiltinLintDiag, LintBuffer};
-use rustc_session::output::{categorize_crate_type, CRATE_TYPES};
-use rustc_session::{filesearch, EarlyDiagCtxt, Session};
-use rustc_span::edit_distance::find_best_match_for_name;
-use rustc_span::edition::Edition;
-use rustc_span::source_map::SourceMapInputs;
-use rustc_span::symbol::sym;
-use rustc_target::spec::Target;
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::thread;
-use std::{env, iter};
+use std::sync::{Arc, OnceLock};
+use std::{env, thread};
+
+use rustc_ast as ast;
+use rustc_attr_parsing::{ShouldEmit, validate_attr};
+use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_data_structures::jobserver::Proxy;
+use rustc_data_structures::sync;
+use rustc_errors::LintBuffer;
+use rustc_metadata::{DylibError, load_symbol_from_dylib};
+use rustc_middle::ty::CurrentGcx;
+use rustc_session::config::{Cfg, OutFileName, OutputFilenames, OutputTypes, Sysroot, host_tuple};
+use rustc_session::output::{CRATE_TYPES, categorize_crate_type};
+use rustc_session::{EarlyDiagCtxt, Session, filesearch, lint};
+use rustc_span::edit_distance::find_best_match_for_name;
+use rustc_span::edition::Edition;
+use rustc_span::source_map::SourceMapInputs;
+use rustc_span::{SessionGlobals, Symbol, sym};
+use rustc_target::spec::Target;
 use tracing::info;
 
+use crate::errors;
+use crate::passes::parse_crate_name;
+
 /// Function pointer type that constructs a new CodegenBackend.
-pub type MakeBackendFn = fn() -> Box<dyn CodegenBackend>;
+type MakeBackendFn = fn() -> Box<dyn CodegenBackend>;
 
 /// Adds `target_feature = "..."` cfgs for a variety of platform
 /// specific features (SSE, NEON etc.).
 ///
 /// This is performed by checking whether a set of permitted features
 /// is available on the target machine, by querying the codegen backend.
-pub fn add_configuration(cfg: &mut Cfg, sess: &mut Session, codegen_backend: &dyn CodegenBackend) {
+pub(crate) fn add_configuration(
+    cfg: &mut Cfg,
+    sess: &mut Session,
+    codegen_backend: &dyn CodegenBackend,
+) {
     let tf = sym::target_feature;
+    let tf_cfg = codegen_backend.target_config(sess);
 
-    let unstable_target_features = codegen_backend.target_features(sess, true);
-    sess.unstable_target_features.extend(unstable_target_features.iter().cloned());
+    sess.unstable_target_features.extend(tf_cfg.unstable_target_features.iter().copied());
+    sess.target_features.extend(tf_cfg.target_features.iter().copied());
 
-    let target_features = codegen_backend.target_features(sess, false);
-    sess.target_features.extend(target_features.iter().cloned());
+    cfg.extend(tf_cfg.target_features.into_iter().map(|feat| (tf, Some(feat))));
 
-    cfg.extend(target_features.into_iter().map(|feat| (tf, Some(feat))));
+    if tf_cfg.has_reliable_f16 {
+        cfg.insert((sym::target_has_reliable_f16, None));
+    }
+    if tf_cfg.has_reliable_f16_math {
+        cfg.insert((sym::target_has_reliable_f16_math, None));
+    }
+    if tf_cfg.has_reliable_f128 {
+        cfg.insert((sym::target_has_reliable_f128, None));
+    }
+    if tf_cfg.has_reliable_f128_math {
+        cfg.insert((sym::target_has_reliable_f128_math, None));
+    }
 
     if sess.crt_static(None) {
         cfg.insert((tf, Some(sym::crt_dash_static)));
+    }
+}
+
+/// Ensures that all target features required by the ABI are present.
+/// Must be called after `unstable_target_features` has been populated!
+pub(crate) fn check_abi_required_features(sess: &Session) {
+    let abi_feature_constraints = sess.target.abi_required_features();
+    // We check this against `unstable_target_features` as that is conveniently already
+    // back-translated to rustc feature names, taking into account `-Ctarget-cpu` and `-Ctarget-feature`.
+    // Just double-check that the features we care about are actually on our list.
+    for feature in
+        abi_feature_constraints.required.iter().chain(abi_feature_constraints.incompatible.iter())
+    {
+        assert!(
+            sess.target.rust_target_features().iter().any(|(name, ..)| feature == name),
+            "target feature {feature} is required/incompatible for the current ABI but not a recognized feature for this target"
+        );
+    }
+
+    for feature in abi_feature_constraints.required {
+        if !sess.unstable_target_features.contains(&Symbol::intern(feature)) {
+            sess.dcx().emit_warn(errors::AbiRequiredTargetFeature { feature, enabled: "enabled" });
+        }
+    }
+    for feature in abi_feature_constraints.incompatible {
+        if sess.unstable_target_features.contains(&Symbol::intern(feature)) {
+            sess.dcx().emit_warn(errors::AbiRequiredTargetFeature { feature, enabled: "disabled" });
+        }
     }
 }
 
@@ -81,10 +125,11 @@ fn init_stack_size(early_dcx: &EarlyDiagCtxt) -> usize {
     })
 }
 
-fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
+fn run_in_thread_with_globals<F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send, R: Send>(
     thread_stack_size: usize,
     edition: Edition,
     sm_inputs: SourceMapInputs,
+    extra_symbols: &[&'static str],
     f: F,
 ) -> R {
     // The "thread pool" is a single spawned thread in the non-parallel
@@ -102,9 +147,12 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
         // name contains null bytes.
         let r = builder
             .spawn_scoped(s, move || {
-                rustc_span::create_session_globals_then(edition, Some(sm_inputs), || {
-                    f(CurrentGcx::new())
-                })
+                rustc_span::create_session_globals_then(
+                    edition,
+                    extra_symbols,
+                    Some(sm_inputs),
+                    || f(CurrentGcx::new(), Proxy::new()),
+                )
             })
             .unwrap()
             .join();
@@ -116,76 +164,92 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
     })
 }
 
-#[cfg(not(parallel_compiler))]
-pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
-    thread_builder_diag: &EarlyDiagCtxt,
-    edition: Edition,
-    _threads: usize,
-    sm_inputs: SourceMapInputs,
-    f: F,
-) -> R {
-    let thread_stack_size = init_stack_size(thread_builder_diag);
-    run_in_thread_with_globals(thread_stack_size, edition, sm_inputs, f)
-}
-
-#[cfg(parallel_compiler)]
-pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
+pub(crate) fn run_in_thread_pool_with_globals<
+    F: FnOnce(CurrentGcx, Arc<Proxy>) -> R + Send,
+    R: Send,
+>(
     thread_builder_diag: &EarlyDiagCtxt,
     edition: Edition,
     threads: usize,
+    extra_symbols: &[&'static str],
     sm_inputs: SourceMapInputs,
     f: F,
 ) -> R {
-    use rustc_data_structures::{defer, jobserver, sync::FromDyn};
+    use std::process;
+
+    use rustc_data_structures::defer;
+    use rustc_data_structures::sync::FromDyn;
     use rustc_middle::ty::tls;
     use rustc_query_impl::QueryCtxt;
-    use rustc_query_system::query::{break_query_cycles, QueryContext};
-    use std::process;
+    use rustc_query_system::query::{QueryContext, break_query_cycles};
 
     let thread_stack_size = init_stack_size(thread_builder_diag);
 
     let registry = sync::Registry::new(std::num::NonZero::new(threads).unwrap());
 
     if !sync::is_dyn_thread_safe() {
-        return run_in_thread_with_globals(thread_stack_size, edition, sm_inputs, |current_gcx| {
-            // Register the thread for use with the `WorkerLocal` type.
-            registry.register();
+        return run_in_thread_with_globals(
+            thread_stack_size,
+            edition,
+            sm_inputs,
+            extra_symbols,
+            |current_gcx, jobserver_proxy| {
+                // Register the thread for use with the `WorkerLocal` type.
+                registry.register();
 
-            f(current_gcx)
-        });
+                f(current_gcx, jobserver_proxy)
+            },
+        );
     }
 
     let current_gcx = FromDyn::from(CurrentGcx::new());
     let current_gcx2 = current_gcx.clone();
 
-    let builder = rayon::ThreadPoolBuilder::new()
+    let proxy = Proxy::new();
+
+    let proxy_ = Arc::clone(&proxy);
+    let proxy__ = Arc::clone(&proxy);
+    let builder = rustc_thread_pool::ThreadPoolBuilder::new()
         .thread_name(|_| "rustc".to_string())
-        .acquire_thread_handler(jobserver::acquire_thread)
-        .release_thread_handler(jobserver::release_thread)
+        .acquire_thread_handler(move || proxy_.acquire_thread())
+        .release_thread_handler(move || proxy__.release_thread())
         .num_threads(threads)
         .deadlock_handler(move || {
             // On deadlock, creates a new thread and forwards information in thread
             // locals to it. The new thread runs the deadlock handler.
 
-            // Get a `GlobalCtxt` reference from `CurrentGcx` as we cannot rely on having a
-            // `TyCtxt` TLS reference here.
-            let query_map = current_gcx2.access(|gcx| {
-                tls::enter_context(&tls::ImplicitCtxt::new(gcx), || {
-                    tls::with(|tcx| QueryCtxt::new(tcx).collect_active_jobs())
-                })
+            let current_gcx2 = current_gcx2.clone();
+            let registry = rustc_thread_pool::Registry::current();
+            let session_globals = rustc_span::with_session_globals(|session_globals| {
+                session_globals as *const SessionGlobals as usize
             });
-            let query_map = FromDyn::from(query_map);
-            let registry = rayon_core::Registry::current();
             thread::Builder::new()
                 .name("rustc query cycle handler".to_string())
                 .spawn(move || {
                     let on_panic = defer(|| {
-                        eprintln!("query cycle handler thread panicked, aborting process");
+                        eprintln!("internal compiler error: query cycle handler thread panicked, aborting process");
                         // We need to abort here as we failed to resolve the deadlock,
                         // otherwise the compiler could just hang,
                         process::abort();
                     });
-                    break_query_cycles(query_map.into_inner(), &registry);
+
+                    // Get a `GlobalCtxt` reference from `CurrentGcx` as we cannot rely on having a
+                    // `TyCtxt` TLS reference here.
+                    current_gcx2.access(|gcx| {
+                        tls::enter_context(&tls::ImplicitCtxt::new(gcx), || {
+                            tls::with(|tcx| {
+                                // Accessing session globals is sound as they outlive `GlobalCtxt`.
+                                // They are needed to hash query keys containing spans or symbols.
+                                let query_map = rustc_span::set_session_globals_then(unsafe { &*(session_globals as *const SessionGlobals) }, || {
+                                    // Ensure there was no errors collecting all active jobs.
+                                    // We need the complete map to ensure we find a cycle to break.
+                                    QueryCtxt::new(tcx).collect_active_jobs().ok().expect("failed to collect active queries in deadlock handler")
+                                });
+                                break_query_cycles(query_map, &registry);
+                            })
+                        })
+                    });
+
                     on_panic.disable();
                 })
                 .unwrap();
@@ -196,13 +260,13 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send,
     // pool. Upon creation, each worker thread created gets a copy of the
     // session globals in TLS. This is possible because `SessionGlobals` impls
     // `Send` in the parallel compiler.
-    rustc_span::create_session_globals_then(edition, Some(sm_inputs), || {
+    rustc_span::create_session_globals_then(edition, extra_symbols, Some(sm_inputs), || {
         rustc_span::with_session_globals(|session_globals| {
             let session_globals = FromDyn::from(session_globals);
             builder
                 .build_scoped(
                     // Initialize each new worker thread when created.
-                    move |thread: rayon::ThreadBuilder| {
+                    move |thread: rustc_thread_pool::ThreadBuilder| {
                         // Register the thread for use with the `WorkerLocal` type.
                         registry.register();
 
@@ -211,7 +275,9 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send,
                         })
                     },
                     // Run `f` on the first thread in the thread pool.
-                    move |pool: &rayon::ThreadPool| pool.install(|| f(current_gcx.into_inner())),
+                    move |pool: &rustc_thread_pool::ThreadPool| {
+                        pool.install(|| f(current_gcx.into_inner(), proxy))
+                    },
                 )
                 .unwrap()
         })
@@ -240,7 +306,7 @@ fn load_backend_from_dylib(early_dcx: &EarlyDiagCtxt, path: &Path) -> MakeBacken
 /// A name of `None` indicates that the default backend should be used.
 pub fn get_codegen_backend(
     early_dcx: &EarlyDiagCtxt,
-    sysroot: &Path,
+    sysroot: &Sysroot,
     backend_name: Option<&str>,
     target: &Target,
 ) -> Box<dyn CodegenBackend> {
@@ -271,29 +337,24 @@ pub fn get_codegen_backend(
 // This is used for rustdoc, but it uses similar machinery to codegen backend
 // loading, so we leave the code here. It is potentially useful for other tools
 // that want to invoke the rustc binary while linking to rustc as well.
-pub fn rustc_path<'a>() -> Option<&'a Path> {
+pub fn rustc_path<'a>(sysroot: &Sysroot) -> Option<&'a Path> {
     static RUSTC_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-    const BIN_PATH: &str = env!("RUSTC_INSTALL_BINDIR");
-
-    RUSTC_PATH.get_or_init(|| get_rustc_path_inner(BIN_PATH)).as_deref()
-}
-
-fn get_rustc_path_inner(bin_path: &str) -> Option<PathBuf> {
-    sysroot_candidates().iter().find_map(|sysroot| {
-        let candidate = sysroot.join(bin_path).join(if cfg!(target_os = "windows") {
-            "rustc.exe"
-        } else {
-            "rustc"
-        });
-        candidate.exists().then_some(candidate)
-    })
+    RUSTC_PATH
+        .get_or_init(|| {
+            let candidate = sysroot
+                .default
+                .join(env!("RUSTC_INSTALL_BINDIR"))
+                .join(if cfg!(target_os = "windows") { "rustc.exe" } else { "rustc" });
+            candidate.exists().then_some(candidate)
+        })
+        .as_deref()
 }
 
 #[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 fn get_codegen_sysroot(
     early_dcx: &EarlyDiagCtxt,
-    sysroot: &Path,
+    sysroot: &Sysroot,
     backend_name: &str,
 ) -> MakeBackendFn {
     // For now we only allow this function to be called once as it'll dlopen a
@@ -307,11 +368,10 @@ fn get_codegen_sysroot(
         "cannot load the default codegen backend twice"
     );
 
-    let target = host_triple();
-    let sysroot_candidates = sysroot_candidates();
+    let target = host_tuple();
 
-    let sysroot = iter::once(sysroot)
-        .chain(sysroot_candidates.iter().map(<_>::as_ref))
+    let sysroot = sysroot
+        .all_paths()
         .map(|sysroot| {
             filesearch::make_target_lib_path(sysroot, target).with_file_name("codegen-backends")
         })
@@ -320,8 +380,8 @@ fn get_codegen_sysroot(
             f.exists()
         })
         .unwrap_or_else(|| {
-            let candidates = sysroot_candidates
-                .iter()
+            let candidates = sysroot
+                .all_paths()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join("\n* ");
@@ -383,7 +443,6 @@ fn get_codegen_sysroot(
     }
 }
 
-#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub(crate) fn check_attr_crate_type(
     sess: &Session,
     attrs: &[ast::Attribute],
@@ -408,16 +467,19 @@ pub(crate) fn check_attr_crate_type(
                         lint::builtin::UNKNOWN_CRATE_TYPES,
                         ast::CRATE_NODE_ID,
                         span,
-                        BuiltinLintDiag::UnknownCrateTypes { span, candidate },
+                        errors::UnknownCrateTypes {
+                            sugg: candidate
+                                .map(|cand| errors::UnknownCrateTypesSub { span, snippet: cand }),
+                        },
                     );
                 }
             } else {
                 // This is here mainly to check for using a macro, such as
-                // #![crate_type = foo!()]. That is not supported since the
+                // `#![crate_type = foo!()]`. That is not supported since the
                 // crate type needs to be known very early in compilation long
                 // before expansion. Otherwise, validation would normally be
-                // caught in AstValidator (via `check_builtin_attribute`), but
-                // by the time that runs the macro is expanded, and it doesn't
+                // caught during semantic analysis via `TyCtxt::check_mod_attrs`,
+                // but by the time that runs the macro is expanded, and it doesn't
                 // give an error.
                 validate_attr::emit_fatal_malformed_builtin_attribute(
                     &sess.psess,
@@ -461,11 +523,10 @@ pub fn build_output_filenames(attrs: &[ast::Attribute], sess: &Session) -> Outpu
         sess.dcx().emit_fatal(errors::MultipleOutputTypesToStdout);
     }
 
-    let crate_name = sess
-        .opts
-        .crate_name
-        .clone()
-        .or_else(|| rustc_attr::find_crate_name(attrs).map(|n| n.to_string()));
+    let crate_name =
+        sess.opts.crate_name.clone().or_else(|| {
+            parse_crate_name(sess, attrs, ShouldEmit::Nothing).map(|i| i.0.to_string())
+        });
 
     match sess.io.output_file {
         None => {

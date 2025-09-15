@@ -3,45 +3,31 @@
 #![doc(rust_logo)]
 #![feature(rustc_attrs)]
 #![feature(rustdoc_internals)]
-#![feature(type_alias_impl_trait)]
 // tidy-alphabetical-end
 
-use fluent_bundle::FluentResource;
-use fluent_syntax::parser::ParserError;
-use icu_provider_adapters::fallback::{LocaleFallbackProvider, LocaleFallbacker};
-use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
-use rustc_macros::{Decodable, Encodable};
-use rustc_span::Span;
 use std::borrow::Cow;
 use std::error::Error;
-use std::fmt;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use tracing::{instrument, trace};
+use std::path::Path;
+use std::sync::{Arc, LazyLock};
+use std::{fmt, fs, io};
 
-#[cfg(not(parallel_compiler))]
-use std::cell::LazyCell as Lazy;
-#[cfg(parallel_compiler)]
-use std::sync::LazyLock as Lazy;
-
-#[cfg(parallel_compiler)]
+use fluent_bundle::FluentResource;
+pub use fluent_bundle::types::FluentType;
+pub use fluent_bundle::{self, FluentArgs, FluentError, FluentValue};
+use fluent_syntax::parser::ParserError;
 use intl_memoizer::concurrent::IntlLangMemoizer;
-#[cfg(not(parallel_compiler))]
-use intl_memoizer::IntlLangMemoizer;
+use rustc_data_structures::sync::{DynSend, IntoDynSyncSend};
+use rustc_macros::{Decodable, Encodable};
+use rustc_span::Span;
+use tracing::{instrument, trace};
+pub use unic_langid::{LanguageIdentifier, langid};
 
-pub use fluent_bundle::{self, types::FluentType, FluentArgs, FluentError, FluentValue};
-pub use unic_langid::{langid, LanguageIdentifier};
+mod diagnostic_impls;
+pub use diagnostic_impls::DiagArgFromDisplay;
 
 pub type FluentBundle =
     IntoDynSyncSend<fluent_bundle::bundle::FluentBundle<FluentResource, IntlLangMemoizer>>;
 
-#[cfg(not(parallel_compiler))]
-fn new_bundle(locales: Vec<LanguageIdentifier>) -> FluentBundle {
-    IntoDynSyncSend(fluent_bundle::bundle::FluentBundle::new(locales))
-}
-
-#[cfg(parallel_compiler)]
 fn new_bundle(locales: Vec<LanguageIdentifier>) -> FluentBundle {
     IntoDynSyncSend(fluent_bundle::bundle::FluentBundle::new_concurrent(locales))
 }
@@ -121,12 +107,11 @@ impl From<Vec<FluentError>> for TranslationBundleError {
 /// (overriding any conflicting messages).
 #[instrument(level = "trace")]
 pub fn fluent_bundle(
-    mut user_provided_sysroot: Option<PathBuf>,
-    mut sysroot_candidates: Vec<PathBuf>,
+    sysroot_candidates: &[&Path],
     requested_locale: Option<LanguageIdentifier>,
     additional_ftl_path: Option<&Path>,
     with_directionality_markers: bool,
-) -> Result<Option<Lrc<FluentBundle>>, TranslationBundleError> {
+) -> Result<Option<Arc<FluentBundle>>, TranslationBundleError> {
     if requested_locale.is_none() && additional_ftl_path.is_none() {
         return Ok(None);
     }
@@ -156,7 +141,8 @@ pub fn fluent_bundle(
     // If the user requests the default locale then don't try to load anything.
     if let Some(requested_locale) = requested_locale {
         let mut found_resources = false;
-        for sysroot in user_provided_sysroot.iter_mut().chain(sysroot_candidates.iter_mut()) {
+        for sysroot in sysroot_candidates {
+            let mut sysroot = sysroot.to_path_buf();
             sysroot.push("share");
             sysroot.push("locale");
             sysroot.push(requested_locale.to_string());
@@ -204,7 +190,7 @@ pub fn fluent_bundle(
         bundle.add_resource_overriding(resource);
     }
 
-    let bundle = Lrc::new(bundle);
+    let bundle = Arc::new(bundle);
     Ok(Some(bundle))
 }
 
@@ -219,7 +205,8 @@ fn register_functions(bundle: &mut FluentBundle) {
 
 /// Type alias for the result of `fallback_fluent_bundle` - a reference-counted pointer to a lazily
 /// evaluated fluent bundle.
-pub type LazyFallbackBundle = Lrc<Lazy<FluentBundle, impl FnOnce() -> FluentBundle>>;
+pub type LazyFallbackBundle =
+    Arc<LazyLock<FluentBundle, Box<dyn FnOnce() -> FluentBundle + DynSend>>>;
 
 /// Return the default `FluentBundle` with standard "en-US" diagnostic messages.
 #[instrument(level = "trace", skip(resources))]
@@ -227,7 +214,7 @@ pub fn fallback_fluent_bundle(
     resources: Vec<&'static str>,
     with_directionality_markers: bool,
 ) -> LazyFallbackBundle {
-    Lrc::new(Lazy::new(move || {
+    Arc::new(LazyLock::new(Box::new(move || {
         let mut fallback_bundle = new_bundle(vec![langid!("en-US")]);
 
         register_functions(&mut fallback_bundle);
@@ -242,7 +229,7 @@ pub fn fallback_fluent_bundle(
         }
 
         fallback_bundle
-    }))
+    })))
 }
 
 /// Identifier for the Fluent message/attribute corresponding to a diagnostic message.
@@ -371,9 +358,9 @@ impl From<Cow<'static, str>> for DiagMessage {
 /// subdiagnostic derive refers to typed identifiers that are `DiagMessage`s, so need to be
 /// able to convert between these, as much as they'll be converted back into `DiagMessage`
 /// using `with_subdiagnostic_message` eventually. Don't use this other than for the derive.
-impl Into<SubdiagMessage> for DiagMessage {
-    fn into(self) -> SubdiagMessage {
-        match self {
+impl From<DiagMessage> for SubdiagMessage {
+    fn from(val: DiagMessage) -> Self {
+        match val {
             DiagMessage::Str(s) => SubdiagMessage::Str(s),
             DiagMessage::Translated(s) => SubdiagMessage::Translated(s),
             DiagMessage::FluentIdentifier(id, None) => SubdiagMessage::FluentIdentifier(id),
@@ -527,8 +514,8 @@ impl From<Vec<Span>> for MultiSpan {
     }
 }
 
-fn icu_locale_from_unic_langid(lang: LanguageIdentifier) -> Option<icu_locid::Locale> {
-    icu_locid::Locale::try_from_bytes(lang.to_string().as_bytes()).ok()
+fn icu_locale_from_unic_langid(lang: LanguageIdentifier) -> Option<icu_locale::Locale> {
+    icu_locale::Locale::try_from_str(&lang.to_string()).ok()
 }
 
 pub fn fluent_value_from_str_list_sep_by_and(l: Vec<Cow<'_, str>>) -> FluentValue<'_> {
@@ -550,15 +537,6 @@ pub fn fluent_value_from_str_list_sep_by_and(l: Vec<Cow<'_, str>>) -> FluentValu
             Cow::Owned(result)
         }
 
-        #[cfg(not(parallel_compiler))]
-        fn as_string_threadsafe(
-            &self,
-            _intls: &intl_memoizer::concurrent::IntlLangMemoizer,
-        ) -> Cow<'static, str> {
-            unreachable!("`as_string_threadsafe` is not used in non-parallel rustc")
-        }
-
-        #[cfg(parallel_compiler)]
         fn as_string_threadsafe(
             &self,
             intls: &intl_memoizer::concurrent::IntlLangMemoizer,
@@ -589,21 +567,15 @@ pub fn fluent_value_from_str_list_sep_by_and(l: Vec<Cow<'_, str>>) -> FluentValu
         where
             Self: Sized,
         {
-            let baked_data_provider = rustc_baked_icu_data::baked_data_provider();
-            let locale_fallbacker =
-                LocaleFallbacker::try_new_with_any_provider(&baked_data_provider)
-                    .expect("Failed to create fallback provider");
-            let data_provider =
-                LocaleFallbackProvider::new_with_fallbacker(baked_data_provider, locale_fallbacker);
             let locale = icu_locale_from_unic_langid(lang)
                 .unwrap_or_else(|| rustc_baked_icu_data::supported_locales::EN);
-            let list_formatter =
-                icu_list::ListFormatter::try_new_and_with_length_with_any_provider(
-                    &data_provider,
-                    &locale.into(),
-                    icu_list::ListLength::Wide,
-                )
-                .expect("Failed to create list formatter");
+            let list_formatter = icu_list::ListFormatter::try_new_and_unstable(
+                &rustc_baked_icu_data::BakedDataProvider,
+                locale.into(),
+                icu_list::options::ListFormatterOptions::default()
+                    .with_length(icu_list::options::ListLength::Wide),
+            )
+            .expect("Failed to create list formatter");
 
             Ok(MemoizableListFormatter(list_formatter))
         }
@@ -612,4 +584,54 @@ pub fn fluent_value_from_str_list_sep_by_and(l: Vec<Cow<'_, str>>) -> FluentValu
     let l = l.into_iter().map(|x| x.into_owned()).collect();
 
     FluentValue::Custom(Box::new(FluentStrListSepByAnd(l)))
+}
+
+/// Simplified version of `FluentArg` that can implement `Encodable` and `Decodable`. Collection of
+/// `DiagArg` are converted to `FluentArgs` (consuming the collection) at the start of diagnostic
+/// emission.
+pub type DiagArg<'iter> = (&'iter DiagArgName, &'iter DiagArgValue);
+
+/// Name of a diagnostic argument.
+pub type DiagArgName = Cow<'static, str>;
+
+/// Simplified version of `FluentValue` that can implement `Encodable` and `Decodable`. Converted
+/// to a `FluentValue` by the emitter to be used in diagnostic translation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
+pub enum DiagArgValue {
+    Str(Cow<'static, str>),
+    // This gets converted to a `FluentNumber`, which is an `f64`. An `i32`
+    // safely fits in an `f64`. Any integers bigger than that will be converted
+    // to strings in `into_diag_arg` and stored using the `Str` variant.
+    Number(i32),
+    StrListSepByAnd(Vec<Cow<'static, str>>),
+}
+
+/// Converts a value of a type into a `DiagArg` (typically a field of an `Diag` struct).
+/// Implemented as a custom trait rather than `From` so that it is implemented on the type being
+/// converted rather than on `DiagArgValue`, which enables types from other `rustc_*` crates to
+/// implement this.
+pub trait IntoDiagArg {
+    /// Convert `Self` into a `DiagArgValue` suitable for rendering in a diagnostic.
+    ///
+    /// It takes a `path` where "long values" could be written to, if the `DiagArgValue` is too big
+    /// for displaying on the terminal. This path comes from the `Diag` itself. When rendering
+    /// values that come from `TyCtxt`, like `Ty<'_>`, they can use `TyCtxt::short_string`. If a
+    /// value has no shortening logic that could be used, the argument can be safely ignored.
+    fn into_diag_arg(self, path: &mut Option<std::path::PathBuf>) -> DiagArgValue;
+}
+
+impl IntoDiagArg for DiagArgValue {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        self
+    }
+}
+
+impl From<DiagArgValue> for FluentValue<'static> {
+    fn from(val: DiagArgValue) -> Self {
+        match val {
+            DiagArgValue::Str(s) => From::from(s),
+            DiagArgValue::Number(n) => From::from(n),
+            DiagArgValue::StrListSepByAnd(l) => fluent_value_from_str_list_sep_by_and(l),
+        }
+    }
 }

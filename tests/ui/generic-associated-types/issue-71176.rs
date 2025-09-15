@@ -11,11 +11,12 @@ struct Holder<B> {
   //~^ ERROR: missing generics for associated type
   //~| ERROR: missing generics for associated type
   //~| ERROR: missing generics for associated type
-  //~| ERROR: the trait `Provider` cannot be made into an object
+  //~| ERROR: the trait `Provider` is not dyn compatible
 }
 
 fn main() {
     Holder {
         inner: Box::new(()),
+        //~^ ERROR: the trait `Provider` is not dyn compatible
     };
 }

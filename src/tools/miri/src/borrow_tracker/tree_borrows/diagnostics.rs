@@ -4,12 +4,10 @@ use std::ops::Range;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_span::{Span, SpanData};
 
-use crate::borrow_tracker::tree_borrows::{
-    perms::{PermTransition, Permission},
-    tree::LocationState,
-    unimap::UniIndex,
-};
 use crate::borrow_tracker::ProtectorKind;
+use crate::borrow_tracker::tree_borrows::perms::{PermTransition, Permission};
+use crate::borrow_tracker::tree_borrows::tree::LocationState;
+use crate::borrow_tracker::tree_borrows::unimap::UniIndex;
 use crate::*;
 
 /// Cause of an access: either a real access or one
@@ -181,7 +179,7 @@ impl NodeDebugInfo {
     /// Add a name to the tag. If a same tag is associated to several pointers,
     /// it can have several names which will be separated by commas.
     pub fn add_name(&mut self, name: &str) {
-        if let Some(ref mut prev_name) = &mut self.name {
+        if let Some(prev_name) = &mut self.name {
             prev_name.push_str(", ");
             prev_name.push_str(name);
         } else {
@@ -228,7 +226,7 @@ impl<'tcx> Tree {
         } else {
             eprintln!("Tag {tag:?} (to be named '{name}') not found!");
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Debug helper: determines if the tree contains a tag.
@@ -300,7 +298,7 @@ pub(super) struct TbError<'node> {
 
 impl TbError<'_> {
     /// Produce a UB error.
-    pub fn build<'tcx>(self) -> InterpError<'tcx> {
+    pub fn build<'tcx>(self) -> InterpErrorKind<'tcx> {
         use TransitionError::*;
         let cause = self.access_cause;
         let accessed = self.accessed_info;
@@ -506,7 +504,7 @@ impl DisplayFmt {
         if let Some(perm) = perm {
             format!(
                 "{ac}{st}",
-                ac = if perm.is_initialized() { self.accessed.yes } else { self.accessed.no },
+                ac = if perm.is_accessed() { self.accessed.yes } else { self.accessed.no },
                 st = perm.permission().short_name(),
             )
         } else {
@@ -800,6 +798,6 @@ impl<'tcx> Tree {
                 /* print warning message about tags not shown */ !show_unnamed,
             );
         }
-        Ok(())
+        interp_ok(())
     }
 }

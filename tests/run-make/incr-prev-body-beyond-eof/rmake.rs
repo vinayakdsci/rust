@@ -7,14 +7,9 @@
 // was hashed by rustc in addition to the span length, and the fix still
 // works.
 
-//@ ignore-none
-// reason: no-std is not supported
+//@ ignore-cross-compile
 
-//@ ignore-nvptx64-nvidia-cuda
-// FIXME: can't find crate for `std`
-
-use run_make_support::rfs;
-use run_make_support::rustc;
+use run_make_support::{rfs, rustc};
 
 fn main() {
     rfs::create_dir("src");

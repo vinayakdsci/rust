@@ -1,14 +1,19 @@
 use std::iter::{self, Peekable};
 
 use either::Either;
-use hir::{Adt, Crate, HasAttrs, HasSource, ImportPathConfig, ModuleDef, Semantics};
+use hir::{Adt, AsAssocItem, Crate, HasAttrs, ImportPathConfig, ModuleDef, Semantics, sym};
 use ide_db::RootDatabase;
+use ide_db::assists::ExprFillDefaultMode;
+use ide_db::syntax_helpers::suggest_name;
 use ide_db::{famous_defs::FamousDefs, helpers::mod_path_to_ast};
 use itertools::Itertools;
-use syntax::ast::edit_in_place::Removable;
-use syntax::ast::{self, make, AstNode, HasName, MatchArmList, MatchExpr, Pat};
+use syntax::ToSmolStr;
+use syntax::ast::edit::IndentLevel;
+use syntax::ast::edit_in_place::Indent;
+use syntax::ast::syntax_factory::SyntaxFactory;
+use syntax::ast::{self, AstNode, MatchArmList, MatchExpr, Pat, make};
 
-use crate::{utils, AssistContext, AssistId, AssistKind, Assists};
+use crate::{AssistContext, AssistId, Assists, utils};
 
 // Assist: add_missing_match_arms
 //
@@ -29,8 +34,8 @@ use crate::{utils, AssistContext, AssistId, AssistKind, Assists};
 //
 // fn handle(action: Action) {
 //     match action {
-//         $0Action::Move { distance } => todo!(),
-//         Action::Stop => todo!(),
+//         Action::Move { distance } => ${1:todo!()},
+//         Action::Stop => ${2:todo!()},$0
 //     }
 // }
 // ```
@@ -71,18 +76,24 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
         .filter(|pat| !matches!(pat, Pat::WildcardPat(_)))
         .collect();
 
-    let cfg = ImportPathConfig {
-        prefer_no_std: ctx.config.prefer_no_std,
-        prefer_prelude: ctx.config.prefer_prelude,
-        prefer_absolute: ctx.config.prefer_absolute,
-    };
+    let cfg = ctx.config.import_path_config();
 
-    let module = ctx.sema.scope(expr.syntax())?.module();
+    let make = SyntaxFactory::with_mappings();
+
+    let scope = ctx.sema.scope(expr.syntax())?;
+    let module = scope.module();
+    let self_ty = if ctx.config.prefer_self_ty {
+        scope
+            .containing_function()
+            .and_then(|function| function.as_assoc_item(ctx.db())?.implementing_ty(ctx.db()))
+    } else {
+        None
+    };
     let (mut missing_pats, is_non_exhaustive, has_hidden_variants): (
         Peekable<Box<dyn Iterator<Item = (ast::Pat, bool)>>>,
         bool,
         bool,
-    ) = if let Some(enum_def) = resolve_enum_def(&ctx.sema, &expr) {
+    ) = if let Some(enum_def) = resolve_enum_def(&ctx.sema, &expr, self_ty.as_ref()) {
         let is_non_exhaustive = enum_def.is_non_exhaustive(ctx.db(), module.krate());
 
         let variants = enum_def.variants(ctx.db());
@@ -94,14 +105,15 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             .into_iter()
             .filter_map(|variant| {
                 Some((
-                    build_pat(ctx.db(), module, variant, cfg)?,
+                    build_pat(ctx, &make, module, variant, cfg)?,
                     variant.should_be_hidden(ctx.db(), module.krate()),
                 ))
             })
             .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
 
-        let option_enum = FamousDefs(&ctx.sema, module.krate()).core_option_Option().map(lift_enum);
-        let missing_pats: Box<dyn Iterator<Item = _>> = if Some(enum_def) == option_enum {
+        let option_enum = FamousDefs(&ctx.sema, module.krate()).core_option_Option();
+        let missing_pats: Box<dyn Iterator<Item = _>> = if matches!(enum_def, ExtendedEnum::Enum { enum_: e, .. } if Some(e) == option_enum)
+        {
             // Match `Some` variant first.
             cov_mark::hit!(option_order);
             Box::new(missing_pats.rev())
@@ -109,7 +121,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             Box::new(missing_pats)
         };
         (missing_pats.peekable(), is_non_exhaustive, has_hidden_variants)
-    } else if let Some(enum_defs) = resolve_tuple_of_enum_def(&ctx.sema, &expr) {
+    } else if let Some(enum_defs) = resolve_tuple_of_enum_def(&ctx.sema, &expr, self_ty.as_ref()) {
         let is_non_exhaustive =
             enum_defs.iter().any(|enum_def| enum_def.is_non_exhaustive(ctx.db(), module.krate()));
 
@@ -147,9 +159,9 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                     .any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
                 let patterns = variants
                     .into_iter()
-                    .filter_map(|variant| build_pat(ctx.db(), module, variant, cfg));
+                    .filter_map(|variant| build_pat(ctx, &make, module, variant, cfg));
 
-                (ast::Pat::from(make::tuple_pat(patterns)), is_hidden)
+                (ast::Pat::from(make.tuple_pat(patterns)), is_hidden)
             })
             .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
         (
@@ -157,7 +169,9 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             is_non_exhaustive,
             has_hidden_variants,
         )
-    } else if let Some((enum_def, len)) = resolve_array_of_enum_def(&ctx.sema, &expr) {
+    } else if let Some((enum_def, len)) =
+        resolve_array_of_enum_def(&ctx.sema, &expr, self_ty.as_ref())
+    {
         let is_non_exhaustive = enum_def.is_non_exhaustive(ctx.db(), module.krate());
         let variants = enum_def.variants(ctx.db());
 
@@ -180,8 +194,9 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                     .any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
                 let patterns = variants
                     .into_iter()
-                    .filter_map(|variant| build_pat(ctx.db(), module, variant, cfg));
-                (ast::Pat::from(make::slice_pat(patterns)), is_hidden)
+                    .filter_map(|variant| build_pat(ctx, &make, module, variant, cfg));
+
+                (ast::Pat::from(make.slice_pat(patterns)), is_hidden)
             })
             .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
         (
@@ -202,12 +217,10 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
     }
 
     acc.add(
-        AssistId("add_missing_match_arms", AssistKind::QuickFix),
+        AssistId::quick_fix("add_missing_match_arms"),
         "Fill match arms",
         ctx.sema.original_range(match_expr.syntax()).range,
-        |edit| {
-            let new_match_arm_list = match_arm_list.clone_for_update();
-
+        |builder| {
             // having any hidden variants means that we need a catch-all arm
             needs_catch_all_arm |= has_hidden_variants;
 
@@ -217,79 +230,102 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                     !hidden
                 })
                 .map(|(pat, _)| {
-                    make::match_arm(iter::once(pat), None, make::ext::expr_todo())
-                        .clone_for_update()
+                    make.match_arm(
+                        pat,
+                        None,
+                        match ctx.config.expr_fill_default {
+                            ExprFillDefaultMode::Todo => make::ext::expr_todo(),
+                            ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
+                            ExprFillDefaultMode::Default => make::ext::expr_todo(),
+                        },
+                    )
                 });
 
-            let catch_all_arm = new_match_arm_list
+            let mut arms: Vec<_> = match_arm_list
                 .arms()
-                .find(|arm| matches!(arm.pat(), Some(ast::Pat::WildcardPat(_))));
-            if let Some(arm) = catch_all_arm {
-                let is_empty_expr = arm.expr().map_or(true, |e| match e {
-                    ast::Expr::BlockExpr(b) => {
-                        b.statements().next().is_none() && b.tail_expr().is_none()
+                .filter(|arm| {
+                    if matches!(arm.pat(), Some(ast::Pat::WildcardPat(_))) {
+                        let is_empty_expr = arm.expr().is_none_or(|e| match e {
+                            ast::Expr::BlockExpr(b) => {
+                                b.statements().next().is_none() && b.tail_expr().is_none()
+                            }
+                            ast::Expr::TupleExpr(t) => t.fields().next().is_none(),
+                            _ => false,
+                        });
+                        if is_empty_expr {
+                            false
+                        } else {
+                            cov_mark::hit!(add_missing_match_arms_empty_expr);
+                            true
+                        }
+                    } else {
+                        true
                     }
-                    ast::Expr::TupleExpr(t) => t.fields().next().is_none(),
-                    _ => false,
-                });
-                if is_empty_expr {
-                    arm.remove();
-                } else {
-                    cov_mark::hit!(add_missing_match_arms_empty_expr);
-                }
-            }
+                })
+                .collect();
 
-            let mut first_new_arm = None;
-            for arm in missing_arms {
-                first_new_arm.get_or_insert_with(|| arm.clone());
-                new_match_arm_list.add_arm(arm);
-            }
+            let first_new_arm_idx = arms.len();
+            arms.extend(missing_arms);
 
             if needs_catch_all_arm && !has_catch_all_arm {
                 cov_mark::hit!(added_wildcard_pattern);
-                let arm = make::match_arm(
-                    iter::once(make::wildcard_pat().into()),
+                let arm = make.match_arm(
+                    make.wildcard_pat().into(),
                     None,
-                    make::ext::expr_todo(),
-                )
-                .clone_for_update();
-                first_new_arm.get_or_insert_with(|| arm.clone());
-                new_match_arm_list.add_arm(arm);
+                    match ctx.config.expr_fill_default {
+                        ExprFillDefaultMode::Todo => make::ext::expr_todo(),
+                        ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
+                        ExprFillDefaultMode::Default => make::ext::expr_todo(),
+                    },
+                );
+                arms.push(arm);
             }
 
-            if let (Some(first_new_arm), Some(cap)) = (first_new_arm, ctx.config.snippet_cap) {
-                match first_new_arm.syntax().descendants().find_map(ast::WildcardPat::cast) {
-                    Some(it) => edit.add_placeholder_snippet(cap, it),
-                    None => edit.add_tabstop_before(cap, first_new_arm),
-                }
-            }
+            let new_match_arm_list = make.match_arm_list(arms);
 
-            // FIXME: Hack for mutable syntax trees not having great support for macros
+            // FIXME: Hack for syntax trees not having great support for macros
             // Just replace the element that the original range came from
             let old_place = {
                 // Find the original element
                 let file = ctx.sema.parse(arm_list_range.file_id);
                 let old_place = file.syntax().covering_element(arm_list_range.range);
 
-                // Make `old_place` mut
                 match old_place {
-                    syntax::SyntaxElement::Node(it) => {
-                        syntax::SyntaxElement::from(edit.make_syntax_mut(it))
-                    }
+                    syntax::SyntaxElement::Node(it) => it,
                     syntax::SyntaxElement::Token(it) => {
-                        // Don't have a way to make tokens mut, so instead make the parent mut
-                        // and find the token again
-                        let parent =
-                            edit.make_syntax_mut(it.parent().expect("Token must have a parent."));
-                        let mut_token =
-                            parent.covering_element(it.text_range()).into_token().expect("Covering element cannot be found. Range may be beyond the current node's range");
-
-                        syntax::SyntaxElement::from(mut_token)
+                        // If a token is found, it is '{' or '}'
+                        // The parent is `{ ... }`
+                        it.parent().expect("Token must have a parent.")
                     }
                 }
             };
 
-            syntax::ted::replace(old_place, new_match_arm_list.syntax());
+            let mut editor = builder.make_editor(&old_place);
+            new_match_arm_list.indent(IndentLevel::from_node(&old_place));
+            editor.replace(old_place, new_match_arm_list.syntax());
+
+            if let Some(cap) = ctx.config.snippet_cap {
+                if let Some(it) = new_match_arm_list
+                    .arms()
+                    .nth(first_new_arm_idx)
+                    .and_then(|arm| arm.syntax().descendants().find_map(ast::WildcardPat::cast))
+                {
+                    editor.add_annotation(it.syntax(), builder.make_placeholder_snippet(cap));
+                }
+
+                for arm in new_match_arm_list.arms().skip(first_new_arm_idx) {
+                    if let Some(expr) = arm.expr() {
+                        editor.add_annotation(expr.syntax(), builder.make_placeholder_snippet(cap));
+                    }
+                }
+
+                if let Some(arm) = new_match_arm_list.arms().skip(first_new_arm_idx).last() {
+                    editor.add_annotation(arm.syntax(), builder.make_tabstop_after(cap));
+                }
+            }
+
+            editor.add_mappings(make.take());
+            builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
@@ -349,23 +385,23 @@ fn does_pat_match_variant(pat: &Pat, var: &Pat) -> bool {
     }
 }
 
-#[derive(Eq, PartialEq, Clone, Copy)]
+#[derive(Eq, PartialEq, Clone)]
 enum ExtendedEnum {
     Bool,
-    Enum(hir::Enum),
+    Enum { enum_: hir::Enum, use_self: bool },
 }
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 enum ExtendedVariant {
     True,
     False,
-    Variant(hir::Variant),
+    Variant { variant: hir::Variant, use_self: bool },
 }
 
 impl ExtendedVariant {
     fn should_be_hidden(self, db: &RootDatabase, krate: Crate) -> bool {
         match self {
-            ExtendedVariant::Variant(var) => {
+            ExtendedVariant::Variant { variant: var, .. } => {
                 var.attrs(db).has_doc_hidden() && var.module(db).krate() != krate
             }
             _ => false,
@@ -373,25 +409,35 @@ impl ExtendedVariant {
     }
 }
 
-fn lift_enum(e: hir::Enum) -> ExtendedEnum {
-    ExtendedEnum::Enum(e)
-}
-
 impl ExtendedEnum {
-    fn is_non_exhaustive(self, db: &RootDatabase, krate: Crate) -> bool {
+    fn enum_(
+        db: &RootDatabase,
+        enum_: hir::Enum,
+        enum_ty: &hir::Type<'_>,
+        self_ty: Option<&hir::Type<'_>>,
+    ) -> Self {
+        ExtendedEnum::Enum {
+            enum_,
+            use_self: self_ty.is_some_and(|self_ty| self_ty.could_unify_with_deeply(db, enum_ty)),
+        }
+    }
+
+    fn is_non_exhaustive(&self, db: &RootDatabase, krate: Crate) -> bool {
         match self {
-            ExtendedEnum::Enum(e) => {
-                e.attrs(db).by_key("non_exhaustive").exists() && e.module(db).krate() != krate
+            ExtendedEnum::Enum { enum_: e, .. } => {
+                e.attrs(db).by_key(sym::non_exhaustive).exists() && e.module(db).krate() != krate
             }
             _ => false,
         }
     }
 
-    fn variants(self, db: &RootDatabase) -> Vec<ExtendedVariant> {
-        match self {
-            ExtendedEnum::Enum(e) => {
-                e.variants(db).into_iter().map(ExtendedVariant::Variant).collect::<Vec<_>>()
-            }
+    fn variants(&self, db: &RootDatabase) -> Vec<ExtendedVariant> {
+        match *self {
+            ExtendedEnum::Enum { enum_: e, use_self } => e
+                .variants(db)
+                .into_iter()
+                .map(|variant| ExtendedVariant::Variant { variant, use_self })
+                .collect::<Vec<_>>(),
             ExtendedEnum::Bool => {
                 Vec::<ExtendedVariant>::from([ExtendedVariant::True, ExtendedVariant::False])
             }
@@ -399,9 +445,13 @@ impl ExtendedEnum {
     }
 }
 
-fn resolve_enum_def(sema: &Semantics<'_, RootDatabase>, expr: &ast::Expr) -> Option<ExtendedEnum> {
+fn resolve_enum_def(
+    sema: &Semantics<'_, RootDatabase>,
+    expr: &ast::Expr,
+    self_ty: Option<&hir::Type<'_>>,
+) -> Option<ExtendedEnum> {
     sema.type_of_expr(expr)?.adjusted().autoderef(sema.db).find_map(|ty| match ty.as_adt() {
-        Some(Adt::Enum(e)) => Some(ExtendedEnum::Enum(e)),
+        Some(Adt::Enum(e)) => Some(ExtendedEnum::enum_(sema.db, e, &ty, self_ty)),
         _ => ty.is_bool().then_some(ExtendedEnum::Bool),
     })
 }
@@ -409,6 +459,7 @@ fn resolve_enum_def(sema: &Semantics<'_, RootDatabase>, expr: &ast::Expr) -> Opt
 fn resolve_tuple_of_enum_def(
     sema: &Semantics<'_, RootDatabase>,
     expr: &ast::Expr,
+    self_ty: Option<&hir::Type<'_>>,
 ) -> Option<Vec<ExtendedEnum>> {
     sema.type_of_expr(expr)?
         .adjusted()
@@ -417,7 +468,7 @@ fn resolve_tuple_of_enum_def(
         .map(|ty| {
             ty.autoderef(sema.db).find_map(|ty| {
                 match ty.as_adt() {
-                    Some(Adt::Enum(e)) => Some(lift_enum(e)),
+                    Some(Adt::Enum(e)) => Some(ExtendedEnum::enum_(sema.db, e, &ty, self_ty)),
                     // For now we only handle expansion for a tuple of enums. Here
                     // we map non-enum items to None and rely on `collect` to
                     // convert Vec<Option<hir::Enum>> into Option<Vec<hir::Enum>>.
@@ -432,52 +483,76 @@ fn resolve_tuple_of_enum_def(
 fn resolve_array_of_enum_def(
     sema: &Semantics<'_, RootDatabase>,
     expr: &ast::Expr,
+    self_ty: Option<&hir::Type<'_>>,
 ) -> Option<(ExtendedEnum, usize)> {
     sema.type_of_expr(expr)?.adjusted().as_array(sema.db).and_then(|(ty, len)| {
         ty.autoderef(sema.db).find_map(|ty| match ty.as_adt() {
-            Some(Adt::Enum(e)) => Some((lift_enum(e), len)),
+            Some(Adt::Enum(e)) => Some((ExtendedEnum::enum_(sema.db, e, &ty, self_ty), len)),
             _ => ty.is_bool().then_some((ExtendedEnum::Bool, len)),
         })
     })
 }
 
 fn build_pat(
-    db: &RootDatabase,
+    ctx: &AssistContext<'_>,
+    make: &SyntaxFactory,
     module: hir::Module,
     var: ExtendedVariant,
     cfg: ImportPathConfig,
 ) -> Option<ast::Pat> {
+    let db = ctx.db();
     match var {
-        ExtendedVariant::Variant(var) => {
-            let path = mod_path_to_ast(&module.find_path(db, ModuleDef::from(var), cfg)?);
-            // FIXME: use HIR for this; it doesn't currently expose struct vs. tuple vs. unit variants though
-            Some(match var.source(db)?.value.kind() {
-                ast::StructKind::Tuple(field_list) => {
-                    let pats =
-                        iter::repeat(make::wildcard_pat().into()).take(field_list.fields().count());
-                    make::tuple_struct_pat(path, pats).into()
-                }
-                ast::StructKind::Record(field_list) => {
-                    let pats = field_list.fields().map(|f| {
-                        make::ext::simple_ident_pat(
-                            f.name().expect("Record field must have a name"),
-                        )
-                        .into()
+        ExtendedVariant::Variant { variant: var, use_self } => {
+            let edition = module.krate().edition(db);
+            let path = if use_self {
+                make::path_from_segments(
+                    [
+                        make::path_segment(make::name_ref_self_ty()),
+                        make::path_segment(make::name_ref(
+                            &var.name(db).display(db, edition).to_smolstr(),
+                        )),
+                    ],
+                    false,
+                )
+            } else {
+                mod_path_to_ast(&module.find_path(db, ModuleDef::from(var), cfg)?, edition)
+            };
+            let fields = var.fields(db);
+            let pat: ast::Pat = match var.kind(db) {
+                hir::StructKind::Tuple => {
+                    let mut name_generator = suggest_name::NameGenerator::default();
+                    let pats = fields.into_iter().map(|f| {
+                        let name = name_generator.for_type(&f.ty(db), db, edition);
+                        match name {
+                            Some(name) => make::ext::simple_ident_pat(make.name(&name)).into(),
+                            None => make.wildcard_pat().into(),
+                        }
                     });
-                    make::record_pat(path, pats).into()
+                    make.tuple_struct_pat(path, pats).into()
                 }
-                ast::StructKind::Unit => make::path_pat(path),
-            })
+                hir::StructKind::Record => {
+                    let fields = fields
+                        .into_iter()
+                        .map(|f| make.ident_pat(false, false, make.name(f.name(db).as_str())))
+                        .map(|ident| make.record_pat_field_shorthand(ident.into()));
+                    let fields = make.record_pat_field_list(fields, None);
+                    make.record_pat_with_fields(path, fields).into()
+                }
+                hir::StructKind::Unit => make.path_pat(path),
+            };
+            Some(pat)
         }
-        ExtendedVariant::True => Some(ast::Pat::from(make::literal_pat("true"))),
-        ExtendedVariant::False => Some(ast::Pat::from(make::literal_pat("false"))),
+        ExtendedVariant::True => Some(ast::Pat::from(make.literal_pat("true"))),
+        ExtendedVariant::False => Some(ast::Pat::from(make.literal_pat("false"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::AssistConfig;
     use crate::tests::{
-        check_assist, check_assist_not_applicable, check_assist_target, check_assist_unresolved,
+        TEST_CONFIG, check_assist, check_assist_not_applicable, check_assist_target,
+        check_assist_unresolved, check_assist_with_config,
     };
 
     use super::add_missing_match_arms;
@@ -579,8 +654,8 @@ fn foo(a: bool) {
             r#"
 fn foo(a: bool) {
     match a {
-        $0true => todo!(),
-        false => todo!(),
+        true => ${1:todo!()},
+        false => ${2:todo!()},$0
     }
 }
 "#,
@@ -602,7 +677,7 @@ fn foo(a: bool) {
 fn foo(a: bool) {
     match a {
         true => {}
-        $0false => todo!(),
+        false => ${1:todo!()},$0
     }
 }
 "#,
@@ -652,10 +727,10 @@ fn foo(a: bool) {
             r#"
 fn foo(a: bool) {
     match (a, a) {
-        $0(true, true) => todo!(),
-        (true, false) => todo!(),
-        (false, true) => todo!(),
-        (false, false) => todo!(),
+        (true, true) => ${1:todo!()},
+        (true, false) => ${2:todo!()},
+        (false, true) => ${3:todo!()},
+        (false, false) => ${4:todo!()},$0
     }
 }
 "#,
@@ -675,8 +750,8 @@ fn foo(a: bool) {
             r#"
 fn foo(a: bool) {
     match [a] {
-        $0[true] => todo!(),
-        [false] => todo!(),
+        [true] => ${1:todo!()},
+        [false] => ${2:todo!()},$0
     }
 }
 "#,
@@ -693,8 +768,8 @@ fn foo(a: bool) {
             r#"
 fn foo(a: bool) {
     match [a,] {
-        $0[true] => todo!(),
-        [false] => todo!(),
+        [true] => ${1:todo!()},
+        [false] => ${2:todo!()},$0
     }
 }
 "#,
@@ -713,9 +788,9 @@ fn foo(a: bool) {
 fn foo(a: bool) {
     match [a, a] {
         [true, true] => todo!(),
-        $0[true, false] => todo!(),
-        [false, true] => todo!(),
-        [false, false] => todo!(),
+        [true, false] => ${1:todo!()},
+        [false, true] => ${2:todo!()},
+        [false, false] => ${3:todo!()},$0
     }
 }
 "#,
@@ -732,10 +807,10 @@ fn foo(a: bool) {
             r#"
 fn foo(a: bool) {
     match [a, a] {
-        $0[true, true] => todo!(),
-        [true, false] => todo!(),
-        [false, true] => todo!(),
-        [false, false] => todo!(),
+        [true, true] => ${1:todo!()},
+        [true, false] => ${2:todo!()},
+        [false, true] => ${3:todo!()},
+        [false, false] => ${4:todo!()},$0
     }
 }
 "#,
@@ -757,8 +832,8 @@ fn foo(a: bool) {
 fn foo(a: bool) {
     match (a, a) {
         (true | false, true) => {}
-        $0(true, false) => todo!(),
-        (false, false) => todo!(),
+        (true, false) => ${1:todo!()},
+        (false, false) => ${2:todo!()},$0
     }
 }
 "#,
@@ -777,9 +852,9 @@ fn foo(a: bool) {
 fn foo(a: bool) {
     match (a, a) {
         (false, true) => {}
-        $0(true, true) => todo!(),
-        (true, false) => todo!(),
-        (false, false) => todo!(),
+        (true, true) => ${1:todo!()},
+        (true, false) => ${2:todo!()},
+        (false, false) => ${3:todo!()},$0
     }
 }
 "#,
@@ -813,7 +888,7 @@ fn main() {
     match A::As {
         A::Bs { x, y: Some(_) } => {}
         A::Cs(_, Some(_)) => {}
-        $0A::As => todo!(),
+        A::As => ${1:todo!()},$0
     }
 }
 "#,
@@ -836,7 +911,7 @@ fn main() {
 fn main() {
     match None {
         None => {}
-        Some(${0:_}) => todo!(),
+        Some(${1:_}) => ${2:todo!()},$0
     }
 }
 "#,
@@ -860,7 +935,7 @@ enum A { As, Bs, Cs(Option<i32>) }
 fn main() {
     match A::As {
         A::Cs(_) | A::Bs => {}
-        $0A::As => todo!(),
+        A::As => ${1:todo!()},$0
     }
 }
 "#,
@@ -890,8 +965,8 @@ fn main() {
         A::Bs if 0 < 1 => {}
         A::Ds(_value) => { let x = 1; }
         A::Es(B::Xs) => (),
-        $0A::As => todo!(),
-        A::Cs => todo!(),
+        A::As => ${1:todo!()},
+        A::Cs => ${2:todo!()},$0
     }
 }
 "#,
@@ -917,7 +992,7 @@ fn main() {
     match A::As {
         A::As(_) => {}
         a @ A::Bs(_) => {}
-        A::Cs(${0:_}) => todo!(),
+        A::Cs(${1:_}) => ${2:todo!()},$0
     }
 }
 "#,
@@ -943,11 +1018,11 @@ enum A { As, Bs, Cs(String), Ds(String, String), Es { x: usize, y: usize } }
 fn main() {
     let a = A::As;
     match a {
-        $0A::As => todo!(),
-        A::Bs => todo!(),
-        A::Cs(_) => todo!(),
-        A::Ds(_, _) => todo!(),
-        A::Es { x, y } => todo!(),
+        A::As => ${1:todo!()},
+        A::Bs => ${2:todo!()},
+        A::Cs(_) => ${3:todo!()},
+        A::Ds(_, _) => ${4:todo!()},
+        A::Es { x, y } => ${5:todo!()},$0
     }
 }
 "#,
@@ -980,9 +1055,9 @@ fn main() {
     let b = B::One;
     match (a, b) {
         (A::Two, B::One) => {},
-        $0(A::One, B::One) => todo!(),
-        (A::One, B::Two) => todo!(),
-        (A::Two, B::Two) => todo!(),
+        (A::One, B::One) => ${1:todo!()},
+        (A::One, B::Two) => ${2:todo!()},
+        (A::Two, B::Two) => ${3:todo!()},$0
     }
 }
 "#,
@@ -1011,10 +1086,10 @@ fn main() {
     let a = A::One;
     let b = B::One;
     match (a, b) {
-        $0(A::One, B::One) => todo!(),
-        (A::One, B::Two) => todo!(),
-        (A::Two, B::One) => todo!(),
-        (A::Two, B::Two) => todo!(),
+        (A::One, B::One) => ${1:todo!()},
+        (A::One, B::Two) => ${2:todo!()},
+        (A::Two, B::One) => ${3:todo!()},
+        (A::Two, B::Two) => ${4:todo!()},$0
     }
 }
 "#,
@@ -1043,10 +1118,10 @@ fn main() {
     let a = A::One;
     let b = B::One;
     match (&a, &b) {
-        $0(A::One, B::One) => todo!(),
-        (A::One, B::Two) => todo!(),
-        (A::Two, B::One) => todo!(),
-        (A::Two, B::Two) => todo!(),
+        (A::One, B::One) => ${1:todo!()},
+        (A::One, B::Two) => ${2:todo!()},
+        (A::Two, B::One) => ${3:todo!()},
+        (A::Two, B::Two) => ${4:todo!()},$0
     }
 }
 "#,
@@ -1078,9 +1153,9 @@ fn main() {
     let b = B::One;
     match (a, b) {
         (A::Two, B::One) => {}
-        $0(A::One, B::One) => todo!(),
-        (A::One, B::Two) => todo!(),
-        (A::Two, B::Two) => todo!(),
+        (A::One, B::One) => ${1:todo!()},
+        (A::One, B::Two) => ${2:todo!()},
+        (A::Two, B::Two) => ${3:todo!()},$0
     }
 }
 "#,
@@ -1105,9 +1180,9 @@ fn main() {
     match (A, B, C) {
         (A | B , A, A | B | C) => (),
         (A | B | C , B | C, A | B | C) => (),
-        $0(C, A, A) => todo!(),
-        (C, A, B) => todo!(),
-        (C, A, C) => todo!(),
+        (C, A, A) => ${1:todo!()},
+        (C, A, B) => ${2:todo!()},
+        (C, A, C) => ${3:todo!()},$0
     }
 }
 "#,
@@ -1136,7 +1211,7 @@ fn main() {
     match (a, b) {
         (Some(_), _) => {}
         (None, Some(_)) => {}
-        $0(None, None) => todo!(),
+        (None, None) => ${1:todo!()},$0
     }
 }
 "#,
@@ -1201,8 +1276,8 @@ enum A { One, Two }
 fn main() {
     let a = A::One;
     match (a, ) {
-        $0(A::One,) => todo!(),
-        (A::Two,) => todo!(),
+        (A::One,) => ${1:todo!()},
+        (A::Two,) => ${2:todo!()},$0
     }
 }
 "#,
@@ -1226,7 +1301,7 @@ enum A { As }
 
 fn foo(a: &A) {
     match a {
-        $0A::As => todo!(),
+        A::As => ${1:todo!()},$0
     }
 }
 "#,
@@ -1251,7 +1326,7 @@ enum A {
 
 fn foo(a: &mut A) {
     match a {
-        $0A::Es { x, y } => todo!(),
+        A::Es { x, y } => ${1:todo!()},$0
     }
 }
 "#,
@@ -1311,8 +1386,8 @@ enum E { X, Y }
 
 fn main() {
     match E::X {
-        $0E::X => todo!(),
-        E::Y => todo!(),
+        E::X => ${1:todo!()},
+        E::Y => ${2:todo!()},$0
     }
 }
 "#,
@@ -1358,14 +1433,17 @@ use foo::E::X;
 
 fn main() {
     match X {
-        $0X => todo!(),
-        foo::E::Y => todo!(),
+        X => ${1:todo!()},
+        foo::E::Y => ${2:todo!()},$0
     }
 }
 "#,
         );
     }
 
+    // FIXME: Preserving comments is quite hard in the current transitional syntax editing model.
+    // Once we migrate to new trivia model addressed in #6854, remove the ignore attribute.
+    #[ignore]
     #[test]
     fn add_missing_match_arms_preserves_comments() {
         check_assist(
@@ -1386,7 +1464,7 @@ fn foo(a: A) {
     match a  {
         // foo bar baz
         A::One => {}
-        $0A::Two => todo!(),
+        A::Two => ${1:todo!()},$0
         // This is where the rest should be
     }
 }
@@ -1394,6 +1472,9 @@ fn foo(a: A) {
         );
     }
 
+    // FIXME: Preserving comments is quite hard in the current transitional syntax editing model.
+    // Once we migrate to new trivia model addressed in #6854, remove the ignore attribute.
+    #[ignore]
     #[test]
     fn add_missing_match_arms_preserves_comments_empty() {
         check_assist(
@@ -1410,8 +1491,8 @@ fn foo(a: A) {
 enum A { One, Two }
 fn foo(a: A) {
     match a {
-        $0A::One => todo!(),
-        A::Two => todo!(),
+        A::One => ${1:todo!()},
+        A::Two => ${2:todo!()},$0
         // foo bar baz
     }
 }
@@ -1435,8 +1516,8 @@ fn foo(a: A) {
 enum A { One, Two, }
 fn foo(a: A) {
     match a {
-        $0A::One => todo!(),
-        A::Two => todo!(),
+        A::One => ${1:todo!()},
+        A::Two => ${2:todo!()},$0
     }
 }
 "#,
@@ -1458,8 +1539,8 @@ fn foo(opt: Option<i32>) {
             r#"
 fn foo(opt: Option<i32>) {
     match opt {
-        Some(${0:_}) => todo!(),
-        None => todo!(),
+        Some(${1:_}) => ${2:todo!()},
+        None => ${3:todo!()},$0
     }
 }
 "#,
@@ -1491,10 +1572,10 @@ enum Test {
 
 fn foo(t: Test) {
     m!(match t {
-    $0Test::A => todo!(),
-    Test::B => todo!(),
-    Test::C => todo!(),
-});
+        Test::A => ${1:todo!()},
+        Test::B => ${2:todo!()},
+        Test::C => ${3:todo!()},$0
+    });
 }"#,
         );
     }
@@ -1528,7 +1609,7 @@ fn foo(t: bool) {
 fn foo(t: bool) {
     match t {
         true => 1 + 2,
-        $0false => todo!(),
+        false => ${1:todo!()},$0
     }
 }"#,
         );
@@ -1548,7 +1629,7 @@ fn foo(t: bool) {
 fn foo(t: bool) {
     match t {
         true => 1 + 2,
-        $0false => todo!(),
+        false => ${1:todo!()},$0
     }
 }"#,
         );
@@ -1569,8 +1650,8 @@ fn foo(t: bool) {
 fn foo(t: bool) {
     match t {
         _ => 1 + 2,
-        $0true => todo!(),
-        false => todo!(),
+        true => ${1:todo!()},
+        false => ${2:todo!()},$0
     }
 }"#,
         );
@@ -1593,8 +1674,8 @@ pub enum E { A, #[doc(hidden)] B, }
             r#"
 fn foo(t: ::e::E) {
     match t {
-        $0e::E::A => todo!(),
-        _ => todo!(),
+        e::E::A => ${1:todo!()},
+        _ => ${2:todo!()},$0
     }
 }
 "#,
@@ -1618,9 +1699,9 @@ pub enum E { A, #[doc(hidden)] B, }
             r#"
 fn foo(t: (bool, ::e::E)) {
     match t {
-        $0(true, e::E::A) => todo!(),
-        (false, e::E::A) => todo!(),
-        _ => todo!(),
+        (true, e::E::A) => ${1:todo!()},
+        (false, e::E::A) => ${2:todo!()},
+        _ => ${3:todo!()},$0
     }
 }
 "#,
@@ -1644,7 +1725,7 @@ pub enum E { #[doc(hidden)] A, }
             r#"
 fn foo(t: ::e::E) {
     match t {
-        ${0:_} => todo!(),
+        ${1:_} => ${2:todo!()},$0
     }
 }
 "#,
@@ -1705,7 +1786,7 @@ pub enum E { A, }
 fn foo(t: ::e::E) {
     match t {
         e::E::A => todo!(),
-        ${0:_} => todo!(),
+        ${1:_} => ${2:todo!()},$0
     }
 }
 "#,
@@ -1730,8 +1811,8 @@ pub enum E { A, }
             r#"
 fn foo(t: ::e::E) {
     match t {
-        $0e::E::A => todo!(),
-        _ => todo!(),
+        e::E::A => ${1:todo!()},
+        _ => ${2:todo!()},$0
     }
 }
 "#,
@@ -1755,8 +1836,8 @@ pub enum E { A, #[doc(hidden)] B }"#,
             r#"
 fn foo(t: ::e::E) {
     match t {
-        $0e::E::A => todo!(),
-        _ => todo!(),
+        e::E::A => ${1:todo!()},
+        _ => ${2:todo!()},$0
     }
 }
 "#,
@@ -1782,7 +1863,7 @@ pub enum E { A, #[doc(hidden)] B }"#,
 fn foo(t: ::e::E) {
     match t {
         e::E::A => todo!(),
-        ${0:_} => todo!(),
+        ${1:_} => ${2:todo!()},$0
     }
 }
 "#,
@@ -1807,7 +1888,7 @@ pub enum E { #[doc(hidden)] A, }"#,
 fn foo(t: ::e::E, b: bool) {
     match t {
         _ if b => todo!(),
-        ${0:_} => todo!(),
+        ${1:_} => ${2:todo!()},$0
     }
 }
 "#,
@@ -1848,8 +1929,8 @@ pub enum E { A, #[doc(hidden)] B, }"#,
             r#"
 fn foo(t: ::e::E) {
     match t {
-        $0e::E::A => todo!(),
-        _ => todo!(),
+        e::E::A => ${1:todo!()},
+        _ => ${2:todo!()},$0
     }
 }
 "#,
@@ -1872,8 +1953,8 @@ enum E { A, #[doc(hidden)] B, }
 
 fn foo(t: E) {
     match t {
-        $0E::A => todo!(),
-        E::B => todo!(),
+        E::A => ${1:todo!()},
+        E::B => ${2:todo!()},$0
     }
 }"#,
         );
@@ -1897,8 +1978,8 @@ enum E { A, B, }
 
 fn foo(t: E) {
     match t {
-        $0E::A => todo!(),
-        E::B => todo!(),
+        E::A => ${1:todo!()},
+        E::B => ${2:todo!()},$0
     }
 }"#,
         );
@@ -1922,8 +2003,8 @@ enum E { A, #[doc(hidden)] B, }
 
 fn foo(t: E) {
     match t {
-        $0E::A => todo!(),
-        E::B => todo!(),
+        E::A => ${1:todo!()},
+        E::B => ${2:todo!()},$0
     }
 }"#,
         );
@@ -1973,10 +2054,194 @@ enum A {
 fn a() {
     let b = A::A;
     match b {
-        $0A::A => todo!(),
-        A::Missing { a, u32, c } => todo!(),
+        A::A => ${1:todo!()},
+        A::Missing { a, u32, c } => ${2:todo!()},$0
     }
 }"#,
         )
+    }
+
+    #[test]
+    fn suggest_name_for_tuple_struct_patterns() {
+        // single tuple struct
+        check_assist(
+            add_missing_match_arms,
+            r#"
+struct S;
+
+pub enum E {
+    A
+    B(S),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        $0
+    }
+}
+"#,
+            r#"
+struct S;
+
+pub enum E {
+    A
+    B(S),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        E::A => ${1:todo!()},
+        E::B(s) => ${2:todo!()},$0
+    }
+}
+"#,
+        );
+
+        // multiple tuple struct patterns
+        check_assist(
+            add_missing_match_arms,
+            r#"
+struct S1;
+struct S2;
+
+pub enum E {
+    A
+    B(S1, S2),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        $0
+    }
+}
+"#,
+            r#"
+struct S1;
+struct S2;
+
+pub enum E {
+    A
+    B(S1, S2),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        E::A => ${1:todo!()},
+        E::B(s1, s2) => ${2:todo!()},$0
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn prefer_self() {
+        check_assist_with_config(
+            add_missing_match_arms,
+            AssistConfig { prefer_self_ty: true, ..TEST_CONFIG },
+            r#"
+enum Foo {
+    Bar,
+    Baz,
+}
+
+impl Foo {
+    fn qux(&self) {
+        match self {
+            $0_ => {}
+        }
+    }
+}
+            "#,
+            r#"
+enum Foo {
+    Bar,
+    Baz,
+}
+
+impl Foo {
+    fn qux(&self) {
+        match self {
+            Self::Bar => ${1:todo!()},
+            Self::Baz => ${2:todo!()},$0
+        }
+    }
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn prefer_self_with_generics() {
+        check_assist_with_config(
+            add_missing_match_arms,
+            AssistConfig { prefer_self_ty: true, ..TEST_CONFIG },
+            r#"
+enum Foo<T> {
+    Bar(T),
+    Baz,
+}
+
+impl<T> Foo<T> {
+    fn qux(&self) {
+        match self {
+            $0_ => {}
+        }
+    }
+}
+            "#,
+            r#"
+enum Foo<T> {
+    Bar(T),
+    Baz,
+}
+
+impl<T> Foo<T> {
+    fn qux(&self) {
+        match self {
+            Self::Bar(${1:_}) => ${2:todo!()},
+            Self::Baz => ${3:todo!()},$0
+        }
+    }
+}
+            "#,
+        );
+        check_assist_with_config(
+            add_missing_match_arms,
+            AssistConfig { prefer_self_ty: true, ..TEST_CONFIG },
+            r#"
+enum Foo<T> {
+    Bar(T),
+    Baz,
+}
+
+impl<T> Foo<T> {
+    fn qux(v: Foo<i32>) {
+        match v {
+            $0_ => {}
+        }
+    }
+}
+            "#,
+            r#"
+enum Foo<T> {
+    Bar(T),
+    Baz,
+}
+
+impl<T> Foo<T> {
+    fn qux(v: Foo<i32>) {
+        match v {
+            Foo::Bar(${1:_}) => ${2:todo!()},
+            Foo::Baz => ${3:todo!()},$0
+        }
+    }
+}
+            "#,
+        );
     }
 }

@@ -8,6 +8,7 @@ pub mod make;
 mod node_ext;
 mod operators;
 pub mod prec;
+pub mod syntax_factory;
 mod token_ext;
 mod traits;
 
@@ -16,8 +17,8 @@ use std::marker::PhantomData;
 use either::Either;
 
 use crate::{
-    syntax_node::{SyntaxNode, SyntaxNodeChildren, SyntaxToken},
     SyntaxKind,
+    syntax_node::{SyntaxNode, SyntaxNodeChildren, SyntaxToken},
 };
 
 pub use self::{
@@ -41,6 +42,14 @@ pub use self::{
 /// the same representation: a pointer to the tree root and a pointer to the
 /// node itself.
 pub trait AstNode {
+    /// This panics if the `SyntaxKind` is not statically known.
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        panic!("dynamic `SyntaxKind` for `AstNode::kind()`")
+    }
+
     fn can_cast(kind: SyntaxKind) -> bool
     where
         Self: Sized;
@@ -166,7 +175,7 @@ mod support {
 }
 
 #[test]
-fn assert_ast_is_object_safe() {
+fn assert_ast_is_dyn_compatible() {
     fn _f(_: &dyn AstNode, _: &dyn HasName) {}
 }
 
@@ -384,8 +393,7 @@ where
     let pred = predicates.next().unwrap();
     let mut bounds = pred.type_bound_list().unwrap().bounds();
 
-    assert!(pred.for_token().is_none());
-    assert!(pred.generic_param_list().is_none());
+    assert!(pred.for_binder().is_none());
     assert_eq!("T", pred.ty().unwrap().syntax().text().to_string());
     assert_bound("Clone", bounds.next());
     assert_bound("Copy", bounds.next());
@@ -423,8 +431,10 @@ where
     let pred = predicates.next().unwrap();
     let mut bounds = pred.type_bound_list().unwrap().bounds();
 
-    assert!(pred.for_token().is_some());
-    assert_eq!("<'a>", pred.generic_param_list().unwrap().syntax().text().to_string());
+    assert_eq!(
+        "<'a>",
+        pred.for_binder().unwrap().generic_param_list().unwrap().syntax().text().to_string()
+    );
     assert_eq!("F", pred.ty().unwrap().syntax().text().to_string());
     assert_bound("Fn(&'a str)", bounds.next());
 }

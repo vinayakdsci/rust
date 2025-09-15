@@ -1,5 +1,5 @@
 //@ build-fail
-//@ normalize-stderr-test: ".nll/" -> "/"
+//@ compile-flags: --diagnostic-width=100 -Zwrite-long-types-to-disk=yes
 
 trait Mirror {
     type Image;

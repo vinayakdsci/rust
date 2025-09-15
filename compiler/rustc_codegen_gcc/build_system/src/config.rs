@@ -1,14 +1,15 @@
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::{env as std_env, fs};
+
+use boml::Toml;
+use boml::types::TomlValue;
+
 use crate::utils::{
     create_dir, create_symlink, get_os_name, get_sysroot_dir, run_command_with_output,
     rustc_version_info, split_args,
 };
-use std::collections::HashMap;
-use std::env as std_env;
-use std::ffi::OsStr;
-use std::fs;
-use std::path::{Path, PathBuf};
-
-use boml::{types::TomlValue, Toml};
 
 #[derive(Default, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Channel {
@@ -65,7 +66,7 @@ impl ConfigFile {
                         "Expected a boolean for `download-gccjit`",
                     );
                 }
-                _ => return failed_config_parsing(config_file, &format!("Unknown key `{}`", key)),
+                _ => return failed_config_parsing(config_file, &format!("Unknown key `{key}`")),
             }
         }
         match (config.gcc_path.as_mut(), config.download_gccjit) {
@@ -85,9 +86,7 @@ impl ConfigFile {
                 let path = Path::new(gcc_path);
                 *gcc_path = path
                     .canonicalize()
-                    .map_err(|err| {
-                        format!("Failed to get absolute path of `{}`: {:?}", gcc_path, err)
-                    })?
+                    .map_err(|err| format!("Failed to get absolute path of `{gcc_path}`: {err:?}"))?
                     .display()
                     .to_string();
             }
@@ -97,7 +96,7 @@ impl ConfigFile {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct ConfigInfo {
     pub target: String,
     pub target_triple: String,
@@ -111,7 +110,7 @@ pub struct ConfigInfo {
     pub sysroot_panic_abort: bool,
     pub cg_backend_path: String,
     pub sysroot_path: String,
-    pub gcc_path: String,
+    pub gcc_path: Option<String>,
     config_file: Option<String>,
     // This is used in particular in rust compiler bootstrap because it doesn't run at the root
     // of the `cg_gcc` folder, making it complicated for us to get access to local files we need
@@ -122,6 +121,7 @@ pub struct ConfigInfo {
     pub no_download: bool,
     pub no_default_features: bool,
     pub backend: Option<String>,
+    pub features: Vec<String>,
 }
 
 impl ConfigInfo {
@@ -132,6 +132,13 @@ impl ConfigInfo {
         args: &mut impl Iterator<Item = String>,
     ) -> Result<bool, String> {
         match arg {
+            "--features" => {
+                if let Some(arg) = args.next() {
+                    self.features.push(arg);
+                } else {
+                    return Err("Expected a value after `--features`, found nothing".to_string());
+                }
+            }
             "--target" => {
                 if let Some(arg) = args.next() {
                     self.target = arg;
@@ -164,6 +171,14 @@ impl ConfigInfo {
             "--release-sysroot" => self.sysroot_release_channel = true,
             "--release" => self.channel = Channel::Release,
             "--sysroot-panic-abort" => self.sysroot_panic_abort = true,
+            "--gcc-path" => match args.next() {
+                Some(arg) if !arg.is_empty() => {
+                    self.gcc_path = Some(arg);
+                }
+                _ => {
+                    return Err("Expected a value after `--gcc-path`, found nothing".to_string());
+                }
+            },
             "--cg_gcc-path" => match args.next() {
                 Some(arg) if !arg.is_empty() => {
                     self.cg_gcc_path = Some(arg.into());
@@ -227,7 +242,7 @@ impl ConfigInfo {
         let libgccjit_so = output_dir.join(libgccjit_so_name);
         if !libgccjit_so.is_file() && !self.no_download {
             // Download time!
-            let tempfile_name = format!("{}.download", libgccjit_so_name);
+            let tempfile_name = format!("{libgccjit_so_name}.download");
             let tempfile = output_dir.join(&tempfile_name);
             let is_in_ci = std::env::var("GITHUB_ACTIONS").is_ok();
 
@@ -245,14 +260,15 @@ impl ConfigInfo {
                 )
             })?;
 
-            println!("Downloaded libgccjit.so version {} successfully!", commit);
+            println!("Downloaded libgccjit.so version {commit} successfully!");
             // We need to create a link named `libgccjit.so.0` because that's what the linker is
             // looking for.
-            create_symlink(&libgccjit_so, output_dir.join(&format!("{}.0", libgccjit_so_name)))?;
+            create_symlink(&libgccjit_so, output_dir.join(format!("{libgccjit_so_name}.0")))?;
         }
 
-        self.gcc_path = output_dir.display().to_string();
-        println!("Using `{}` as path for libgccjit", self.gcc_path);
+        let gcc_path = output_dir.display().to_string();
+        println!("Using `{gcc_path}` as path for libgccjit");
+        self.gcc_path = Some(gcc_path);
         Ok(())
     }
 
@@ -264,6 +280,14 @@ impl ConfigInfo {
     }
 
     pub fn setup_gcc_path(&mut self) -> Result<(), String> {
+        // If the user used the `--gcc-path` option, no need to look at `config.toml` content
+        // since we already have everything we need.
+        if let Some(gcc_path) = &self.gcc_path {
+            println!(
+                "`--gcc-path` was provided, ignoring config file. Using `{gcc_path}` as path for libgccjit"
+            );
+            return Ok(());
+        }
         let config_file = match self.config_file.as_deref() {
             Some(config_file) => config_file.into(),
             None => self.compute_path("config.toml"),
@@ -274,12 +298,15 @@ impl ConfigInfo {
             self.download_gccjit_if_needed()?;
             return Ok(());
         }
-        self.gcc_path = match gcc_path {
-            Some(path) => path,
-            None => {
-                return Err(format!("missing `gcc-path` value from `{}`", config_file.display(),));
-            }
+        let Some(gcc_path) = gcc_path else {
+            return Err(format!("missing `gcc-path` value from `{}`", config_file.display()));
         };
+        println!(
+            "GCC path retrieved from `{}`. Using `{}` as path for libgccjit",
+            config_file.display(),
+            gcc_path
+        );
+        self.gcc_path = Some(gcc_path);
         Ok(())
     }
 
@@ -290,10 +317,17 @@ impl ConfigInfo {
     ) -> Result<(), String> {
         env.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
 
-        if self.gcc_path.is_empty() && !use_system_gcc {
-            self.setup_gcc_path()?;
-        }
-        env.insert("GCC_PATH".to_string(), self.gcc_path.clone());
+        let gcc_path = if !use_system_gcc {
+            if self.gcc_path.is_none() {
+                self.setup_gcc_path()?;
+            }
+            self.gcc_path.clone().expect(
+                "The config module should have emitted an error if the GCC path wasn't provided",
+            )
+        } else {
+            String::new()
+        };
+        env.insert("GCC_PATH".to_string(), gcc_path.clone());
 
         if self.cargo_target_dir.is_empty() {
             match env.get("CARGO_TARGET_DIR").filter(|dir| !dir.is_empty()) {
@@ -306,7 +340,7 @@ impl ConfigInfo {
         self.dylib_ext = match os_name.as_str() {
             "Linux" => "so",
             "Darwin" => "dylib",
-            os => return Err(format!("unsupported OS `{}`", os)),
+            os => return Err(format!("unsupported OS `{os}`")),
         }
         .to_string();
         let rustc = match env.get("RUSTC") {
@@ -318,11 +352,6 @@ impl ConfigInfo {
             None => return Err("no host found".to_string()),
         };
 
-        if self.target_triple.is_empty() {
-            if let Some(overwrite) = env.get("OVERWRITE_TARGET_TRIPLE") {
-                self.target_triple = overwrite.clone();
-            }
-        }
         if self.target_triple.is_empty() {
             self.target_triple = self.host_triple.clone();
         }
@@ -341,7 +370,7 @@ impl ConfigInfo {
         }
 
         let current_dir =
-            std_env::current_dir().map_err(|error| format!("`current_dir` failed: {:?}", error))?;
+            std_env::current_dir().map_err(|error| format!("`current_dir` failed: {error:?}"))?;
         let channel = if self.channel == Channel::Release {
             "release"
         } else if let Some(channel) = env.get("CHANNEL") {
@@ -354,15 +383,15 @@ impl ConfigInfo {
         self.cg_backend_path = current_dir
             .join("target")
             .join(channel)
-            .join(&format!("librustc_codegen_gcc.{}", self.dylib_ext))
+            .join(format!("librustc_codegen_gcc.{}", self.dylib_ext))
             .display()
             .to_string();
         self.sysroot_path =
-            current_dir.join(&get_sysroot_dir()).join("sysroot").display().to_string();
+            current_dir.join(get_sysroot_dir()).join("sysroot").display().to_string();
         if let Some(backend) = &self.backend {
             // This option is only used in the rust compiler testsuite. The sysroot is handled
             // by its build system directly so no need to set it ourselves.
-            rustflags.push(format!("-Zcodegen-backend={}", backend));
+            rustflags.push(format!("-Zcodegen-backend={backend}"));
         } else {
             rustflags.extend_from_slice(&[
                 "--sysroot".to_string(),
@@ -372,11 +401,13 @@ impl ConfigInfo {
         }
 
         // This environment variable is useful in case we want to change options of rustc commands.
+        // We have a different environment variable than RUSTFLAGS to make sure those flags are
+        // only sent to rustc_codegen_gcc and not the LLVM backend.
         if let Some(cg_rustflags) = env.get("CG_RUSTFLAGS") {
-            rustflags.extend_from_slice(&split_args(&cg_rustflags)?);
+            rustflags.extend_from_slice(&split_args(cg_rustflags)?);
         }
         if let Some(test_flags) = env.get("TEST_FLAGS") {
-            rustflags.extend_from_slice(&split_args(&test_flags)?);
+            rustflags.extend_from_slice(&split_args(test_flags)?);
         }
 
         if let Some(linker) = linker {
@@ -399,13 +430,13 @@ impl ConfigInfo {
         env.insert("RUSTC_LOG".to_string(), "warn".to_string());
 
         let sysroot = current_dir
-            .join(&get_sysroot_dir())
-            .join(&format!("sysroot/lib/rustlib/{}/lib", self.target_triple));
+            .join(get_sysroot_dir())
+            .join(format!("sysroot/lib/rustlib/{}/lib", self.target_triple));
         let ld_library_path = format!(
             "{target}:{sysroot}:{gcc_path}",
             target = self.cargo_target_dir,
             sysroot = sysroot.display(),
-            gcc_path = self.gcc_path,
+            gcc_path = gcc_path,
         );
         env.insert("LIBRARY_PATH".to_string(), ld_library_path.clone());
         env.insert("LD_LIBRARY_PATH".to_string(), ld_library_path.clone());
@@ -442,6 +473,7 @@ impl ConfigInfo {
     pub fn show_usage() {
         println!(
             "\
+    --features [arg]       : Add a new feature [arg]
     --target-triple [arg]  : Set the target triple to [arg]
     --target [arg]         : Set the target to [arg]
     --out-dir              : Location where the files will be generated
@@ -449,6 +481,7 @@ impl ConfigInfo {
     --release-sysroot      : Build sysroot in release mode
     --sysroot-panic-abort  : Build the sysroot without unwinding support
     --config-file          : Location of the config file to be used
+    --gcc-path             : Location of the GCC root folder
     --cg_gcc-path          : Location of the rustc_codegen_gcc root folder (used
                              when ran from another directory)
     --no-default-features  : Add `--no-default-features` flag to cargo commands
@@ -464,7 +497,7 @@ fn download_gccjit(
     with_progress_bar: bool,
 ) -> Result<(), String> {
     let url = if std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
-        format!("https://github.com/rust-lang/gcc/releases/download/master-{}/libgccjit.so", commit)
+        format!("https://github.com/rust-lang/gcc/releases/download/master-{commit}/libgccjit.so")
     } else {
         eprintln!(
             "\
@@ -477,7 +510,7 @@ to `download-gccjit = false` and set `gcc-path` to the appropriate directory."
         ));
     };
 
-    println!("Downloading `{}`...", url);
+    println!("Downloading `{url}`...");
 
     // Try curl. If that fails and we are on windows, fallback to PowerShell.
     let mut ret = run_command_with_output(
@@ -497,7 +530,7 @@ to `download-gccjit = false` and set `gcc-path` to the appropriate directory."
             if with_progress_bar { &"--progress-bar" } else { &"-s" },
             &url.as_str(),
         ],
-        Some(&output_dir),
+        Some(output_dir),
     );
     if ret.is_err() && cfg!(windows) {
         eprintln!("Fallback to PowerShell");
@@ -508,12 +541,11 @@ to `download-gccjit = false` and set `gcc-path` to the appropriate directory."
                 &"-Command",
                 &"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;",
                 &format!(
-                    "(New-Object System.Net.WebClient).DownloadFile('{}', '{}')",
-                    url, tempfile_name,
+                    "(New-Object System.Net.WebClient).DownloadFile('{url}', '{tempfile_name}')",
                 )
                 .as_str(),
             ],
-            Some(&output_dir),
+            Some(output_dir),
         );
     }
     ret

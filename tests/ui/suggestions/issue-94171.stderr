@@ -6,8 +6,9 @@ LL | (; {`
    |
 help: Unicode character '`' (Grave Accent) looks like ''' (Single Quote), but it is not
    |
-LL | (; {'
-   |     ~
+LL - (; {`
+LL + (; {'
+   |
 
 error: mismatched closing delimiter: `]`
   --> $DIR/issue-94171.rs:1:5
@@ -21,16 +22,14 @@ error: this file contains an unclosed delimiter
   --> $DIR/issue-94171.rs:5:52
    |
 LL | fn L(]{match
-   |      -- unclosed delimiter
-   |      |
-   |      missing open `[` for this delimiter
+   |       - unclosed delimiter
 LL | (; {`
    | -  - unclosed delimiter
    | |
    | unclosed delimiter
 ...
 LL |
-   |                                                    ^
+   |                                                   ^
 
 error: aborting due to 3 previous errors
 

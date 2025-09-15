@@ -1,15 +1,15 @@
-use crate::mir::traversal::Postorder;
-use crate::mir::{BasicBlock, BasicBlockData, Terminator, TerminatorKind, START_BLOCK};
+use std::sync::OnceLock;
 
-use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::graph;
-use rustc_data_structures::graph::dominators::{dominators, Dominators};
+use rustc_data_structures::graph::dominators::{Dominators, dominators};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_data_structures::sync::OnceLock;
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use smallvec::SmallVec;
+
+use crate::mir::traversal::Postorder;
+use crate::mir::{BasicBlock, BasicBlockData, START_BLOCK};
 
 #[derive(Clone, TyEncodable, TyDecodable, Debug, HashStable, TypeFoldable, TypeVisitable)]
 pub struct BasicBlocks<'tcx> {
@@ -18,15 +18,19 @@ pub struct BasicBlocks<'tcx> {
 }
 
 // Typically 95%+ of basic blocks have 4 or fewer predecessors.
-pub type Predecessors = IndexVec<BasicBlock, SmallVec<[BasicBlock; 4]>>;
+type Predecessors = IndexVec<BasicBlock, SmallVec<[BasicBlock; 4]>>;
 
-pub type SwitchSources = FxHashMap<(BasicBlock, BasicBlock), SmallVec<[Option<u128>; 1]>>;
+#[derive(Debug, Clone, Copy)]
+pub enum SwitchTargetValue {
+    // A normal switch value.
+    Normal(u128),
+    // The final "otherwise" fallback value.
+    Otherwise,
+}
 
 #[derive(Clone, Default, Debug)]
 struct Cache {
     predecessors: OnceLock<Predecessors>,
-    switch_sources: OnceLock<SwitchSources>,
-    is_cyclic: OnceLock<bool>,
     reverse_postorder: OnceLock<Vec<BasicBlock>>,
     dominators: OnceLock<Dominators<BasicBlock>>,
 }
@@ -35,12 +39,6 @@ impl<'tcx> BasicBlocks<'tcx> {
     #[inline]
     pub fn new(basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>) -> Self {
         BasicBlocks { basic_blocks, cache: Cache::default() }
-    }
-
-    /// Returns true if control-flow graph contains a cycle reachable from the `START_BLOCK`.
-    #[inline]
-    pub fn is_cfg_cyclic(&self) -> bool {
-        *self.cache.is_cyclic.get_or_init(|| graph::is_cyclic(self))
     }
 
     pub fn dominators(&self) -> &Dominators<BasicBlock> {
@@ -71,30 +69,9 @@ impl<'tcx> BasicBlocks<'tcx> {
     #[inline]
     pub fn reverse_postorder(&self) -> &[BasicBlock] {
         self.cache.reverse_postorder.get_or_init(|| {
-            let mut rpo: Vec<_> = Postorder::new(&self.basic_blocks, START_BLOCK).collect();
+            let mut rpo: Vec<_> = Postorder::new(&self.basic_blocks, START_BLOCK, None).collect();
             rpo.reverse();
             rpo
-        })
-    }
-
-    /// `switch_sources()[&(target, switch)]` returns a list of switch
-    /// values that lead to a `target` block from a `switch` block.
-    #[inline]
-    pub fn switch_sources(&self) -> &SwitchSources {
-        self.cache.switch_sources.get_or_init(|| {
-            let mut switch_sources: SwitchSources = FxHashMap::default();
-            for (bb, data) in self.basic_blocks.iter_enumerated() {
-                if let Some(Terminator {
-                    kind: TerminatorKind::SwitchInt { targets, .. }, ..
-                }) = &data.terminator
-                {
-                    for (value, target) in targets.iter() {
-                        switch_sources.entry((target, bb)).or_default().push(Some(value));
-                    }
-                    switch_sources.entry((targets.otherwise(), bb)).or_default().push(None);
-                }
-            }
-            switch_sources
         })
     }
 
@@ -170,6 +147,7 @@ impl<'tcx> graph::Predecessors for BasicBlocks<'tcx> {
     }
 }
 
+// Done here instead of in `structural_impls.rs` because `Cache` is private, as is `basic_blocks`.
 TrivialTypeTraversalImpls! { Cache }
 
 impl<S: Encoder> Encodable<S> for Cache {

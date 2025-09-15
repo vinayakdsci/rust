@@ -1,10 +1,9 @@
 #![deny(unused_variables)]
 
 use anyhow::{Context, Error};
-use build_helper::stage0_parser::{parse_stage0_file, Stage0Config, VersionMetadata};
+use build_helper::stage0_parser::{Stage0Config, VersionMetadata, parse_stage0_file};
 use curl::easy::Easy;
 use indexmap::IndexMap;
-use std::collections::HashMap;
 
 const PATH: &str = "src/stage0";
 const COMPILER_COMPONENTS: &[&str] = &["rustc", "rust-std", "cargo", "clippy-preview"];
@@ -51,7 +50,7 @@ impl Tool {
 #
 # All changes below this comment will be overridden the next time the
 # tool is executed.
-            "#;
+"#;
 
         let mut file_content = String::new();
 
@@ -62,36 +61,35 @@ impl Tool {
             artifacts_server,
             artifacts_with_llvm_assertions_server,
             git_merge_commit_email,
-            git_repository,
             nightly_branch,
         } = &self.config;
 
-        file_content.push_str(&format!("dist_server={}", dist_server));
-        file_content.push_str(&format!("\nartifacts_server={}", artifacts_server));
+        file_content.push_str(&format!("dist_server={}\n", dist_server));
+        file_content.push_str(&format!("artifacts_server={}\n", artifacts_server));
         file_content.push_str(&format!(
-            "\nartifacts_with_llvm_assertions_server={}",
+            "artifacts_with_llvm_assertions_server={}\n",
             artifacts_with_llvm_assertions_server
         ));
-        file_content.push_str(&format!("\ngit_merge_commit_email={}", git_merge_commit_email));
-        file_content.push_str(&format!("\ngit_repository={}", git_repository));
-        file_content.push_str(&format!("\nnightly_branch={}", nightly_branch));
+        file_content.push_str(&format!("git_merge_commit_email={}\n", git_merge_commit_email));
+        file_content.push_str(&format!("nightly_branch={}\n", nightly_branch));
 
-        file_content.push_str("\n\n");
+        file_content.push_str("\n");
         file_content.push_str(COMMENTS);
+        file_content.push_str("\n");
 
         let compiler = self.detect_compiler()?;
-        file_content.push_str(&format!("\ncompiler_date={}", compiler.date));
-        file_content.push_str(&format!("\ncompiler_version={}", compiler.version));
+        file_content.push_str(&format!("compiler_date={}\n", compiler.date));
+        file_content.push_str(&format!("compiler_version={}\n", compiler.version));
 
         if let Some(rustfmt) = self.detect_rustfmt()? {
-            file_content.push_str(&format!("\nrustfmt_date={}", rustfmt.date));
-            file_content.push_str(&format!("\nrustfmt_version={}", rustfmt.version));
+            file_content.push_str(&format!("rustfmt_date={}\n", rustfmt.date));
+            file_content.push_str(&format!("rustfmt_version={}\n", rustfmt.version));
         }
 
         file_content.push_str("\n");
 
         for (key, value) in self.checksums {
-            file_content.push_str(&format!("\n{}={}", key, value));
+            file_content.push_str(&format!("{}={}\n", key, value));
         }
 
         std::fs::write(PATH, file_content)?;
@@ -187,7 +185,11 @@ fn fetch_manifest(
         format!("{}/dist/channel-rust-{}.toml", config.dist_server, channel)
     };
 
-    Ok(toml::from_slice(&http_get(&url)?)?)
+    // FIXME: on newer `toml` (>= `0.9.*`), use `toml::from_slice`. For now, we use the most recent
+    // `toml` available in-tree which is `0.8.*`, so we have to do an additional dance here.
+    let response = http_get(&url)?;
+    let response = String::from_utf8(response)?;
+    Ok(toml::from_str(&response)?)
 }
 
 fn http_get(url: &str) -> Result<Vec<u8>, Error> {
@@ -216,13 +218,13 @@ enum Channel {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Manifest {
     date: String,
-    pkg: HashMap<String, ManifestPackage>,
+    pkg: IndexMap<String, ManifestPackage>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ManifestPackage {
     version: String,
-    target: HashMap<String, ManifestTargetPackage>,
+    target: IndexMap<String, ManifestTargetPackage>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

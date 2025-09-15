@@ -6,7 +6,7 @@ use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 use rustc_middle::ty::print::with_forced_trimmed_paths;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 use super::UNNECESSARY_FALLIBLE_CONVERSIONS;
 
@@ -165,7 +165,7 @@ pub(super) fn check_method(cx: &LateContext<'_>, expr: &Expr<'_>) {
 pub(super) fn check_function(cx: &LateContext<'_>, expr: &Expr<'_>, callee: &Expr<'_>) {
     if let ExprKind::Path(ref qpath) = callee.kind
         && let Some(item_def_id) = cx.qpath_res(qpath, callee.hir_id).opt_def_id()
-        && let Some(trait_def_id) = cx.tcx.trait_of_item(item_def_id)
+        && let Some(trait_def_id) = cx.tcx.trait_of_assoc(item_def_id)
     {
         let qpath_spans = match qpath {
             QPath::Resolved(_, path) => {

@@ -2,20 +2,26 @@
 
 use crate::helpers::mod_path_to_ast;
 use either::Either;
-use hir::{AsAssocItem, HirDisplay, ImportPathConfig, ModuleDef, SemanticsScope};
+use hir::{
+    AsAssocItem, HirDisplay, HirFileId, ImportPathConfig, ModuleDef, SemanticsScope,
+    prettify_macro_expansion,
+};
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
+use span::Edition;
 use syntax::{
-    ast::{self, make, AstNode, HasGenericArgs},
-    ted, SyntaxNode,
+    NodeOrToken, SyntaxNode,
+    ast::{self, AstNode, HasGenericArgs, make},
+    syntax_editor::{self, SyntaxEditor},
 };
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct AstSubsts {
     types_and_consts: Vec<TypeOrConst>,
     lifetimes: Vec<ast::LifetimeArg>,
 }
 
+#[derive(Debug)]
 enum TypeOrConst {
     Either(ast::TypeArg), // indistinguishable type or const param
     Const(ast::ConstArg),
@@ -31,7 +37,7 @@ type DefaultedParam = Either<hir::TypeParam, hir::ConstParam>;
 /// block), you generally want to appropriately qualify the names, and sometimes
 /// you might want to substitute generic parameters as well:
 ///
-/// ```
+/// ```ignore
 /// mod x {
 ///   pub struct A<V>;
 ///   pub trait T<U> { fn foo(&self, _: U) -> A<U>; }
@@ -123,15 +129,37 @@ impl<'a> PathTransform<'a> {
         }
     }
 
-    pub fn apply(&self, syntax: &SyntaxNode) {
+    #[must_use]
+    pub fn apply(&self, syntax: &SyntaxNode) -> SyntaxNode {
         self.build_ctx().apply(syntax)
     }
 
-    pub fn apply_all<'b>(&self, nodes: impl IntoIterator<Item = &'b SyntaxNode>) {
+    #[must_use]
+    pub fn apply_all<'b>(
+        &self,
+        nodes: impl IntoIterator<Item = &'b SyntaxNode>,
+    ) -> Vec<SyntaxNode> {
         let ctx = self.build_ctx();
-        for node in nodes {
-            ctx.apply(node);
+        nodes.into_iter().map(|node| ctx.apply(&node.clone())).collect()
+    }
+
+    fn prettify_target_node(&self, node: SyntaxNode) -> SyntaxNode {
+        match self.target_scope.file_id() {
+            HirFileId::FileId(_) => node,
+            HirFileId::MacroFile(file_id) => {
+                let db = self.target_scope.db;
+                prettify_macro_expansion(
+                    db,
+                    node,
+                    &db.expansion_span_map(file_id),
+                    self.target_scope.module().krate().into(),
+                )
+            }
         }
+    }
+
+    fn prettify_target_ast<N: AstNode>(&self, node: N) -> N {
+        N::cast(self.prettify_target_node(node.syntax().clone())).unwrap()
     }
 
     fn build_ctx(&self) -> Ctx<'a> {
@@ -146,6 +174,7 @@ impl<'a> PathTransform<'a> {
         let mut type_substs: FxHashMap<hir::TypeParam, ast::Type> = Default::default();
         let mut const_substs: FxHashMap<hir::ConstParam, SyntaxNode> = Default::default();
         let mut defaulted_params: Vec<DefaultedParam> = Default::default();
+        let target_edition = target_module.krate().edition(self.source_scope.db);
         self.generic_def
             .into_iter()
             .flat_map(|it| it.type_or_const_params(db))
@@ -160,59 +189,63 @@ impl<'a> PathTransform<'a> {
             .for_each(|(k, v)| match (k.split(db), v) {
                 (Either::Right(k), Some(TypeOrConst::Either(v))) => {
                     if let Some(ty) = v.ty() {
-                        type_substs.insert(k, ty);
+                        type_substs.insert(k, self.prettify_target_ast(ty));
                     }
                 }
                 (Either::Right(k), None) => {
-                    if let Some(default) = k.default(db) {
-                        if let Some(default) =
+                    if let Some(default) = k.default(db)
+                        && let Some(default) =
                             &default.display_source_code(db, source_module.into(), false).ok()
-                        {
-                            type_substs.insert(k, make::ty(default).clone_for_update());
-                            defaulted_params.push(Either::Left(k));
-                        }
+                    {
+                        type_substs.insert(k, make::ty(default).clone_for_update());
+                        defaulted_params.push(Either::Left(k));
                     }
                 }
                 (Either::Left(k), Some(TypeOrConst::Either(v))) => {
                     if let Some(ty) = v.ty() {
-                        const_substs.insert(k, ty.syntax().clone());
+                        const_substs.insert(k, self.prettify_target_node(ty.syntax().clone()));
                     }
                 }
                 (Either::Left(k), Some(TypeOrConst::Const(v))) => {
                     if let Some(expr) = v.expr() {
                         // FIXME: expressions in curly brackets can cause ambiguity after insertion
                         // (e.g. `N * 2` -> `{1 + 1} * 2`; it's unclear whether `{1 + 1}`
-                        // is a standalone statement or a part of another expresson)
+                        // is a standalone statement or a part of another expression)
                         // and sometimes require slight modifications; see
                         // https://doc.rust-lang.org/reference/statements.html#expression-statements
                         // (default values in curly brackets can cause the same problem)
-                        const_substs.insert(k, expr.syntax().clone());
+                        const_substs.insert(k, self.prettify_target_node(expr.syntax().clone()));
                     }
                 }
                 (Either::Left(k), None) => {
-                    if let Some(default) = k.default(db) {
-                        if let Some(default) = default.expr() {
-                            const_substs.insert(k, default.syntax().clone_for_update());
-                            defaulted_params.push(Either::Right(k));
-                        }
+                    if let Some(default) =
+                        k.default(db, target_module.krate().to_display_target(db))
+                        && let Some(default) = default.expr()
+                    {
+                        const_substs.insert(k, default.syntax().clone_for_update());
+                        defaulted_params.push(Either::Right(k));
                     }
                 }
                 _ => (), // ignore mismatching params
             });
+        // No need to prettify lifetimes, there's nothing to prettify.
         let lifetime_substs: FxHashMap<_, _> = self
             .generic_def
             .into_iter()
             .flat_map(|it| it.lifetime_params(db))
             .zip(self.substs.lifetimes.clone())
-            .filter_map(|(k, v)| Some((k.name(db).display(db.upcast()).to_string(), v.lifetime()?)))
+            .filter_map(|(k, v)| {
+                Some((k.name(db).display(db, target_edition).to_string(), v.lifetime()?))
+            })
             .collect();
-        let ctx = Ctx {
+        let mut ctx = Ctx {
             type_substs,
             const_substs,
             lifetime_substs,
             target_module,
             source_scope: self.source_scope,
             same_self_type: self.target_scope.has_same_self_type(self.source_scope),
+            target_edition,
         };
         ctx.transform_default_values(defaulted_params);
         ctx
@@ -226,6 +259,7 @@ struct Ctx<'a> {
     target_module: hir::Module,
     source_scope: &'a SemanticsScope<'a>,
     same_self_type: bool,
+    target_edition: Edition,
 }
 
 fn preorder_rev(item: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
@@ -240,54 +274,87 @@ fn preorder_rev(item: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
 }
 
 impl Ctx<'_> {
-    fn apply(&self, item: &SyntaxNode) {
+    fn apply(&self, item: &SyntaxNode) -> SyntaxNode {
         // `transform_path` may update a node's parent and that would break the
         // tree traversal. Thus all paths in the tree are collected into a vec
         // so that such operation is safe.
-        let paths = preorder_rev(item).filter_map(ast::Path::cast).collect::<Vec<_>>();
-        for path in paths {
-            self.transform_path(path);
-        }
-
-        preorder_rev(item).filter_map(ast::Lifetime::cast).for_each(|lifetime| {
+        let item = self.transform_path(item).clone_subtree();
+        let mut editor = SyntaxEditor::new(item.clone());
+        preorder_rev(&item).filter_map(ast::Lifetime::cast).for_each(|lifetime| {
             if let Some(subst) = self.lifetime_substs.get(&lifetime.syntax().text().to_string()) {
-                ted::replace(lifetime.syntax(), subst.clone_subtree().clone_for_update().syntax());
+                editor
+                    .replace(lifetime.syntax(), subst.clone_subtree().clone_for_update().syntax());
             }
         });
+
+        editor.finish().new_root().clone()
     }
 
-    fn transform_default_values(&self, defaulted_params: Vec<DefaultedParam>) {
+    fn transform_default_values(&mut self, defaulted_params: Vec<DefaultedParam>) {
         // By now the default values are simply copied from where they are declared
         // and should be transformed. As any value is allowed to refer to previous
         // generic (both type and const) parameters, they should be all iterated left-to-right.
         for param in defaulted_params {
-            let value = match param {
-                Either::Left(k) => self.type_substs.get(&k).unwrap().syntax(),
-                Either::Right(k) => self.const_substs.get(&k).unwrap(),
+            let value = match &param {
+                Either::Left(k) => self.type_substs.get(k).unwrap().syntax(),
+                Either::Right(k) => self.const_substs.get(k).unwrap(),
             };
             // `transform_path` may update a node's parent and that would break the
             // tree traversal. Thus all paths in the tree are collected into a vec
             // so that such operation is safe.
-            let paths = preorder_rev(value).filter_map(ast::Path::cast).collect::<Vec<_>>();
-            for path in paths {
-                self.transform_path(path);
+            let new_value = self.transform_path(value);
+            match param {
+                Either::Left(k) => {
+                    self.type_substs.insert(k, ast::Type::cast(new_value.clone()).unwrap());
+                }
+                Either::Right(k) => {
+                    self.const_substs.insert(k, new_value.clone());
+                }
             }
         }
     }
 
-    fn transform_path(&self, path: ast::Path) -> Option<()> {
+    fn transform_path(&self, path: &SyntaxNode) -> SyntaxNode {
+        fn find_child_paths(root_path: &SyntaxNode) -> Vec<ast::Path> {
+            let mut result = Vec::new();
+            for child in root_path.children() {
+                if let Some(child_path) = ast::Path::cast(child.clone()) {
+                    result.push(child_path);
+                } else {
+                    result.extend(find_child_paths(&child));
+                }
+            }
+            result
+        }
+        let root_path = path.clone_subtree();
+        let result = find_child_paths(&root_path);
+        let mut editor = SyntaxEditor::new(root_path.clone());
+        for sub_path in result {
+            let new = self.transform_path(sub_path.syntax());
+            editor.replace(sub_path.syntax(), new);
+        }
+        let update_sub_item = editor.finish().new_root().clone().clone_subtree();
+        let item = find_child_paths(&update_sub_item);
+        let mut editor = SyntaxEditor::new(update_sub_item);
+        for sub_path in item {
+            self.transform_path_(&mut editor, &sub_path);
+        }
+        editor.finish().new_root().clone()
+    }
+
+    fn transform_path_(&self, editor: &mut SyntaxEditor, path: &ast::Path) -> Option<()> {
         if path.qualifier().is_some() {
             return None;
         }
-        if path.segment().map_or(false, |s| {
-            s.param_list().is_some() || (s.self_token().is_some() && path.parent_path().is_none())
+        if path.segment().is_some_and(|s| {
+            s.parenthesized_arg_list().is_some()
+                || (s.self_token().is_some() && path.parent_path().is_none())
         }) {
             // don't try to qualify `Fn(Foo) -> Bar` paths, they are in prelude anyway
             // don't try to qualify sole `self` either, they are usually locals, but are returned as modules due to namespace clashing
             return None;
         }
-
-        let resolution = self.source_scope.speculative_resolve(&path)?;
+        let resolution = self.source_scope.speculative_resolve(path)?;
 
         match resolution {
             hir::PathResolution::TypeParam(tp) => {
@@ -312,13 +379,14 @@ impl Ctx<'_> {
                                 prefer_no_std: false,
                                 prefer_prelude: true,
                                 prefer_absolute: false,
+                                allow_unstable: true,
                             };
                             let found_path = self.target_module.find_path(
-                                self.source_scope.db.upcast(),
+                                self.source_scope.db,
                                 hir::ModuleDef::Trait(trait_ref),
                                 cfg,
                             )?;
-                            match make::ty_path(mod_path_to_ast(&found_path)) {
+                            match make::ty_path(mod_path_to_ast(&found_path, self.target_edition)) {
                                 ast::Type::PathType(path_ty) => Some(path_ty),
                                 _ => None,
                             }
@@ -326,14 +394,30 @@ impl Ctx<'_> {
 
                         let segment = make::path_segment_ty(subst.clone(), trait_ref);
                         let qualified = make::path_from_segments(std::iter::once(segment), false);
-                        ted::replace(path.syntax(), qualified.clone_for_update().syntax());
+                        editor.replace(path.syntax(), qualified.clone_for_update().syntax());
                     } else if let Some(path_ty) = ast::PathType::cast(parent) {
-                        ted::replace(
-                            path_ty.syntax(),
-                            subst.clone_subtree().clone_for_update().syntax(),
-                        );
+                        let old = path_ty.syntax();
+
+                        if old.parent().is_some() {
+                            editor.replace(old, subst.clone_subtree().clone_for_update().syntax());
+                        } else {
+                            // Some `path_ty` has no parent, especially ones made for default value
+                            // of type parameters.
+                            // In this case, `ted` cannot replace `path_ty` with `subst` directly.
+                            // So, just replace its children as long as the `subst` is the same type.
+                            let new = subst.clone_subtree().clone_for_update();
+                            if !matches!(new, ast::Type::PathType(..)) {
+                                return None;
+                            }
+                            let start = path_ty.syntax().first_child().map(NodeOrToken::Node)?;
+                            let end = path_ty.syntax().last_child().map(NodeOrToken::Node)?;
+                            editor.replace_all(
+                                start..=end,
+                                new.syntax().children().map(NodeOrToken::Node).collect::<Vec<_>>(),
+                            );
+                        }
                     } else {
-                        ted::replace(
+                        editor.replace(
                             path.syntax(),
                             subst.clone_subtree().clone_for_update().syntax(),
                         );
@@ -341,35 +425,44 @@ impl Ctx<'_> {
                 }
             }
             hir::PathResolution::Def(def) if def.as_assoc_item(self.source_scope.db).is_none() => {
-                if let hir::ModuleDef::Trait(_) = def {
-                    if matches!(path.segment()?.kind()?, ast::PathSegmentKind::Type { .. }) {
-                        // `speculative_resolve` resolves segments like `<T as
-                        // Trait>` into `Trait`, but just the trait name should
-                        // not be used as the replacement of the original
-                        // segment.
-                        return None;
-                    }
+                if let hir::ModuleDef::Trait(_) = def
+                    && matches!(path.segment()?.kind()?, ast::PathSegmentKind::Type { .. })
+                {
+                    // `speculative_resolve` resolves segments like `<T as
+                    // Trait>` into `Trait`, but just the trait name should
+                    // not be used as the replacement of the original
+                    // segment.
+                    return None;
                 }
 
                 let cfg = ImportPathConfig {
                     prefer_no_std: false,
                     prefer_prelude: true,
                     prefer_absolute: false,
+                    allow_unstable: true,
                 };
-                let found_path =
-                    self.target_module.find_path(self.source_scope.db.upcast(), def, cfg)?;
-                let res = mod_path_to_ast(&found_path).clone_for_update();
-                if let Some(args) = path.segment().and_then(|it| it.generic_arg_list()) {
-                    if let Some(segment) = res.segment() {
-                        let old = segment.get_or_create_generic_arg_list();
-                        ted::replace(old.syntax(), args.clone_subtree().syntax().clone_for_update())
+                let found_path = self.target_module.find_path(self.source_scope.db, def, cfg)?;
+                let res = mod_path_to_ast(&found_path, self.target_edition).clone_for_update();
+                let mut res_editor = SyntaxEditor::new(res.syntax().clone_subtree());
+                if let Some(args) = path.segment().and_then(|it| it.generic_arg_list())
+                    && let Some(segment) = res.segment()
+                {
+                    if let Some(old) = segment.generic_arg_list() {
+                        res_editor
+                            .replace(old.syntax(), args.clone_subtree().syntax().clone_for_update())
+                    } else {
+                        res_editor.insert(
+                            syntax_editor::Position::last_child_of(segment.syntax()),
+                            args.clone_subtree().syntax().clone_for_update(),
+                        );
                     }
                 }
-                ted::replace(path.syntax(), res.syntax())
+                let res = res_editor.finish().new_root().clone();
+                editor.replace(path.syntax().clone(), res);
             }
             hir::PathResolution::ConstParam(cp) => {
                 if let Some(subst) = self.const_substs.get(&cp) {
-                    ted::replace(path.syntax(), subst.clone_subtree().clone_for_update());
+                    editor.replace(path.syntax(), subst.clone_subtree().clone_for_update());
                 }
             }
             hir::PathResolution::SelfType(imp) => {
@@ -388,28 +481,31 @@ impl Ctx<'_> {
                     .ok()?;
                 let ast_ty = make::ty(ty_str).clone_for_update();
 
-                if let Some(adt) = ty.as_adt() {
-                    if let ast::Type::PathType(path_ty) = &ast_ty {
-                        let cfg = ImportPathConfig {
-                            prefer_no_std: false,
-                            prefer_prelude: true,
-                            prefer_absolute: false,
-                        };
-                        let found_path = self.target_module.find_path(
-                            self.source_scope.db.upcast(),
-                            ModuleDef::from(adt),
-                            cfg,
-                        )?;
+                if let Some(adt) = ty.as_adt()
+                    && let ast::Type::PathType(path_ty) = &ast_ty
+                {
+                    let cfg = ImportPathConfig {
+                        prefer_no_std: false,
+                        prefer_prelude: true,
+                        prefer_absolute: false,
+                        allow_unstable: true,
+                    };
+                    let found_path = self.target_module.find_path(
+                        self.source_scope.db,
+                        ModuleDef::from(adt),
+                        cfg,
+                    )?;
 
-                        if let Some(qual) = mod_path_to_ast(&found_path).qualifier() {
-                            let res = make::path_concat(qual, path_ty.path()?).clone_for_update();
-                            ted::replace(path.syntax(), res.syntax());
-                            return Some(());
-                        }
+                    if let Some(qual) =
+                        mod_path_to_ast(&found_path, self.target_edition).qualifier()
+                    {
+                        let res = make::path_concat(qual, path_ty.path()?).clone_for_update();
+                        editor.replace(path.syntax(), res.syntax());
+                        return Some(());
                     }
                 }
 
-                ted::replace(path.syntax(), ast_ty.syntax());
+                editor.replace(path.syntax(), ast_ty.syntax());
             }
             hir::PathResolution::Local(_)
             | hir::PathResolution::Def(_)
@@ -472,7 +568,7 @@ fn find_trait_for_assoc_item(
         });
 
         for name in names {
-            if assoc_item_name.as_str() == name.as_text()?.as_str() {
+            if assoc_item_name.as_str() == name.as_str() {
                 // It is fine to return the first match because in case of
                 // multiple possibilities, the exact trait must be disambiguated
                 // in the definition of trait being implemented, so this search

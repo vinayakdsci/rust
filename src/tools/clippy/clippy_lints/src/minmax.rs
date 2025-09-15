@@ -1,10 +1,9 @@
-use clippy_utils::consts::{constant_simple, Constant};
+use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::is_trait_method;
+use clippy_utils::{is_trait_method, sym};
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
-use rustc_span::sym;
 use std::cmp::Ordering::{Equal, Greater, Less};
 
 declare_clippy_lint! {
@@ -79,12 +78,10 @@ fn min_max<'a, 'tcx>(cx: &LateContext<'tcx>, expr: &'a Expr<'a>) -> Option<(MinM
         },
         ExprKind::MethodCall(path, receiver, args @ [_], _) => {
             if cx.typeck_results().expr_ty(receiver).is_floating_point() || is_trait_method(cx, expr, sym::Ord) {
-                if path.ident.name == sym!(max) {
-                    fetch_const(cx, Some(receiver), args, MinMax::Max)
-                } else if path.ident.name == sym!(min) {
-                    fetch_const(cx, Some(receiver), args, MinMax::Min)
-                } else {
-                    None
+                match path.ident.name {
+                    sym::max => fetch_const(cx, Some(receiver), args, MinMax::Max),
+                    sym::min => fetch_const(cx, Some(receiver), args, MinMax::Min),
+                    _ => None,
                 }
             } else {
                 None
@@ -106,15 +103,11 @@ fn fetch_const<'a, 'tcx>(
     if args.next().is_some() {
         return None;
     }
-    constant_simple(cx, cx.typeck_results(), first_arg).map_or_else(
-        || constant_simple(cx, cx.typeck_results(), second_arg).map(|c| (m, c, first_arg)),
-        |c| {
-            if constant_simple(cx, cx.typeck_results(), second_arg).is_none() {
-                // otherwise ignore
-                Some((m, c, second_arg))
-            } else {
-                None
-            }
-        },
-    )
+    let ecx = ConstEvalCtxt::new(cx);
+    match (ecx.eval_simple(first_arg), ecx.eval_simple(second_arg)) {
+        (Some(c), None) => Some((m, c, second_arg)),
+        (None, Some(c)) => Some((m, c, first_arg)),
+        // otherwise ignore
+        _ => None,
+    }
 }

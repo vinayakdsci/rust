@@ -9,8 +9,9 @@
 // algorithm should not matter to the caller of the methods, which is why it is not noted in the
 // documentation.
 
-use crate::symbol::Symbol;
 use std::{cmp, mem};
+
+use crate::Symbol;
 
 #[cfg(test)]
 mod tests;
@@ -117,7 +118,7 @@ pub fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<u
     // Check one isn't less than half the length of the other. If this is true then there is a
     // big difference in length.
     let big_len_diff = (n * 2) < m || (m * 2) < n;
-    let len_diff = if n < m { m - n } else { n - m };
+    let len_diff = m.abs_diff(n);
     let distance = edit_distance(a, b, limit + len_diff)?;
 
     // This is the crux, subtracting length difference means exact substring matches will now be 0
@@ -129,7 +130,7 @@ pub fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<u
         1 // Exact substring match, but not a total word match so return non-zero
     } else if !big_len_diff {
         // Not a big difference in length, discount cost of length difference
-        score + (len_diff + 1) / 2
+        score + len_diff.div_ceil(2)
     } else {
         // A big difference in length, add back the difference in length to the score
         score + len_diff

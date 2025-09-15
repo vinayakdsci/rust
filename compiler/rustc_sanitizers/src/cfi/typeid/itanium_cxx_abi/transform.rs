@@ -4,33 +4,34 @@
 //! For more information about LLVM CFI and cross-language LLVM CFI support for the Rust compiler,
 //! see design document in the tracking issue #89653.
 
+use std::iter;
+
 use rustc_hir as hir;
 use rustc_hir::LangItem;
 use rustc_middle::bug;
-use rustc_middle::ty::fold::{TypeFolder, TypeSuperFoldable};
 use rustc_middle::ty::{
     self, ExistentialPredicateStableCmpExt as _, Instance, InstanceKind, IntTy, List, TraitRef, Ty,
-    TyCtxt, TypeFoldable, TypeVisitableExt, UintTy,
+    TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, UintTy,
 };
-use rustc_span::{def_id::DefId, sym};
+use rustc_span::def_id::DefId;
+use rustc_span::{DUMMY_SP, sym};
 use rustc_trait_selection::traits;
-use std::iter;
 use tracing::{debug, instrument};
 
-use crate::cfi::typeid::itanium_cxx_abi::encode::EncodeTyOptions;
 use crate::cfi::typeid::TypeIdOptions;
+use crate::cfi::typeid::itanium_cxx_abi::encode::EncodeTyOptions;
 
 /// Options for transform_ty.
-pub type TransformTyOptions = TypeIdOptions;
+pub(crate) type TransformTyOptions = TypeIdOptions;
 
-pub struct TransformTy<'tcx> {
+pub(crate) struct TransformTy<'tcx> {
     tcx: TyCtxt<'tcx>,
     options: TransformTyOptions,
     parents: Vec<Ty<'tcx>>,
 }
 
 impl<'tcx> TransformTy<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, options: TransformTyOptions) -> Self {
+    pub(crate) fn new(tcx: TyCtxt<'tcx>, options: TransformTyOptions) -> Self {
         TransformTy { tcx, options, parents: Vec::new() }
     }
 }
@@ -49,8 +50,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
     // Transforms a ty:Ty for being encoded and used in the substitution dictionary.
     fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
         match t.kind() {
-            ty::Array(..)
-            | ty::Closure(..)
+            ty::Closure(..)
             | ty::Coroutine(..)
             | ty::CoroutineClosure(..)
             | ty::CoroutineWitness(..)
@@ -62,7 +62,15 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
             | ty::Pat(..)
             | ty::Slice(..)
             | ty::Str
-            | ty::Tuple(..) => t.super_fold_with(self),
+            | ty::Tuple(..)
+            | ty::UnsafeBinder(_) => t.super_fold_with(self),
+
+            // Don't transform the type of the array length and keep it as `usize`.
+            // This is required for `try_to_target_usize` to work correctly.
+            &ty::Array(inner, len) => {
+                let inner = self.fold_ty(inner);
+                Ty::new_array_with_const_len(self.tcx, inner, len)
+            }
 
             ty::Bool => {
                 if self.options.contains(EncodeTyOptions::NORMALIZE_INTEGERS) {
@@ -134,17 +142,20 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
                         return t;
                     }
                     let variant = adt_def.non_enum_variant();
-                    let param_env = self.tcx.param_env(variant.def_id);
+                    let typing_env = ty::TypingEnv::post_analysis(self.tcx, variant.def_id);
                     let field = variant.fields.iter().find(|field| {
                         let ty = self.tcx.type_of(field.did).instantiate_identity();
                         let is_zst = self
                             .tcx
-                            .layout_of(param_env.and(ty))
+                            .layout_of(typing_env.as_query_input(ty))
                             .is_ok_and(|layout| layout.is_zst());
                         !is_zst
                     });
                     if let Some(field) = field {
-                        let ty0 = self.tcx.type_of(field.did).instantiate(self.tcx, args);
+                        let ty0 = self.tcx.normalize_erasing_regions(
+                            ty::TypingEnv::fully_monomorphized(),
+                            field.ty(self.tcx, args),
+                        );
                         // Generalize any repr(transparent) user-defined type that is either a
                         // pointer or reference, and either references itself or any other type that
                         // contains or references itself, to avoid a reference cycle.
@@ -204,9 +215,9 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
                 }
             }
 
-            ty::Alias(..) => {
-                self.fold_ty(self.tcx.normalize_erasing_regions(ty::ParamEnv::reveal_all(), t))
-            }
+            ty::Alias(..) => self.fold_ty(
+                self.tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), t),
+            ),
 
             ty::Bound(..) | ty::Error(..) | ty::Infer(..) | ty::Param(..) | ty::Placeholder(..) => {
                 bug!("fold_ty: unexpected `{:?}`", t.kind());
@@ -229,21 +240,26 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
         .flat_map(|super_poly_trait_ref| {
             tcx.associated_items(super_poly_trait_ref.def_id())
                 .in_definition_order()
-                .filter(|item| item.kind == ty::AssocKind::Type)
+                .filter(|item| item.is_type())
+                .filter(|item| !tcx.generics_require_sized_self(item.def_id))
                 .map(move |assoc_ty| {
                     super_poly_trait_ref.map_bound(|super_trait_ref| {
                         let alias_ty =
                             ty::AliasTy::new_from_args(tcx, assoc_ty.def_id, super_trait_ref.args);
                         let resolved = tcx.normalize_erasing_regions(
-                            ty::ParamEnv::reveal_all(),
+                            ty::TypingEnv::fully_monomorphized(),
                             alias_ty.to_ty(tcx),
                         );
                         debug!("Resolved {:?} -> {resolved}", alias_ty.to_ty(tcx));
-                        ty::ExistentialPredicate::Projection(ty::ExistentialProjection {
-                            def_id: assoc_ty.def_id,
-                            args: ty::ExistentialTraitRef::erase_self_ty(tcx, super_trait_ref).args,
-                            term: resolved.into(),
-                        })
+                        ty::ExistentialPredicate::Projection(
+                            ty::ExistentialProjection::erase_self_ty(
+                                tcx,
+                                ty::ProjectionPredicate {
+                                    projection_term: alias_ty.into(),
+                                    term: resolved.into(),
+                                },
+                            ),
+                        )
                     })
                 })
         })
@@ -259,7 +275,7 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
 /// mangling.
 ///
 /// typeid_for_instance is called at two locations, initially when declaring/defining functions and
-/// methods, and later during code generation at call sites, after type erasure might have ocurred.
+/// methods, and later during code generation at call sites, after type erasure might have occurred.
 ///
 /// In the first call (i.e., when declaring/defining functions and methods), it encodes type ids for
 /// an FnAbi or Instance, and these type ids are attached to functions and methods. (These type ids
@@ -267,7 +283,7 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
 /// these type ids.)
 ///
 /// In the second call (i.e., during code generation at call sites), it encodes a type id for an
-/// FnAbi or Instance, after type erasure might have occured, and this type id is used for testing
+/// FnAbi or Instance, after type erasure might have occurred, and this type id is used for testing
 /// if a function is member of the group derived from this type id. Therefore, in the first call to
 /// typeid_for_fnabi (when type ids are attached to functions and methods), it can only include at
 /// most as much information that would be available in the second call (i.e., during code
@@ -285,7 +301,7 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
 ///   the Fn trait that defines the method (for being attached as a secondary type id).
 ///
 #[instrument(level = "trace", skip(tcx))]
-pub fn transform_instance<'tcx>(
+pub(crate) fn transform_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     mut instance: Instance<'tcx>,
     options: TransformTyOptions,
@@ -312,20 +328,21 @@ pub fn transform_instance<'tcx>(
             .lang_items()
             .drop_trait()
             .unwrap_or_else(|| bug!("typeid_for_instance: couldn't get drop_trait lang item"));
-        let predicate = ty::ExistentialPredicate::Trait(ty::ExistentialTraitRef {
-            def_id: def_id,
-            args: List::empty(),
-        });
+        let predicate = ty::ExistentialPredicate::Trait(ty::ExistentialTraitRef::new_from_args(
+            tcx,
+            def_id,
+            ty::List::empty(),
+        ));
         let predicates = tcx.mk_poly_existential_predicates(&[ty::Binder::dummy(predicate)]);
         let self_ty = Ty::new_dynamic(tcx, predicates, tcx.lifetimes.re_erased, ty::Dyn);
         instance.args = tcx.mk_args_trait(self_ty, List::empty());
     } else if let ty::InstanceKind::Virtual(def_id, _) = instance.def {
         // Transform self into a trait object of the trait that defines the method for virtual
         // functions to match the type erasure done below.
-        let upcast_ty = match tcx.trait_of_item(def_id) {
+        let upcast_ty = match tcx.trait_of_assoc(def_id) {
             Some(trait_id) => trait_object_ty(
                 tcx,
-                ty::Binder::dummy(ty::TraitRef::from_method(tcx, trait_id, instance.args)),
+                ty::Binder::dummy(ty::TraitRef::from_assoc(tcx, trait_id, instance.args)),
             ),
             // drop_in_place won't have a defining trait, skip the upcast
             None => instance.args.type_at(0),
@@ -347,7 +364,7 @@ pub fn transform_instance<'tcx>(
         };
         instance.args = tcx.mk_args_trait(self_ty, instance.args.into_iter().skip(1));
     } else if let ty::InstanceKind::VTableShim(def_id) = instance.def
-        && let Some(trait_id) = tcx.trait_of_item(def_id)
+        && let Some(trait_id) = tcx.trait_of_assoc(def_id)
     {
         // Adjust the type ids of VTableShims to the type id expected in the call sites for the
         // entry in the vtable (i.e., by using the signature of the closure passed as an argument
@@ -362,10 +379,10 @@ pub fn transform_instance<'tcx>(
         // of the trait that defines the method.
         if let Some((trait_ref, method_id, ancestor)) = implemented_method(tcx, instance) {
             // Trait methods will have a Self polymorphic parameter, where the concreteized
-            // implementatation will not. We need to walk back to the more general trait method
+            // implementation will not. We need to walk back to the more general trait method
             let trait_ref = tcx.instantiate_and_normalize_erasing_regions(
                 instance.args,
-                ty::ParamEnv::reveal_all(),
+                ty::TypingEnv::fully_monomorphized(),
                 trait_ref,
             );
             let invoke_ty = trait_object_ty(tcx, ty::Binder::dummy(trait_ref));
@@ -386,7 +403,7 @@ pub fn transform_instance<'tcx>(
         } else if tcx.is_closure_like(instance.def_id()) {
             // We're either a closure or a coroutine. Our goal is to find the trait we're defined on,
             // instantiate it, and take the type of its only method as our own.
-            let closure_ty = instance.ty(tcx, ty::ParamEnv::reveal_all());
+            let closure_ty = instance.ty(tcx, ty::TypingEnv::fully_monomorphized());
             let (trait_id, inputs) = match closure_ty.kind() {
                 ty::Closure(..) => {
                     let closure_args = instance.args.as_closure();
@@ -397,7 +414,7 @@ pub fn transform_instance<'tcx>(
                 }
                 ty::Coroutine(..) => match tcx.coroutine_kind(instance.def_id()).unwrap() {
                     hir::CoroutineKind::Coroutine(..) => (
-                        tcx.require_lang_item(LangItem::Coroutine, None),
+                        tcx.require_lang_item(LangItem::Coroutine, DUMMY_SP),
                         Some(instance.args.as_coroutine().resume_ty()),
                     ),
                     hir::CoroutineKind::Desugared(desugaring, _) => {
@@ -406,11 +423,11 @@ pub fn transform_instance<'tcx>(
                             hir::CoroutineDesugaring::AsyncGen => LangItem::AsyncIterator,
                             hir::CoroutineDesugaring::Gen => LangItem::Iterator,
                         };
-                        (tcx.require_lang_item(lang_item, None), None)
+                        (tcx.require_lang_item(lang_item, DUMMY_SP), None)
                     }
                 },
                 ty::CoroutineClosure(..) => (
-                    tcx.require_lang_item(LangItem::FnOnce, None),
+                    tcx.require_lang_item(LangItem::FnOnce, DUMMY_SP),
                     Some(
                         tcx.instantiate_bound_regions_with_erased(
                             instance.args.as_coroutine_closure().coroutine_closure_sig(),
@@ -429,7 +446,7 @@ pub fn transform_instance<'tcx>(
             let call = tcx
                 .associated_items(trait_id)
                 .in_definition_order()
-                .find(|it| it.kind == ty::AssocKind::Fn)
+                .find(|it| it.is_fn())
                 .expect("No call-family function on closure-like Fn trait?")
                 .def_id;
 
@@ -449,11 +466,10 @@ fn implemented_method<'tcx>(
     let method_id;
     let trait_id;
     let trait_method;
-    let ancestor = if let Some(impl_id) = tcx.impl_of_method(instance.def_id()) {
+    let ancestor = if let Some(impl_id) = tcx.impl_of_assoc(instance.def_id()) {
         // Implementation in an `impl` block
         trait_ref = tcx.impl_trait_ref(impl_id)?;
-        let impl_method = tcx.associated_item(instance.def_id());
-        method_id = impl_method.trait_item_def_id?;
+        method_id = tcx.trait_item_of(instance.def_id())?;
         trait_method = tcx.associated_item(method_id);
         trait_id = trait_ref.skip_binder().def_id;
         impl_id
@@ -463,13 +479,13 @@ fn implemented_method<'tcx>(
         // Provided method in a `trait` block
         trait_method = trait_method_bound;
         method_id = instance.def_id();
-        trait_id = tcx.trait_of_item(method_id)?;
-        trait_ref = ty::EarlyBinder::bind(TraitRef::from_method(tcx, trait_id, instance.args));
+        trait_id = tcx.trait_of_assoc(method_id)?;
+        trait_ref = ty::EarlyBinder::bind(TraitRef::from_assoc(tcx, trait_id, instance.args));
         trait_id
     } else {
         return None;
     };
-    let vtable_possible =
-        traits::is_vtable_safe_method(tcx, trait_id, trait_method) && tcx.is_object_safe(trait_id);
+    let vtable_possible = traits::is_vtable_safe_method(tcx, trait_id, trait_method)
+        && tcx.is_dyn_compatible(trait_id);
     vtable_possible.then_some((trait_ref, method_id, ancestor))
 }

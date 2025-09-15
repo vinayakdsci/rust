@@ -1,11 +1,8 @@
-use hir::{ImportPathConfig, ModuleDef};
-use ide_db::{
-    assists::{AssistId, AssistKind},
-    famous_defs::FamousDefs,
-};
+use hir::ModuleDef;
+use ide_db::{assists::AssistId, famous_defs::FamousDefs};
 use syntax::{
-    ast::{self, HasGenericArgs, HasVisibility},
     AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,
+    ast::{self, HasGenericArgs, HasVisibility},
 };
 
 use crate::{AssistContext, Assists};
@@ -60,7 +57,7 @@ pub(crate) fn sugar_impl_future_into_async(
     let future_output = unwrap_future_output(main_trait_path)?;
 
     acc.add(
-        AssistId("sugar_impl_future_into_async", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("sugar_impl_future_into_async"),
         "Convert `impl Future` into async",
         function.syntax().text_range(),
         |builder| {
@@ -127,7 +124,7 @@ pub(crate) fn desugar_async_into_impl_future(
 
     let rparen = function.param_list()?.r_paren_token()?;
     let return_type = match function.ret_type() {
-        // unable to get a `ty` makes the action unapplicable
+        // unable to get a `ty` makes the action inapplicable
         Some(ret_type) => Some(ret_type.ty()?),
         // No type means `-> ()`
         None => None,
@@ -139,16 +136,13 @@ pub(crate) fn desugar_async_into_impl_future(
     let trait_path = module.find_path(
         ctx.db(),
         ModuleDef::Trait(future_trait),
-        ImportPathConfig {
-            prefer_no_std: ctx.config.prefer_no_std,
-            prefer_prelude: ctx.config.prefer_prelude,
-            prefer_absolute: ctx.config.prefer_absolute,
-        },
+        ctx.config.import_path_config(),
     )?;
-    let trait_path = trait_path.display(ctx.db());
+    let edition = scope.krate().edition(ctx.db());
+    let trait_path = trait_path.display(ctx.db(), edition);
 
     acc.add(
-        AssistId("desugar_async_into_impl_future", AssistKind::RefactorRewrite),
+        AssistId::refactor_rewrite("desugar_async_into_impl_future"),
         "Convert async into `impl Future`",
         function.syntax().text_range(),
         |builder| {

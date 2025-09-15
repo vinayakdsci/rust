@@ -9,18 +9,15 @@ use rustc_lint::LateContext;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_span::symbol::sym;
 
-use super::{utils, REDUNDANT_ALLOCATION};
+use super::{REDUNDANT_ALLOCATION, utils};
 
 pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, hir_ty: &hir::Ty<'tcx>, qpath: &QPath<'tcx>, def_id: DefId) -> bool {
     let mut applicability = Applicability::MaybeIncorrect;
-    let outer_sym = if Some(def_id) == cx.tcx.lang_items().owned_box() {
-        "Box"
-    } else if cx.tcx.is_diagnostic_item(sym::Rc, def_id) {
-        "Rc"
-    } else if cx.tcx.is_diagnostic_item(sym::Arc, def_id) {
-        "Arc"
-    } else {
-        return false;
+    let outer_sym = match cx.tcx.get_diagnostic_name(def_id) {
+        _ if Some(def_id) == cx.tcx.lang_items().owned_box() => "Box",
+        Some(sym::Rc) => "Rc",
+        Some(sym::Arc) => "Arc",
+        _ => return false,
     };
 
     if let Some(span) = utils::match_borrows_parameter(cx, qpath) {
@@ -60,7 +57,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, hir_ty: &hir::Ty<'tcx>, qpath:
             // here because `mod.rs` guarantees this lint is only run on types outside of bodies and
             // is not run on locals.
             let ty = lower_ty(cx.tcx, hir_ty);
-            if ty.has_escaping_bound_vars() || !ty.is_sized(cx.tcx, cx.param_env) {
+            if ty.has_escaping_bound_vars() || !ty.is_sized(cx.tcx, cx.typing_env()) {
                 return false;
             }
             hir_ty.span

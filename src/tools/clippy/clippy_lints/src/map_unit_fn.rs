@@ -7,7 +7,7 @@ use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{self, Ty};
 use rustc_session::declare_lint_pass;
-use rustc_span::{sym, Span};
+use rustc_span::{Span, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -101,10 +101,10 @@ fn is_unit_type(ty: Ty<'_>) -> bool {
 fn is_unit_function(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
     let ty = cx.typeck_results().expr_ty(expr);
 
-    if let ty::FnDef(id, _) = *ty.kind() {
-        if let Some(fn_type) = cx.tcx.fn_sig(id).instantiate_identity().no_bound_vars() {
-            return is_unit_type(fn_type.output());
-        }
+    if let ty::FnDef(id, _) = *ty.kind()
+        && let Some(fn_type) = cx.tcx.fn_sig(id).instantiate_identity().no_bound_vars()
+    {
+        return is_unit_type(fn_type.output());
     }
     false
 }
@@ -116,8 +116,10 @@ fn is_unit_expression(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
 /// The expression inside a closure may or may not have surrounding braces and
 /// semicolons, which causes problems when generating a suggestion. Given an
 /// expression that evaluates to '()' or '!', recursively remove useless braces
-/// and semi-colons until is suitable for including in the suggestion template
-fn reduce_unit_expression(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Span> {
+/// and semi-colons until is suitable for including in the suggestion template.
+/// The `bool` is `true` when the resulting `span` needs to be enclosed in an
+/// `unsafe` block.
+fn reduce_unit_expression(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<(Span, bool)> {
     if !is_unit_expression(cx, expr) {
         return None;
     }
@@ -125,22 +127,24 @@ fn reduce_unit_expression(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<
     match expr.kind {
         hir::ExprKind::Call(_, _) | hir::ExprKind::MethodCall(..) => {
             // Calls can't be reduced any more
-            Some(expr.span)
+            Some((expr.span, false))
         },
         hir::ExprKind::Block(block, _) => {
+            let is_unsafe = matches!(block.rules, hir::BlockCheckMode::UnsafeBlock(_));
             match (block.stmts, block.expr.as_ref()) {
                 ([], Some(inner_expr)) => {
                     // If block only contains an expression,
                     // reduce `{ X }` to `X`
                     reduce_unit_expression(cx, inner_expr)
+                        .map(|(span, inner_is_unsafe)| (span, inner_is_unsafe || is_unsafe))
                 },
                 ([inner_stmt], None) => {
                     // If block only contains statements,
                     // reduce `{ X; }` to `X` or `X;`
                     match inner_stmt.kind {
-                        hir::StmtKind::Let(local) => Some(local.span),
-                        hir::StmtKind::Expr(e) => Some(e.span),
-                        hir::StmtKind::Semi(..) => Some(inner_stmt.span),
+                        hir::StmtKind::Let(local) => Some((local.span, is_unsafe)),
+                        hir::StmtKind::Expr(e) => Some((e.span, is_unsafe)),
+                        hir::StmtKind::Semi(..) => Some((inner_stmt.span, is_unsafe)),
                         hir::StmtKind::Item(..) => None,
                     }
                 },
@@ -163,7 +167,7 @@ fn unit_closure<'tcx>(
     expr: &hir::Expr<'_>,
 ) -> Option<(&'tcx hir::Param<'tcx>, &'tcx hir::Expr<'tcx>)> {
     if let hir::ExprKind::Closure(&hir::Closure { fn_decl, body, .. }) = expr.kind
-        && let body = cx.tcx.hir().body(body)
+        && let body = cx.tcx.hir_body(body)
         && let body_expr = &body.value
         && fn_decl.inputs.len() == 1
         && is_unit_expression(cx, body_expr)
@@ -228,10 +232,11 @@ fn lint_map_unit_fn(
         let msg = suggestion_msg("closure", map_type);
 
         span_lint_and_then(cx, lint, expr.span, msg, |diag| {
-            if let Some(reduced_expr_span) = reduce_unit_expression(cx, closure_expr) {
+            if let Some((reduced_expr_span, is_unsafe)) = reduce_unit_expression(cx, closure_expr) {
                 let mut applicability = Applicability::MachineApplicable;
+                let (prefix_is_unsafe, suffix_is_unsafe) = if is_unsafe { ("unsafe { ", " }") } else { ("", "") };
                 let suggestion = format!(
-                    "if let {0}({1}) = {2} {{ {3} }}",
+                    "if let {0}({1}) = {2} {{ {prefix_is_unsafe}{3}{suffix_is_unsafe} }}",
                     variant,
                     snippet_with_applicability(cx, binding.pat.span, "_", &mut applicability),
                     snippet_with_applicability(cx, var_arg.span, "_", &mut applicability),
@@ -251,11 +256,11 @@ fn lint_map_unit_fn(
     }
 }
 
-impl<'tcx> LateLintPass<'tcx> for MapUnit {
+impl LateLintPass<'_> for MapUnit {
     fn check_stmt(&mut self, cx: &LateContext<'_>, stmt: &hir::Stmt<'_>) {
         if let hir::StmtKind::Semi(expr) = stmt.kind
             && !stmt.span.from_expansion()
-            && let Some(arglists) = method_chain_args(expr, &["map"])
+            && let Some(arglists) = method_chain_args(expr, &[sym::map])
         {
             lint_map_unit_fn(cx, stmt, expr, arglists[0]);
         }

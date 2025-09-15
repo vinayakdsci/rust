@@ -4,23 +4,23 @@
 //! etc. This is run by default on `./x.py test` and as part of the auto
 //! builders. The tidy checks can be executed with `./x.py test tidy`.
 
-use tidy::*;
-
 use std::collections::VecDeque;
-use std::env;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::process;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, scope, ScopedJoinHandle};
+use std::thread::{self, ScopedJoinHandle, scope};
+use std::{env, process};
+
+use tidy::*;
 
 fn main() {
-    // Running Cargo will read the libstd Cargo.toml
+    // Enable nightly, because Cargo will read the libstd Cargo.toml
     // which uses the unstable `public-dependency` feature.
-    //
-    // `setenv` might not be thread safe, so run it before using multiple threads.
-    env::set_var("RUSTC_BOOTSTRAP", "1");
+    // SAFETY: no other threads have been spawned
+    unsafe {
+        env::set_var("RUSTC_BOOTSTRAP", "1");
+    }
 
     let root_path: PathBuf = env::args_os().nth(1).expect("need path to root of repo").into();
     let cargo: PathBuf = env::args_os().nth(2).expect("need path to cargo").into();
@@ -29,12 +29,15 @@ fn main() {
     let concurrency: NonZeroUsize =
         FromStr::from_str(&env::args().nth(4).expect("need concurrency"))
             .expect("concurrency must be a number");
+    let npm: PathBuf = env::args_os().nth(5).expect("need name/path of npm command").into();
 
+    let root_manifest = root_path.join("Cargo.toml");
     let src_path = root_path.join("src");
     let tests_path = root_path.join("tests");
     let library_path = root_path.join("library");
     let compiler_path = root_path.join("compiler");
     let librustdoc_path = src_path.join("librustdoc");
+    let tools_path = src_path.join("tools");
     let crashes_path = tests_path.join("crashes");
 
     let args: Vec<String> = env::args().skip(1).collect();
@@ -47,7 +50,9 @@ fn main() {
     let extra_checks =
         cfg_args.iter().find(|s| s.starts_with("--extra-checks=")).map(String::as_str);
 
-    let bad = std::sync::Arc::new(AtomicBool::new(false));
+    let mut bad = false;
+    let ci_info = CiInfo::new(&mut bad);
+    let bad = std::sync::Arc::new(AtomicBool::new(bad));
 
     let drain_handles = |handles: &mut VecDeque<ScopedJoinHandle<'_, ()>>| {
         // poll all threads for completion before awaiting the oldest one
@@ -96,7 +101,7 @@ fn main() {
         check!(target_specific_tests, &tests_path);
 
         // Checks that are done on the cargo workspace.
-        check!(deps, &root_path, &cargo);
+        check!(deps, &root_path, &cargo, bless);
         check!(extdeps, &root_path);
 
         // Checks over tests.
@@ -104,27 +109,29 @@ fn main() {
         check!(tests_revision_unpaired_stdout_stderr, &tests_path);
         check!(debug_artifacts, &tests_path);
         check!(ui_tests, &root_path, bless);
-        // FIXME(jieyouxu): remove this check once all run-make tests are ported over to rmake.rs.
-        check!(run_make_tests, &tests_path, &src_path, bless);
         check!(mir_opt_tests, &tests_path, bless);
         check!(rustdoc_gui_tests, &tests_path);
         check!(rustdoc_css_themes, &librustdoc_path);
+        check!(rustdoc_templates, &librustdoc_path);
+        check!(rustdoc_json, &src_path, &ci_info);
         check!(known_bug, &crashes_path);
         check!(unknown_revision, &tests_path);
 
         // Checks that only make sense for the compiler.
-        check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path], verbose);
+        check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path], verbose, &ci_info);
         check!(fluent_alphabetical, &compiler_path, bless);
         check!(fluent_period, &compiler_path);
+        check!(fluent_lowercase, &compiler_path);
         check!(target_policy, &root_path);
+        check!(gcc_submodule, &root_path, &compiler_path);
 
         // Checks that only make sense for the std libs.
         check!(pal, &library_path);
 
         // Checks that need to be done for both the compiler and std libraries.
-        check!(unit_tests, &src_path);
-        check!(unit_tests, &compiler_path);
-        check!(unit_tests, &library_path);
+        check!(unit_tests, &src_path, false);
+        check!(unit_tests, &compiler_path, false);
+        check!(unit_tests, &library_path, true);
 
         if bins::check_filesystem_support(&[&root_path], &output_directory) {
             check!(bins, &root_path);
@@ -139,12 +146,17 @@ fn main() {
         check!(edition, &compiler_path);
         check!(edition, &library_path);
 
+        check!(alphabetical, &root_manifest);
         check!(alphabetical, &src_path);
         check!(alphabetical, &tests_path);
         check!(alphabetical, &compiler_path);
         check!(alphabetical, &library_path);
 
         check!(x_version, &root_path, &cargo);
+
+        check!(triagebot, &root_path);
+
+        check!(filenames, &root_path);
 
         let collected = {
             drain_handles(&mut handles);
@@ -165,7 +177,19 @@ fn main() {
         };
         check!(unstable_book, &src_path, collected);
 
-        check!(ext_tool_checks, &root_path, &output_directory, bless, extra_checks, pos_args);
+        check!(
+            extra_checks,
+            &root_path,
+            &output_directory,
+            &ci_info,
+            &librustdoc_path,
+            &tools_path,
+            &npm,
+            &cargo,
+            bless,
+            extra_checks,
+            pos_args
+        );
     });
 
     if bad.load(Ordering::Relaxed) {

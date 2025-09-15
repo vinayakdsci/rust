@@ -1,10 +1,12 @@
+use rustc_abi::CanonAbi;
 use rustc_apfloat::ieee::Double;
+use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
-use rustc_target::spec::abi::Abi;
+use rustc_target::callconv::FnAbi;
 
 use super::{
-    bin_op_simd_float_all, bin_op_simd_float_first, convert_float_to_int, packssdw, packsswb,
-    packuswb, shift_simd_by_scalar, FloatBinOp, ShiftOp,
+    FloatBinOp, ShiftOp, bin_op_simd_float_all, bin_op_simd_float_first, convert_float_to_int,
+    packssdw, packsswb, packuswb, shift_simd_by_scalar,
 };
 use crate::*;
 
@@ -13,7 +15,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_sse2_intrinsic(
         &mut self,
         link_name: Symbol,
-        abi: Abi,
+        abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[OpTy<'tcx>],
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
@@ -40,11 +42,11 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // intermediate 32-bit integers, and pack the results in `dest`.
             "pmadd.wd" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
-                let (left, left_len) = this.operand_to_simd(left)?;
-                let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.mplace_to_simd(dest)?;
+                let (left, left_len) = this.project_to_simd(left)?;
+                let (right, right_len) = this.project_to_simd(right)?;
+                let (dest, dest_len) = this.project_to_simd(dest)?;
 
                 assert_eq!(left_len, right_len);
                 assert_eq!(dest_len.strict_mul(2), left_len);
@@ -79,11 +81,11 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_sad_epu8
             "psad.bw" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
-                let (left, left_len) = this.operand_to_simd(left)?;
-                let (right, right_len) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.mplace_to_simd(dest)?;
+                let (left, left_len) = this.project_to_simd(left)?;
+                let (right, right_len) = this.project_to_simd(right)?;
+                let (dest, dest_len) = this.project_to_simd(dest)?;
 
                 // left and right are u8x16, dest is u64x2
                 assert_eq!(left_len, right_len);
@@ -118,7 +120,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "psll.w" | "psrl.w" | "psra.w" | "psll.d" | "psrl.d" | "psra.d" | "psll.q"
             | "psrl.q" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let which = match unprefixed_name {
                     "psll.w" | "psll.d" | "psll.q" => ShiftOp::Left,
@@ -133,7 +135,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // and _mm_cvttpd_epi32 functions.
             // Converts packed f32/f64 to packed i32.
             "cvtps2dq" | "cvttps2dq" | "cvtpd2dq" | "cvttpd2dq" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let [op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let (op_len, _) = op.layout.ty.simd_size_and_type(*this.tcx);
                 let (dest_len, _) = dest.layout.ty.simd_size_and_type(*this.tcx);
@@ -171,7 +173,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // vector with signed saturation.
             "packsswb.128" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 packsswb(this, left, right, dest)?;
             }
@@ -180,7 +182,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // unsigned integer vector with saturation.
             "packuswb.128" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 packuswb(this, left, right, dest)?;
             }
@@ -189,7 +191,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // vector with signed saturation.
             "packssdw.128" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 packssdw(this, left, right, dest)?;
             }
@@ -200,7 +202,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // semantics.
             "min.sd" | "max.sd" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let which = match unprefixed_name {
                     "min.sd" => FloatBinOp::Min,
@@ -217,7 +219,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // semantics.
             "min.pd" | "max.pd" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let which = match unprefixed_name {
                     "min.pd" => FloatBinOp::Min,
@@ -226,46 +228,6 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 };
 
                 bin_op_simd_float_all::<Double>(this, which, left, right, dest)?;
-            }
-            // Used to implement _mm_sqrt_sd functions.
-            // Performs the operations on the first component of `op` and
-            // copies the remaining components from `op`.
-            "sqrt.sd" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.mplace_to_simd(dest)?;
-
-                assert_eq!(dest_len, op_len);
-
-                let op0 = this.read_scalar(&this.project_index(&op, 0)?)?.to_u64()?;
-                // FIXME using host floats
-                let res0 = Scalar::from_u64(f64::from_bits(op0).sqrt().to_bits());
-                this.write_scalar(res0, &this.project_index(&dest, 0)?)?;
-
-                for i in 1..dest_len {
-                    this.copy_op(&this.project_index(&op, i)?, &this.project_index(&dest, i)?)?;
-                }
-            }
-            // Used to implement _mm_sqrt_pd functions.
-            // Performs the operations on all components of `op`.
-            "sqrt.pd" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-
-                let (op, op_len) = this.operand_to_simd(op)?;
-                let (dest, dest_len) = this.mplace_to_simd(dest)?;
-
-                assert_eq!(dest_len, op_len);
-
-                for i in 0..dest_len {
-                    let op = this.read_scalar(&this.project_index(&op, i)?)?.to_u64()?;
-                    let dest = this.project_index(&dest, i)?;
-
-                    // FIXME using host floats
-                    let res = Scalar::from_u64(f64::from_bits(op).sqrt().to_bits());
-
-                    this.write_scalar(res, &dest)?;
-                }
             }
             // Used to implement the _mm_cmp*_sd functions.
             // Performs a comparison operation on the first component of `left`
@@ -277,7 +239,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // with hard-coded operations.
             "cmp.sd" => {
                 let [left, right, imm] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let which =
                     FloatBinOp::cmp_from_imm(this, this.read_scalar(imm)?.to_i8()?, link_name)?;
@@ -294,7 +256,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // with hard-coded operations.
             "cmp.pd" => {
                 let [left, right, imm] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let which =
                     FloatBinOp::cmp_from_imm(this, this.read_scalar(imm)?.to_i8()?, link_name)?;
@@ -308,10 +270,10 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             | "ucomieq.sd" | "ucomilt.sd" | "ucomile.sd" | "ucomigt.sd" | "ucomige.sd"
             | "ucomineq.sd" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
-                let (left, left_len) = this.operand_to_simd(left)?;
-                let (right, right_len) = this.operand_to_simd(right)?;
+                let (left, left_len) = this.project_to_simd(left)?;
+                let (right, right_len) = this.project_to_simd(right)?;
 
                 assert_eq!(left_len, right_len);
 
@@ -336,8 +298,8 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // _mm_cvtsd_si64 and _mm_cvttsd_si64 functions.
             // Converts the first component of `op` from f64 to i32/i64.
             "cvtsd2si" | "cvttsd2si" | "cvtsd2si64" | "cvttsd2si64" => {
-                let [op] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let (op, _) = this.operand_to_simd(op)?;
+                let [op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let (op, _) = this.project_to_simd(op)?;
 
                 let op = this.read_immediate(&this.project_index(&op, 0)?)?;
 
@@ -363,11 +325,11 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // the remaining elements from `left`
             "cvtsd2ss" | "cvtss2sd" => {
                 let [left, right] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
-                let (left, left_len) = this.operand_to_simd(left)?;
-                let (right, _) = this.operand_to_simd(right)?;
-                let (dest, dest_len) = this.mplace_to_simd(dest)?;
+                let (left, left_len) = this.project_to_simd(left)?;
+                let (right, _) = this.project_to_simd(right)?;
+                let (dest, dest_len) = this.project_to_simd(dest)?;
 
                 assert_eq!(dest_len, left_len);
 
@@ -384,8 +346,8 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     this.copy_op(&this.project_index(&left, i)?, &this.project_index(&dest, i)?)?;
                 }
             }
-            _ => return Ok(EmulateItemResult::NotSupported),
+            _ => return interp_ok(EmulateItemResult::NotSupported),
         }
-        Ok(EmulateItemResult::NeedsReturn)
+        interp_ok(EmulateItemResult::NeedsReturn)
     }
 }

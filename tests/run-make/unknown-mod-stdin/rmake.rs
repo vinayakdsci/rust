@@ -1,3 +1,5 @@
+//@ needs-target-std
+//
 // Rustc displays a compilation error when it finds a `mod` (module)
 // statement referencing a file that does not exist. However, a bug from 2019
 // caused invalid `mod` statements to silently insert empty inline modules
@@ -12,7 +14,7 @@
 use run_make_support::{diff, rustc};
 
 fn main() {
-    let out = rustc().crate_type("rlib").stdin(b"mod unknown;").arg("-").run_fail();
+    let out = rustc().crate_type("rlib").stdin_buf(b"mod unknown;").arg("-").run_fail();
     diff()
         .actual_text("actual-stdout", out.stdout_utf8())
         .expected_file("unknown-mod.stdout")

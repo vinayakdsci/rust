@@ -6,11 +6,16 @@
 use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, ValueEnum};
+use clap_complete::Generator;
+#[cfg(feature = "tracing")]
+use tracing::instrument;
 
+use crate::core::build_steps::perf::PerfArgs;
 use crate::core::build_steps::setup::Profile;
 use crate::core::builder::{Builder, Kind};
-use crate::core::config::{target_selection_list, Config, TargetSelectionList};
-use crate::{Build, DocTests};
+use crate::core::config::Config;
+use crate::core::config::target_selection::{TargetSelectionList, target_selection_list};
+use crate::{Build, CodegenBackendKind, DocTests};
 
 #[derive(Copy, Clone, Default, Debug, ValueEnum)]
 pub enum Color {
@@ -51,11 +56,11 @@ pub struct Flags {
     /// TOML configuration file for build
     pub config: Option<PathBuf>,
     #[arg(global = true, long, value_hint = clap::ValueHint::DirPath, value_name = "DIR")]
-    /// Build directory, overrides `build.build-dir` in `config.toml`
+    /// Build directory, overrides `build.build-dir` in `bootstrap.toml`
     pub build_dir: Option<PathBuf>,
 
     #[arg(global = true, long, value_hint = clap::ValueHint::Other, value_name = "BUILD")]
-    /// build target of the stage0 compiler
+    /// host target of the stage0 compiler
     pub build: Option<String>,
 
     #[arg(global = true, long, value_hint = clap::ValueHint::Other, value_name = "HOST", value_parser = target_selection_list)]
@@ -76,6 +81,7 @@ pub struct Flags {
     /// include default paths in addition to the provided ones
     pub include_default_paths: bool,
 
+    /// rustc error format
     #[arg(global = true, value_hint = clap::ValueHint::Other, long)]
     pub rustc_error_format: Option<String>,
 
@@ -110,11 +116,10 @@ pub struct Flags {
         short,
         long,
         value_hint = clap::ValueHint::Other,
-        default_value_t = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         value_name = "JOBS"
     )]
     /// number of jobs to run in parallel
-    pub jobs: usize,
+    pub jobs: Option<u32>,
     // This overrides the deny-warnings configuration option,
     // which passes -Dwarnings to the compiler invocations.
     #[arg(global = true, long)]
@@ -124,12 +129,12 @@ pub struct Flags {
     /// otherwise, use the default configured behaviour
     pub warnings: Warnings,
 
-    #[arg(global = true, value_hint = clap::ValueHint::Other, long, value_name = "FORMAT")]
-    /// rustc error format
-    pub error_format: Option<String>,
     #[arg(global = true, long)]
     /// use message-format=json
     pub json_output: bool,
+    #[arg(global = true, long)]
+    /// only build proc-macros and build scripts (for rust-analyzer)
+    pub compile_time_deps: bool,
 
     #[arg(global = true, long, value_name = "STYLE")]
     #[arg(value_enum, default_value_t = Color::Auto)]
@@ -143,9 +148,6 @@ pub struct Flags {
     /// Unless you know exactly what you are doing, you probably don't need this.
     pub bypass_bootstrap_lock: bool,
 
-    /// whether rebuilding llvm should be skipped, overriding `skip-rebuld` in config.toml
-    #[arg(global = true, long, value_name = "VALUE")]
-    pub llvm_skip_rebuild: Option<bool>,
     /// generate PGO profile with rustc build
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
     pub rust_profile_generate: Option<String>,
@@ -174,18 +176,26 @@ pub struct Flags {
     #[arg(global = true)]
     /// paths for the subcommand
     pub paths: Vec<PathBuf>,
-    /// override options in config.toml
+    /// override options in bootstrap.toml
     #[arg(global = true, value_hint = clap::ValueHint::Other, long, value_name = "section.option=value")]
     pub set: Vec<String>,
     /// arguments passed to subcommands
     #[arg(global = true, last(true), value_name = "ARGS")]
     pub free_args: Vec<String>,
+    /// Make bootstrap to behave as it's running on the CI environment or not.
+    #[arg(global = true, long, value_name = "bool")]
+    pub ci: Option<bool>,
+    /// Skip checking the standard library if `rust.download-rustc` isn't available.
+    /// This is mostly for RA as building the stage1 compiler to check the library tree
+    /// on each code change might be too much for some computers.
+    #[arg(global = true, long)]
+    pub skip_std_check_if_no_download_rustc: bool,
 }
 
 impl Flags {
-    pub fn parse(args: &[String]) -> Self {
-        let first = String::from("x.py");
-        let it = std::iter::once(&first).chain(args.iter());
+    /// Check if `<cmd> -h -v` was passed.
+    /// If yes, print the available paths and return `true`.
+    pub fn try_parse_verbose_help(args: &[String]) -> bool {
         // We need to check for `<cmd> -h -v`, in which case we list the paths
         #[derive(Parser)]
         #[command(disable_help_flag(true))]
@@ -198,10 +208,11 @@ impl Flags {
             cmd: Kind,
         }
         if let Ok(HelpVerboseOnly { help: true, verbose: 1.., cmd: subcommand }) =
-            HelpVerboseOnly::try_parse_from(it.clone())
+            HelpVerboseOnly::try_parse_from(normalize_args(args))
         {
             println!("NOTE: updating submodules before printing available paths");
-            let config = Config::parse(&[String::from("build")]);
+            let flags = Self::parse(&[String::from("build")]);
+            let config = Config::parse(flags);
             let build = Build::new(config);
             let paths = Builder::get_help(&build, subcommand);
             if let Some(s) = paths {
@@ -209,14 +220,28 @@ impl Flags {
             } else {
                 panic!("No paths available for subcommand `{}`", subcommand.as_str());
             }
-            crate::exit!(0);
+            true
+        } else {
+            false
         }
+    }
 
-        Flags::parse_from(it)
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(level = "trace", name = "Flags::parse", skip_all, fields(args = ?args))
+    )]
+    pub fn parse(args: &[String]) -> Self {
+        Flags::parse_from(normalize_args(args))
     }
 }
 
-#[derive(Debug, Clone, Default, clap::Subcommand)]
+fn normalize_args(args: &[String]) -> Vec<String> {
+    let first = String::from("x.py");
+    let it = std::iter::once(first).chain(args.iter().cloned());
+    it.collect()
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
 pub enum Subcommand {
     #[command(aliases = ["b"], long_about = "\n
     Arguments:
@@ -231,8 +256,11 @@ pub enum Subcommand {
             ./x.py build --stage 0
             ./x.py build ")]
     /// Compile either the compiler or libraries
-    #[default]
-    Build,
+    Build {
+        #[arg(long)]
+        /// Pass `--timings` to Cargo to get crate build timings
+        timings: bool,
+    },
     #[command(aliases = ["c"], long_about = "\n
     Arguments:
         This subcommand accepts a number of paths to directories to the crates
@@ -244,6 +272,9 @@ pub enum Subcommand {
         #[arg(long)]
         /// Check all targets
         all_targets: bool,
+        #[arg(long)]
+        /// Pass `--timings` to Cargo to get crate build timings
+        timings: bool,
     },
     /// Run Clippy (uses rustup/cargo-installed clippy binary)
     #[command(long_about = "\n
@@ -347,9 +378,9 @@ pub enum Subcommand {
         /// extra arguments to be passed for the test tool being used
         /// (e.g. libtest, compiletest or rustdoc)
         test_args: Vec<String>,
-        /// extra options to pass the compiler when running tests
+        /// extra options to pass the compiler when running compiletest tests
         #[arg(long, value_name = "ARGS", allow_hyphen_values(true))]
-        rustc_args: Vec<String>,
+        compiletest_rustc_args: Vec<String>,
         #[arg(long)]
         /// do not run doc tests
         no_doc: bool,
@@ -361,7 +392,10 @@ pub enum Subcommand {
         bless: bool,
         #[arg(long)]
         /// comma-separated list of other files types to check (accepts py, py:lint,
-        /// py:fmt, shell)
+        /// py:fmt, shell, cpp, cpp:fmt, js, js:lint, js:typecheck, spellcheck)
+        ///
+        /// Any argument can be prefixed with "auto:" to only run if
+        /// relevant files are modified (eg. "auto:py").
         extra_checks: Option<String>,
         #[arg(long)]
         /// rerun tests even if the inputs are unchanged
@@ -382,6 +416,12 @@ pub enum Subcommand {
         /// enable this to generate a Rustfix coverage file, which is saved in
         /// `/<build_base>/rustfix_missing_coverage.txt`
         rustfix_coverage: bool,
+        #[arg(long)]
+        /// don't capture stdout/stderr of tests
+        no_capture: bool,
+        #[arg(long)]
+        /// Use a different codegen backend when running tests.
+        test_codegen_backend: Option<CodegenBackendKind>,
     },
     /// Build and run some test suites *in Miri*
     Miri {
@@ -392,9 +432,6 @@ pub enum Subcommand {
         /// extra arguments to be passed for the test tool being used
         /// (e.g. libtest, compiletest or rustdoc)
         test_args: Vec<String>,
-        /// extra options to pass the compiler when running tests
-        #[arg(long, value_name = "ARGS", allow_hyphen_values(true))]
-        rustc_args: Vec<String>,
         #[arg(long)]
         /// do not run doc tests
         no_doc: bool,
@@ -435,7 +472,7 @@ pub enum Subcommand {
     /// Set up the environment for development
     #[command(long_about = format!(
         "\n
-x.py setup creates a `config.toml` which changes the defaults for x.py itself,
+x.py setup creates a `bootstrap.toml` which changes the defaults for x.py itself,
 as well as setting up a git pre-push hook, VS Code config and toolchain link.
 Arguments:
     This subcommand accepts a 'profile' to use for builds. For example:
@@ -443,22 +480,15 @@ Arguments:
     The profile is optional and you will be prompted interactively if it is not given.
     The following profiles are available:
 {}
-    To only set up the git hook, VS Code config or toolchain link, you may use
+    To only set up the git hook, editor config or toolchain link, you may use
         ./x.py setup hook
-        ./x.py setup vscode
+        ./x.py setup editor
         ./x.py setup link", Profile::all_for_help("        ").trim_end()))]
     Setup {
-        /// Either the profile for `config.toml` or another setup action.
+        /// Either the profile for `bootstrap.toml` or another setup action.
         /// May be omitted to set up interactively
-        #[arg(value_name = "<PROFILE>|hook|vscode|link")]
+        #[arg(value_name = "<PROFILE>|hook|editor|link")]
         profile: Option<PathBuf>,
-    },
-    /// Suggest a subset of tests to run, based on modified files
-    #[command(long_about = "\n")]
-    Suggest {
-        /// run suggested tests
-        #[arg(long)]
-        run: bool,
     },
     /// Vendor dependencies
     Vendor {
@@ -469,11 +499,14 @@ Arguments:
         #[arg(long)]
         versioned_dirs: bool,
     },
-    /// Perform profiling and benchmarking of the compiler using the
-    /// `rustc-perf-wrapper` tool.
-    ///
-    /// You need to pass arguments after `--`, e.g.`x perf -- cachegrind`.
-    Perf {},
+    /// Perform profiling and benchmarking of the compiler using `rustc-perf`.
+    Perf(PerfArgs),
+}
+
+impl Default for Subcommand {
+    fn default() -> Self {
+        Subcommand::Build { timings: false }
+    }
 }
 
 impl Subcommand {
@@ -484,25 +517,24 @@ impl Subcommand {
             Subcommand::Check { .. } => Kind::Check,
             Subcommand::Clippy { .. } => Kind::Clippy,
             Subcommand::Doc { .. } => Kind::Doc,
-            Subcommand::Fix { .. } => Kind::Fix,
+            Subcommand::Fix => Kind::Fix,
             Subcommand::Format { .. } => Kind::Format,
             Subcommand::Test { .. } => Kind::Test,
             Subcommand::Miri { .. } => Kind::Miri,
             Subcommand::Clean { .. } => Kind::Clean,
-            Subcommand::Dist { .. } => Kind::Dist,
-            Subcommand::Install { .. } => Kind::Install,
+            Subcommand::Dist => Kind::Dist,
+            Subcommand::Install => Kind::Install,
             Subcommand::Run { .. } => Kind::Run,
             Subcommand::Setup { .. } => Kind::Setup,
-            Subcommand::Suggest { .. } => Kind::Suggest,
             Subcommand::Vendor { .. } => Kind::Vendor,
             Subcommand::Perf { .. } => Kind::Perf,
         }
     }
 
-    pub fn rustc_args(&self) -> Vec<&str> {
+    pub fn compiletest_rustc_args(&self) -> Vec<&str> {
         match *self {
-            Subcommand::Test { ref rustc_args, .. } | Subcommand::Miri { ref rustc_args, .. } => {
-                rustc_args.iter().flat_map(|s| s.split_whitespace()).collect()
+            Subcommand::Test { ref compiletest_rustc_args, .. } => {
+                compiletest_rustc_args.iter().flat_map(|s| s.split_whitespace()).collect()
             }
             _ => vec![],
         }
@@ -560,6 +592,13 @@ impl Subcommand {
         }
     }
 
+    pub fn no_capture(&self) -> bool {
+        match *self {
+            Subcommand::Test { no_capture, .. } => no_capture,
+            _ => false,
+        }
+    }
+
     pub fn rustfix_coverage(&self) -> bool {
         match *self {
             Subcommand::Test { rustfix_coverage, .. } => rustfix_coverage,
@@ -602,6 +641,13 @@ impl Subcommand {
         }
     }
 
+    pub fn timings(&self) -> bool {
+        match *self {
+            Subcommand::Build { timings, .. } | Subcommand::Check { timings, .. } => timings,
+            _ => false,
+        }
+    }
+
     pub fn vendor_versioned_dirs(&self) -> bool {
         match *self {
             Subcommand::Vendor { versioned_dirs, .. } => versioned_dirs,
@@ -615,11 +661,18 @@ impl Subcommand {
             _ => vec![],
         }
     }
+
+    pub fn test_codegen_backend(&self) -> Option<&CodegenBackendKind> {
+        match self {
+            Subcommand::Test { test_codegen_backend, .. } => test_codegen_backend.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Returns the shell completion for a given shell, if the result differs from the current
 /// content of `path`. If `path` does not exist, always returns `Some`.
-pub fn get_completion<G: clap_complete::Generator>(shell: G, path: &Path) -> Option<String> {
+pub fn get_completion(shell: &dyn Generator, path: &Path) -> Option<String> {
     let mut cmd = Flags::command();
     let current = if !path.exists() {
         String::new()
@@ -630,7 +683,19 @@ pub fn get_completion<G: clap_complete::Generator>(shell: G, path: &Path) -> Opt
         })
     };
     let mut buf = Vec::new();
-    clap_complete::generate(shell, &mut cmd, "x.py", &mut buf);
+    let (bin_name, _) = path
+        .file_name()
+        .expect("path should be a regular file")
+        .to_str()
+        .expect("file name should be UTF-8")
+        .rsplit_once('.')
+        .expect("file name should have an extension");
+
+    // We sort of replicate `clap_complete::generate` here, because we want to call it with
+    // `&dyn Generator`, but that function requires `G: Generator` instead.
+    cmd.set_bin_name(bin_name);
+    cmd.build();
+    shell.generate(&cmd, &mut buf);
     if buf == current.as_bytes() {
         return None;
     }

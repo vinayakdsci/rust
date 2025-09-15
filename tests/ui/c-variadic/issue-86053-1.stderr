@@ -1,23 +1,23 @@
 error: expected type, found `,`
-  --> $DIR/issue-86053-1.rs:10:47
+  --> $DIR/issue-86053-1.rs:6:47
    |
 LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
    |                                               ^ expected type
 
 error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:10:51
+  --> $DIR/issue-86053-1.rs:6:51
    |
 LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
    |                                                   ^^^^ must be the first parameter of an associated function
 
 error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:10:58
+  --> $DIR/issue-86053-1.rs:6:58
    |
 LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
    |                                                          ^^^^ must be the first parameter of an associated function
 
 error: unexpected `self` parameter in function
-  --> $DIR/issue-86053-1.rs:10:67
+  --> $DIR/issue-86053-1.rs:6:67
    |
 LL | fn ordering4 < 'a , 'b     > ( a :            ,   self , self ,   self ,
    |                                                                   ^^^^ must be the first parameter of an associated function
@@ -46,25 +46,27 @@ error: `...` must be the last argument of a C-variadic function
 LL |     self , ... ,   self ,   self , ... ) where F : FnOnce ( & 'a & 'b usize ) {
    |            ^^^
 
-error: only foreign, `unsafe extern "C"`, or `unsafe extern "C-unwind"` functions may have a C-variadic arg
-  --> $DIR/issue-86053-1.rs:11:12
+error: `...` is not supported for non-extern functions
+  --> $DIR/issue-86053-1.rs:11:36
    |
 LL |     self , ... ,   self ,   self , ... ) where F : FnOnce ( & 'a & 'b usize ) {
-   |            ^^^                     ^^^
+   |                                    ^^^
+   |
+   = help: only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
 
 error[E0412]: cannot find type `F` in this scope
   --> $DIR/issue-86053-1.rs:11:48
    |
 LL |     self , ... ,   self ,   self , ... ) where F : FnOnce ( & 'a & 'b usize ) {
    |                                                ^
+   |
   --> $SRC_DIR/core/src/ops/function.rs:LL:COL
    |
    = note: similarly named trait `Fn` defined here
-   |
 help: a trait with a similar name exists
    |
 LL |     self , ... ,   self ,   self , ... ) where Fn : FnOnce ( & 'a & 'b usize ) {
-   |                                                ~~
+   |                                                 +
 help: you might be missing a type parameter
    |
 LL | fn ordering4 < 'a , 'b, F     > ( a :            ,   self , self ,   self ,

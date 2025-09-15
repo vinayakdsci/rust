@@ -1,68 +1,45 @@
-// Caveat - gdb doesn't know about UTF-32 character encoding and will print a
-// rust char as only its numerical value.
-
-//@ min-lldb-version: 310
-//@ min-gdb-version: 8.0
-
 //@ revisions: lto no-lto
 
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 //@ [lto] compile-flags:-C lto
 //@ [lto] no-prefer-dynamic
 
 // gdb-command:run
-// gdbg-command:print 'basic_types_globals::B'
-// gdbr-command:print B
+// gdb-command:print B
 // gdb-check:$1 = false
-// gdbg-command:print 'basic_types_globals::I'
-// gdbr-command:print I
+// gdb-command:print I
 // gdb-check:$2 = -1
-// gdbg-command:print 'basic_types_globals::C'
-// gdbr-command:print/d C
-// gdbg-check:$3 = 97
-// gdbr-check:$3 = 97
-// gdbg-command:print/d 'basic_types_globals::I8'
-// gdbr-command:print I8
+// gdb-command:print/d C
+// gdb-check:$3 = 97
+// gdb-command:print I8
 // gdb-check:$4 = 68
-// gdbg-command:print 'basic_types_globals::I16'
-// gdbr-command:print I16
+// gdb-command:print I16
 // gdb-check:$5 = -16
-// gdbg-command:print 'basic_types_globals::I32'
-// gdbr-command:print I32
+// gdb-command:print I32
 // gdb-check:$6 = -32
-// gdbg-command:print 'basic_types_globals::I64'
-// gdbr-command:print I64
+// gdb-command:print I64
 // gdb-check:$7 = -64
-// gdbg-command:print 'basic_types_globals::U'
-// gdbr-command:print U
+// gdb-command:print U
 // gdb-check:$8 = 1
-// gdbg-command:print/d 'basic_types_globals::U8'
-// gdbr-command:print U8
+// gdb-command:print U8
 // gdb-check:$9 = 100
-// gdbg-command:print 'basic_types_globals::U16'
-// gdbr-command:print U16
+// gdb-command:print U16
 // gdb-check:$10 = 16
-// gdbg-command:print 'basic_types_globals::U32'
-// gdbr-command:print U32
+// gdb-command:print U32
 // gdb-check:$11 = 32
-// gdbg-command:print 'basic_types_globals::U64'
-// gdbr-command:print U64
+// gdb-command:print U64
 // gdb-check:$12 = 64
-// gdbg-command:print 'basic_types_globals::F16'
-// gdbr-command:print F16
+// gdb-command:print F16
 // gdb-check:$13 = 1.5
-// gdbg-command:print 'basic_types_globals::F32'
-// gdbr-command:print F32
+// gdb-command:print F32
 // gdb-check:$14 = 2.5
-// gdbg-command:print 'basic_types_globals::F64'
-// gdbr-command:print F64
+// gdb-command:print F64
 // gdb-check:$15 = 3.5
 // gdb-command:continue
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 #![feature(f16)]
 
 // N.B. These are `mut` only so they don't constant fold away.
@@ -85,7 +62,12 @@ static mut F64: f64 = 3.5;
 fn main() {
     _zzz(); // #break
 
-    let a = unsafe { (B, I, C, I8, I16, I32, I64, U, U8, U16, U32, U64, F16, F32, F64) };
+    let a = unsafe { (B, I, C, I8, I16, I32, I64, U, U8, U16, U32, U64, F32, F64) };
+    // FIXME: Including f16 and f32 in the same tuple emits `__gnu_h2f_ieee`, which
+    // does not exist on some targets like PowerPC.
+    // See https://github.com/llvm/llvm-project/issues/97981 and
+    // https://github.com/rust-lang/compiler-builtins/issues/655
+    let b = unsafe { F16 };
 }
 
 fn _zzz() {()}

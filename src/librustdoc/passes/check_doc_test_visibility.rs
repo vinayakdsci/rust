@@ -5,20 +5,22 @@
 //! - MISSING_DOC_CODE_EXAMPLES: this lint is **UNSTABLE** and looks for public items missing doctests.
 //! - PRIVATE_DOC_TESTS: this lint is **STABLE** and looks for private items with doctests.
 
+use rustc_hir as hir;
+use rustc_middle::lint::{LevelAndSource, LintLevelSource};
+use rustc_session::lint;
+use tracing::debug;
+
 use super::Pass;
 use crate::clean;
 use crate::clean::utils::inherits_doc_hidden;
 use crate::clean::*;
 use crate::core::DocContext;
-use crate::html::markdown::{find_testable_code, ErrorCodes, Ignore, LangString, MdRelLine};
+use crate::html::markdown::{ErrorCodes, Ignore, LangString, MdRelLine, find_testable_code};
 use crate::visit::DocVisitor;
-use rustc_hir as hir;
-use rustc_middle::lint::LintLevelSource;
-use rustc_session::lint;
 
 pub(crate) const CHECK_DOC_TEST_VISIBILITY: Pass = Pass {
     name: "check_doc_test_visibility",
-    run: check_doc_test_visibility,
+    run: Some(check_doc_test_visibility),
     description: "run various visibility-related lints on doctests",
 };
 
@@ -32,7 +34,7 @@ pub(crate) fn check_doc_test_visibility(krate: Crate, cx: &mut DocContext<'_>) -
     krate
 }
 
-impl<'a, 'tcx> DocVisitor for DocTestVisibilityLinter<'a, 'tcx> {
+impl DocVisitor<'_> for DocTestVisibilityLinter<'_, '_> {
     fn visit_item(&mut self, item: &Item) {
         look_for_tests(self.cx, &item.doc_value(), item);
 
@@ -44,7 +46,7 @@ pub(crate) struct Tests {
     pub(crate) found_tests: usize,
 }
 
-impl crate::doctest::DoctestVisitor for Tests {
+impl crate::doctest::DocTestVisitor for Tests {
     fn visit_test(&mut self, _: String, config: LangString, _: MdRelLine) {
         if config.rust && config.ignore == Ignore::None {
             self.found_tests += 1;
@@ -55,18 +57,27 @@ impl crate::doctest::DoctestVisitor for Tests {
 pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -> bool {
     if !cx.cache.effective_visibilities.is_directly_public(cx.tcx, item.item_id.expect_def_id())
         || matches!(
-            *item.kind,
+            item.kind,
             clean::StructFieldItem(_)
                 | clean::VariantItem(_)
-                | clean::AssocConstItem(..)
-                | clean::AssocTypeItem(..)
                 | clean::TypeAliasItem(_)
                 | clean::StaticItem(_)
-                | clean::ConstantItem(_, _, _)
+                | clean::ConstantItem(..)
                 | clean::ExternCrateItem { .. }
                 | clean::ImportItem(_)
                 | clean::PrimitiveItem(_)
                 | clean::KeywordItem
+                | clean::AttributeItem
+                | clean::ModuleItem(_)
+                | clean::TraitAliasItem(_)
+                | clean::ForeignFunctionItem(..)
+                | clean::ForeignStaticItem(..)
+                | clean::ForeignTypeItem
+                | clean::AssocTypeItem(..)
+                | clean::RequiredAssocConstItem(..)
+                | clean::ProvidedAssocConstItem(..)
+                | clean::ImplAssocConstItem(..)
+                | clean::RequiredAssocTypeItem(..)
                 // check for trait impl
                 | clean::ImplItem(box clean::Impl { trait_: Some(_), .. })
         )
@@ -97,14 +108,14 @@ pub(crate) fn should_have_doc_example(cx: &DocContext<'_>, item: &clean::Item) -
     {
         return false;
     }
-    let (level, source) = cx.tcx.lint_level_at_node(
+    let LevelAndSource { level, src, .. } = cx.tcx.lint_level_at_node(
         crate::lint::MISSING_DOC_CODE_EXAMPLES,
         cx.tcx.local_def_id_to_hir_id(def_id),
     );
-    level != lint::Level::Allow || matches!(source, LintLevelSource::Default)
+    level != lint::Level::Allow || matches!(src, LintLevelSource::Default)
 }
 
-pub(crate) fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item) {
+pub(crate) fn look_for_tests(cx: &DocContext<'_>, dox: &str, item: &Item) {
     let Some(hir_id) = DocContext::as_local_hir_id(cx.tcx, item.item_id) else {
         // If non-local, no need to check anything.
         return;
@@ -112,9 +123,9 @@ pub(crate) fn look_for_tests<'tcx>(cx: &DocContext<'tcx>, dox: &str, item: &Item
 
     let mut tests = Tests { found_tests: 0 };
 
-    find_testable_code(dox, &mut tests, ErrorCodes::No, false, None);
+    find_testable_code(dox, &mut tests, ErrorCodes::No, None);
 
-    if tests.found_tests == 0 && cx.tcx.features().rustdoc_missing_doc_code_examples {
+    if tests.found_tests == 0 && cx.tcx.features().rustdoc_missing_doc_code_examples() {
         if should_have_doc_example(cx, item) {
             debug!("reporting error for {item:?} (hir_id={hir_id:?})");
             let sp = item.attr_span(cx.tcx);

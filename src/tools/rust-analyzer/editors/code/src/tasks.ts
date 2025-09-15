@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { Config } from "./config";
 import * as toolchain from "./toolchain";
+import { Env } from "./util";
 
 // This ends up as the `type` key in tasks.json. RLS also uses `cargo` and
 // our configuration should be compatible with it so use the same key.
@@ -117,21 +118,26 @@ export async function buildRustTask(
 export async function targetToExecution(
     definition: TaskDefinition,
     options?: {
-        env?: { [key: string]: string };
         cwd?: string;
+        env?: Env;
     },
     cargo?: string,
 ): Promise<vscode.ProcessExecution | vscode.ShellExecution> {
     let command, args;
     if (isCargoTask(definition)) {
         // FIXME: The server should provide cargo
-        command = cargo || (await toolchain.cargoPath());
+        command = cargo || (await toolchain.cargoPath(options?.env));
         args = [definition.command].concat(definition.args || []);
     } else {
         command = definition.command;
         args = definition.args || [];
     }
-    return new vscode.ProcessExecution(command, args, options);
+    return new vscode.ProcessExecution(command, args, {
+        cwd: options?.cwd,
+        env: Object.fromEntries(
+            Object.entries(options?.env ?? {}).map(([key, value]) => [key, value ?? ""]),
+        ),
+    });
 }
 
 export function activateTaskProvider(config: Config): vscode.Disposable {

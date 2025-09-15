@@ -1,19 +1,19 @@
-use rustc_index::bit_set::{self, BitSet};
-use rustc_index::{Idx, IndexSlice, IndexVec};
-use smallvec::SmallVec;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZero;
 
+use rustc_index::bit_set::{self, DenseBitSet};
+use rustc_index::{Idx, IndexSlice, IndexVec};
+use smallvec::SmallVec;
+
 #[cfg(test)]
 mod tests;
 
-pub use crate::hashes::{Hash128, Hash64};
-
-pub use rustc_stable_hash::FromStableHash;
-pub use rustc_stable_hash::SipHasher128Hash as StableHasherHash;
-pub use rustc_stable_hash::StableSipHasher128 as StableHasher;
+use rustc_hashes::{Hash64, Hash128};
+pub use rustc_stable_hash::{
+    FromStableHash, SipHasher128Hash as StableHasherHash, StableSipHasher128 as StableHasher,
+};
 
 /// Something that implements `HashStable<CTX>` can be hashed in a way that is
 /// stable across multiple compilation sessions.
@@ -543,7 +543,7 @@ where
     }
 }
 
-impl<I: Idx, CTX> HashStable<CTX> for BitSet<I> {
+impl<I: Idx, CTX> HashStable<CTX> for DenseBitSet<I> {
     fn hash_stable(&self, _ctx: &mut CTX, hasher: &mut StableHasher) {
         ::std::hash::Hash::hash(self, hasher);
     }
@@ -563,6 +563,8 @@ where
         self.0.hash_stable(hcx, hasher);
     }
 }
+
+impl_stable_traits_for_trivial_type!(::std::ffi::OsStr);
 
 impl_stable_traits_for_trivial_type!(::std::path::Path);
 impl_stable_traits_for_trivial_type!(::std::path::PathBuf);

@@ -1,14 +1,16 @@
-use crate::errors;
 use rustc_ast::tokenstream::TokenStream;
-use rustc_ast::{self as ast, attr, ptr::P, token, AttrStyle, Attribute, MetaItem};
+use rustc_ast::{self as ast, AttrStyle, Attribute, MetaItem, attr, token};
+use rustc_attr_parsing::validate_attr;
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed};
 use rustc_expand::base::{Annotatable, ExpandResult, ExtCtxt};
 use rustc_expand::expand::AstFragment;
 use rustc_feature::AttributeTemplate;
-use rustc_lint_defs::{builtin::DUPLICATE_MACRO_ATTRIBUTES, BuiltinLintDiag};
-use rustc_parse::{parser, validate_attr};
+use rustc_lint_defs::builtin::DUPLICATE_MACRO_ATTRIBUTES;
+use rustc_parse::{exp, parser};
 use rustc_session::errors::report_lit_error;
 use rustc_span::{BytePos, Span, Symbol};
+
+use crate::errors;
 
 pub(crate) fn check_builtin_macro_attribute(ecx: &ExtCtxt<'_>, meta_item: &MetaItem, name: Symbol) {
     // All the built-in macro attributes are "words" at the moment.
@@ -19,6 +21,7 @@ pub(crate) fn check_builtin_macro_attribute(ecx: &ExtCtxt<'_>, meta_item: &MetaI
         AttrStyle::Outer,
         name,
         template,
+        true,
     );
 }
 
@@ -27,8 +30,7 @@ pub(crate) fn check_builtin_macro_attribute(ecx: &ExtCtxt<'_>, meta_item: &MetaI
 pub(crate) fn warn_on_duplicate_attribute(ecx: &ExtCtxt<'_>, item: &Annotatable, name: Symbol) {
     let attrs: Option<&[Attribute]> = match item {
         Annotatable::Item(item) => Some(&item.attrs),
-        Annotatable::TraitItem(item) => Some(&item.attrs),
-        Annotatable::ImplItem(item) => Some(&item.attrs),
+        Annotatable::AssocItem(item, _) => Some(&item.attrs),
         Annotatable::ForeignItem(item) => Some(&item.attrs),
         Annotatable::Expr(expr) => Some(&expr.attrs),
         Annotatable::Arm(arm) => Some(&arm.attrs),
@@ -46,7 +48,7 @@ pub(crate) fn warn_on_duplicate_attribute(ecx: &ExtCtxt<'_>, item: &Annotatable,
                 DUPLICATE_MACRO_ATTRIBUTES,
                 attr.span,
                 ecx.current_expansion.lint_node_id,
-                BuiltinLintDiag::DuplicateMacroAttribute,
+                errors::DuplicateMacroAttribute,
             );
         }
     }
@@ -54,7 +56,17 @@ pub(crate) fn warn_on_duplicate_attribute(ecx: &ExtCtxt<'_>, item: &Annotatable,
 
 /// `Ok` represents successfully retrieving the string literal at the correct
 /// position, e.g., `println("abc")`.
-type ExprToSpannedStringResult<'a> = Result<(Symbol, ast::StrStyle, Span), UnexpectedExprKind<'a>>;
+pub(crate) type ExprToSpannedStringResult<'a> = Result<ExprToSpannedString, UnexpectedExprKind<'a>>;
+
+pub(crate) struct ExprToSpannedString {
+    pub symbol: Symbol,
+    pub style: ast::StrStyle,
+    pub span: Span,
+    /// The raw string literal, with no escaping or processing.
+    ///
+    /// Generally only useful for lints that care about the raw bytes the user wrote.
+    pub uncooked_symbol: (ast::token::LitKind, Symbol),
+}
 
 /// - `Ok` is returned when the conversion to a string literal is unsuccessful,
 /// but another type of expression is obtained instead.
@@ -70,7 +82,7 @@ type UnexpectedExprKind<'a> = Result<(Diag<'a>, bool /* has_suggestions */), Err
 #[allow(rustc::untranslatable_diagnostic)]
 pub(crate) fn expr_to_spanned_string<'a>(
     cx: &'a mut ExtCtxt<'_>,
-    expr: P<ast::Expr>,
+    expr: Box<ast::Expr>,
     err_msg: &'static str,
 ) -> ExpandResult<ExprToSpannedStringResult<'a>, ()> {
     if !cx.force_mode
@@ -87,7 +99,12 @@ pub(crate) fn expr_to_spanned_string<'a>(
     ExpandResult::Ready(Err(match expr.kind {
         ast::ExprKind::Lit(token_lit) => match ast::LitKind::from_token_lit(token_lit) {
             Ok(ast::LitKind::Str(s, style)) => {
-                return ExpandResult::Ready(Ok((s, style, expr.span)));
+                return ExpandResult::Ready(Ok(ExprToSpannedString {
+                    symbol: s,
+                    style,
+                    span: expr.span,
+                    uncooked_symbol: (token_lit.kind, token_lit.symbol),
+                }));
             }
             Ok(ast::LitKind::ByteStr(..)) => {
                 let mut err = cx.dcx().struct_span_err(expr.span, err_msg);
@@ -117,7 +134,7 @@ pub(crate) fn expr_to_spanned_string<'a>(
 /// compilation on error, merely emits a non-fatal error and returns `Err`.
 pub(crate) fn expr_to_string(
     cx: &mut ExtCtxt<'_>,
-    expr: P<ast::Expr>,
+    expr: Box<ast::Expr>,
     err_msg: &'static str,
 ) -> ExpandResult<Result<(Symbol, ast::StrStyle), ErrorGuaranteed>, ()> {
     expr_to_spanned_string(cx, expr, err_msg).map(|res| {
@@ -125,7 +142,7 @@ pub(crate) fn expr_to_string(
             Ok((err, _)) => err.emit(),
             Err(guar) => guar,
         })
-        .map(|(symbol, style, _)| (symbol, style))
+        .map(|ExprToSpannedString { symbol, style, .. }| (symbol, style))
     })
 }
 
@@ -140,7 +157,7 @@ pub(crate) fn check_zero_tts(cx: &ExtCtxt<'_>, span: Span, tts: TokenStream, nam
 }
 
 /// Parse an expression. On error, emit it, advancing to `Eof`, and return `Err`.
-pub(crate) fn parse_expr(p: &mut parser::Parser<'_>) -> Result<P<ast::Expr>, ErrorGuaranteed> {
+pub(crate) fn parse_expr(p: &mut parser::Parser<'_>) -> Result<Box<ast::Expr>, ErrorGuaranteed> {
     let guar = match p.parse_expr() {
         Ok(expr) => return Ok(expr),
         Err(err) => err.emit(),
@@ -168,6 +185,30 @@ pub(crate) fn get_single_str_spanned_from_tts(
     tts: TokenStream,
     name: &str,
 ) -> ExpandResult<Result<(Symbol, Span), ErrorGuaranteed>, ()> {
+    let ExpandResult::Ready(ret) = get_single_expr_from_tts(cx, span, tts, name) else {
+        return ExpandResult::Retry(());
+    };
+    let ret = match ret {
+        Ok(ret) => ret,
+        Err(e) => return ExpandResult::Ready(Err(e)),
+    };
+    expr_to_spanned_string(cx, ret, "argument must be a string literal").map(|res| {
+        res.map_err(|err| match err {
+            Ok((err, _)) => err.emit(),
+            Err(guar) => guar,
+        })
+        .map(|ExprToSpannedString { symbol, span, .. }| (symbol, span))
+    })
+}
+
+/// Interpreting `tts` as a comma-separated sequence of expressions,
+/// expect exactly one expression, or emit an error and return `Err`.
+pub(crate) fn get_single_expr_from_tts(
+    cx: &mut ExtCtxt<'_>,
+    span: Span,
+    tts: TokenStream,
+    name: &str,
+) -> ExpandResult<Result<Box<ast::Expr>, ErrorGuaranteed>, ()> {
     let mut p = cx.new_parser_from_tts(tts);
     if p.token == token::Eof {
         let guar = cx.dcx().emit_err(errors::OnlyOneArgument { span, name });
@@ -177,18 +218,12 @@ pub(crate) fn get_single_str_spanned_from_tts(
         Ok(ret) => ret,
         Err(guar) => return ExpandResult::Ready(Err(guar)),
     };
-    let _ = p.eat(&token::Comma);
+    let _ = p.eat(exp!(Comma));
 
     if p.token != token::Eof {
         cx.dcx().emit_err(errors::OnlyOneArgument { span, name });
     }
-    expr_to_spanned_string(cx, ret, "argument must be a string literal").map(|res| {
-        res.map_err(|err| match err {
-            Ok((err, _)) => err.emit(),
-            Err(guar) => guar,
-        })
-        .map(|(symbol, _style, span)| (symbol, span))
-    })
+    ExpandResult::Ready(Ok(ret))
 }
 
 /// Extracts comma-separated expressions from `tts`.
@@ -196,7 +231,7 @@ pub(crate) fn get_single_str_spanned_from_tts(
 pub(crate) fn get_exprs_from_tts(
     cx: &mut ExtCtxt<'_>,
     tts: TokenStream,
-) -> ExpandResult<Result<Vec<P<ast::Expr>>, ErrorGuaranteed>, ()> {
+) -> ExpandResult<Result<Vec<Box<ast::Expr>>, ErrorGuaranteed>, ()> {
     let mut p = cx.new_parser_from_tts(tts);
     let mut es = Vec::new();
     while p.token != token::Eof {
@@ -216,7 +251,7 @@ pub(crate) fn get_exprs_from_tts(
         let expr = cx.expander().fully_expand_fragment(AstFragment::Expr(expr)).make_expr();
 
         es.push(expr);
-        if p.eat(&token::Comma) {
+        if p.eat(exp!(Comma)) {
             continue;
         }
         if p.token != token::Eof {

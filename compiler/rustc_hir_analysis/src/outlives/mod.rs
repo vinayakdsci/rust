@@ -1,8 +1,6 @@
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::query::Providers;
-use rustc_middle::ty::GenericArgKind;
-use rustc_middle::ty::{self, CratePredicatesMap, TyCtxt, Upcast};
+use rustc_middle::ty::{self, CratePredicatesMap, GenericArgKind, TyCtxt, Upcast};
 use rustc_span::Span;
 
 pub(crate) mod dump;
@@ -10,11 +8,10 @@ mod explicit;
 mod implicit_infer;
 mod utils;
 
-pub fn provide(providers: &mut Providers) {
-    *providers = Providers { inferred_outlives_of, inferred_outlives_crate, ..*providers };
-}
-
-fn inferred_outlives_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[(ty::Clause<'_>, Span)] {
+pub(super) fn inferred_outlives_of(
+    tcx: TyCtxt<'_>,
+    item_def_id: LocalDefId,
+) -> &[(ty::Clause<'_>, Span)] {
     match tcx.def_kind(item_def_id) {
         DefKind::Struct | DefKind::Enum | DefKind::Union => {
             let crate_map = tcx.inferred_outlives_crate(());
@@ -24,9 +21,9 @@ fn inferred_outlives_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[(ty::Clau
             let crate_map = tcx.inferred_outlives_crate(());
             crate_map.predicates.get(&item_def_id.to_def_id()).copied().unwrap_or(&[])
         }
-        DefKind::AnonConst if tcx.features().generic_const_exprs => {
+        DefKind::AnonConst if tcx.features().generic_const_exprs() => {
             let id = tcx.local_def_id_to_hir_id(item_def_id);
-            if tcx.hir().opt_const_param_default_param_def_id(id).is_some() {
+            if tcx.hir_opt_const_param_default_param_def_id(id).is_some() {
                 // In `generics_of` we set the generics' parent to be our parent's parent which means that
                 // we lose out on the predicates of our actual parent if we dont return those predicates here.
                 // (See comment in `generics_of` for more information on why the parent shenanigans is necessary)
@@ -38,7 +35,7 @@ fn inferred_outlives_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[(ty::Clau
                 //        parent of generics returned by `generics_of`
                 //
                 // In the above code we want the anon const to have predicates in its param env for `'b: 'a`
-                let item_def_id = tcx.hir().get_parent_item(id);
+                let item_def_id = tcx.hir_get_parent_item(id);
                 // In the above code example we would be calling `inferred_outlives_of(Foo)` here
                 tcx.inferred_outlives_of(item_def_id)
             } else {
@@ -49,7 +46,7 @@ fn inferred_outlives_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId) -> &[(ty::Clau
     }
 }
 
-fn inferred_outlives_crate(tcx: TyCtxt<'_>, (): ()) -> CratePredicatesMap<'_> {
+pub(super) fn inferred_outlives_crate(tcx: TyCtxt<'_>, (): ()) -> CratePredicatesMap<'_> {
     // Compute a map from each ADT (struct/enum/union) and lazy type alias to
     // the **explicit** outlives predicates (`T: 'a`, `'a: 'b`) that the user wrote.
     // Typically there won't be many of these, except in older code where
@@ -70,8 +67,8 @@ fn inferred_outlives_crate(tcx: TyCtxt<'_>, (): ()) -> CratePredicatesMap<'_> {
         .map(|(&def_id, set)| {
             let predicates =
                 &*tcx.arena.alloc_from_iter(set.as_ref().skip_binder().iter().filter_map(
-                    |(ty::OutlivesPredicate(kind1, region2), &span)| {
-                        match kind1.unpack() {
+                    |(ty::OutlivesPredicate(arg1, region2), &span)| {
+                        match arg1.kind() {
                             GenericArgKind::Type(ty1) => Some((
                                 ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty1, *region2))
                                     .upcast(tcx),

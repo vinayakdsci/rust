@@ -1,8 +1,7 @@
 //! This module contains logic for performing a merge of two sorted sub-slices.
 
-use crate::cmp;
 use crate::mem::MaybeUninit;
-use crate::ptr;
+use crate::{cmp, ptr};
 
 /// Merges non-decreasing runs `v[..mid]` and `v[mid..]` using `scratch` as
 /// temporary storage, and stores the result into `v[..]`.
@@ -144,7 +143,7 @@ impl<T> Drop for MergeState<T> {
         // leave the input slice `v` with each original element and all possible
         // modifications observed.
         unsafe {
-            let len = self.end.sub_ptr(self.start);
+            let len = self.end.offset_from_unsigned(self.start);
             ptr::copy_nonoverlapping(self.start, self.dst, len);
         }
     }

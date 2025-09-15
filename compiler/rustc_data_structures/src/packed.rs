@@ -1,7 +1,9 @@
-use crate::stable_hasher::{HashStable, StableHasher};
-use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use std::cmp::Ordering;
 use std::fmt;
+
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+
+use crate::stable_hasher::{HashStable, StableHasher};
 
 /// A packed 128-bit integer. Useful for reducing the size of structures in
 /// some cases.
@@ -13,6 +15,13 @@ impl Pu128 {
     #[inline]
     pub fn get(self) -> u128 {
         self.0
+    }
+}
+
+impl From<Pu128> for u128 {
+    #[inline]
+    fn from(value: Pu128) -> Self {
+        value.get()
     }
 }
 

@@ -1,8 +1,9 @@
-use clippy_config::msrvs::{self, Msrv};
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::sugg::Sugg;
-use clippy_utils::ty;
+use clippy_utils::{is_path_diagnostic_item, ty};
 use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
@@ -68,9 +69,8 @@ pub struct InstantSubtraction {
 }
 
 impl InstantSubtraction {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self { msrv: conf.msrv }
     }
 }
 
@@ -97,20 +97,17 @@ impl LateLintPass<'_> for InstantSubtraction {
                 print_manual_instant_elapsed_sugg(cx, expr, sugg);
             } else if ty::is_type_diagnostic_item(cx, rhs_ty, sym::Duration)
                 && !expr.span.from_expansion()
-                && self.msrv.meets(msrvs::TRY_FROM)
+                && self.msrv.meets(cx, msrvs::TRY_FROM)
             {
                 print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr);
             }
         }
     }
-
-    extract_msrv_attr!(LateContext);
 }
 
 fn is_instant_now_call(cx: &LateContext<'_>, expr_block: &'_ Expr<'_>) -> bool {
     if let ExprKind::Call(fn_expr, []) = expr_block.kind
-        && let Some(fn_id) = clippy_utils::path_def_id(cx, fn_expr)
-        && clippy_utils::match_def_path(cx, fn_id, &clippy_utils::paths::INSTANT_NOW)
+        && is_path_diagnostic_item(cx, fn_expr, sym::instant_now)
     {
         true
     } else {
@@ -125,7 +122,7 @@ fn print_manual_instant_elapsed_sugg(cx: &LateContext<'_>, expr: &Expr<'_>, sugg
         expr.span,
         "manual implementation of `Instant::elapsed`",
         "try",
-        format!("{}.elapsed()", sugg.maybe_par()),
+        format!("{}.elapsed()", sugg.maybe_paren()),
         Applicability::MachineApplicable,
     );
 }

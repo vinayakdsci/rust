@@ -1,6 +1,6 @@
 //@ edition:2018
-//@ aux-build:test-macros.rs
-//@ aux-build:derive-helper-shadowing.rs
+//@ proc-macro: test-macros.rs
+//@ proc-macro: derive-helper-shadowing.rs
 
 #[macro_use]
 extern crate test_macros;
@@ -17,7 +17,7 @@ macro_rules! gen_helper_use {
 }
 
 #[empty_helper] //~ ERROR `empty_helper` is ambiguous
-                //~| WARN derive helper attribute is used before it is introduced
+                //~| ERROR derive helper attribute is used before it is introduced
                 //~| WARN this was previously accepted
 #[derive(Empty)]
 struct S {

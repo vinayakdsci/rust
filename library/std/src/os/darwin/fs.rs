@@ -1,12 +1,12 @@
-#![allow(dead_code)]
+//! Darwin-specific extension traits to [`fs`].
+//!
+//! [`fs`]: crate::fs
+#![stable(feature = "metadata_ext", since = "1.1.0")]
 
 use crate::fs::{self, Metadata};
 use crate::sealed::Sealed;
 use crate::sys_common::{AsInner, AsInnerMut, IntoInner};
 use crate::time::SystemTime;
-
-#[allow(deprecated)]
-use super::raw;
 
 /// OS-specific extensions to [`fs::Metadata`].
 ///
@@ -26,7 +26,10 @@ pub trait MetadataExt {
                 methods of this trait"
     )]
     #[allow(deprecated)]
-    fn as_raw_stat(&self) -> &raw::stat;
+    // Only available on macOS and iOS, since they were stably exposed there.
+    #[cfg(any(doc, target_os = "macos", target_os = "ios"))]
+    #[doc(cfg(any(target_os = "macos", target_os = "ios")))]
+    fn as_raw_stat(&self) -> &super::raw::stat;
 
     #[stable(feature = "metadata_ext2", since = "1.8.0")]
     fn st_dev(&self) -> u64;
@@ -78,8 +81,9 @@ pub trait MetadataExt {
 #[stable(feature = "metadata_ext", since = "1.1.0")]
 impl MetadataExt for Metadata {
     #[allow(deprecated)]
-    fn as_raw_stat(&self) -> &raw::stat {
-        unsafe { &*(self.as_inner().as_inner() as *const libc::stat as *const raw::stat) }
+    #[cfg(any(doc, target_os = "macos", target_os = "ios"))]
+    fn as_raw_stat(&self) -> &super::raw::stat {
+        unsafe { &*(self.as_inner().as_inner() as *const libc::stat as *const super::raw::stat) }
     }
     fn st_dev(&self) -> u64 {
         self.as_inner().as_inner().st_dev as u64

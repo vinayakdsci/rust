@@ -1,7 +1,7 @@
 //! This module provides the functionality needed to convert diagnostics from
 //! `cargo check` json format to the LSP diagnostic format.
 
-use flycheck::{Applicability, DiagnosticLevel, DiagnosticSpan};
+use crate::flycheck::{Applicability, DiagnosticLevel, DiagnosticSpan};
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use stdx::format_to;
@@ -17,8 +17,8 @@ use super::{DiagnosticsMapConfig, Fix};
 /// Determines the LSP severity from a diagnostic
 fn diagnostic_severity(
     config: &DiagnosticsMapConfig,
-    level: flycheck::DiagnosticLevel,
-    code: Option<flycheck::DiagnosticCode>,
+    level: crate::flycheck::DiagnosticLevel,
+    code: Option<crate::flycheck::DiagnosticCode>,
 ) -> Option<lsp_types::DiagnosticSeverity> {
     let res = match level {
         DiagnosticLevel::Ice => lsp_types::DiagnosticSeverity::ERROR,
@@ -170,7 +170,7 @@ fn resolve_path(
 
 struct SubDiagnostic {
     related: lsp_types::DiagnosticRelatedInformation,
-    suggested_fix: Option<Fix>,
+    suggested_fix: Option<Box<Fix>>,
 }
 
 enum MappedRustChildDiagnostic {
@@ -181,7 +181,7 @@ enum MappedRustChildDiagnostic {
 fn map_rust_child_diagnostic(
     config: &DiagnosticsMapConfig,
     workspace_root: &AbsPath,
-    rd: &flycheck::Diagnostic,
+    rd: &crate::flycheck::Diagnostic,
     snap: &GlobalStateSnapshot,
 ) -> MappedRustChildDiagnostic {
     let spans: Vec<&DiagnosticSpan> = rd.spans.iter().filter(|s| s.is_primary).collect();
@@ -241,7 +241,7 @@ fn map_rust_child_diagnostic(
                 location: location(config, workspace_root, spans[0], snap),
                 message: message.clone(),
             },
-            suggested_fix: Some(Fix {
+            suggested_fix: Some(Box::new(Fix {
                 ranges: spans
                     .iter()
                     .map(|&span| location(config, workspace_root, span, snap).range)
@@ -260,7 +260,7 @@ fn map_rust_child_diagnostic(
                     data: None,
                     command: None,
                 },
-            }),
+            })),
         })
     }
 }
@@ -269,7 +269,7 @@ fn map_rust_child_diagnostic(
 pub(crate) struct MappedRustDiagnostic {
     pub(crate) url: lsp_types::Url,
     pub(crate) diagnostic: lsp_types::Diagnostic,
-    pub(crate) fix: Option<Fix>,
+    pub(crate) fix: Option<Box<Fix>>,
 }
 
 /// Converts a Rust root diagnostic to LSP form
@@ -284,7 +284,7 @@ pub(crate) struct MappedRustDiagnostic {
 /// If the diagnostic has no primary span this will return `None`
 pub(crate) fn map_rust_diagnostic_to_lsp(
     config: &DiagnosticsMapConfig,
-    rd: &flycheck::Diagnostic,
+    rd: &crate::flycheck::Diagnostic,
     workspace_root: &AbsPath,
     snap: &GlobalStateSnapshot,
 ) -> Vec<MappedRustDiagnostic> {
@@ -298,10 +298,10 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
     let mut source = String::from("rustc");
     let mut code = rd.code.as_ref().map(|c| c.code.clone());
 
-    if let Some(code_val) = &code {
-        if config.check_ignore.contains(code_val) {
-            return Vec::new();
-        }
+    if let Some(code_val) = &code
+        && config.check_ignore.contains(code_val)
+    {
+        return Vec::new();
     }
 
     if let Some(code_val) = &code {
@@ -373,10 +373,8 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
             let primary_location = primary_location(config, workspace_root, primary_span, snap);
             let message = {
                 let mut message = message.clone();
-                if needs_primary_span_label {
-                    if let Some(primary_span_label) = &primary_span.label {
-                        format_to!(message, "\n{}", primary_span_label);
-                    }
+                if needs_primary_span_label && let Some(primary_span_label) = &primary_span.label {
+                    format_to!(message, "\n{}", primary_span_label);
                 }
                 message
             };
@@ -455,11 +453,7 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
                             .cloned()
                             .chain(subdiagnostics.iter().map(|sub| sub.related.clone()))
                             .collect::<Vec<_>>();
-                        if info.is_empty() {
-                            None
-                        } else {
-                            Some(info)
-                        }
+                        if info.is_empty() { None } else { Some(info) }
                     },
                     tags: if tags.is_empty() { None } else { Some(tags.clone()) },
                     data: Some(serde_json::json!({ "rendered": rd.rendered })),
@@ -500,7 +494,7 @@ pub(crate) fn map_rust_diagnostic_to_lsp(
 fn rustc_code_description(code: Option<&str>) -> Option<lsp_types::CodeDescription> {
     code.filter(|code| {
         let mut chars = code.chars();
-        chars.next().map_or(false, |c| c == 'E')
+        chars.next() == Some('E')
             && chars.by_ref().take(4).all(|c| c.is_ascii_digit())
             && chars.next().is_none()
     })
@@ -528,7 +522,7 @@ mod tests {
 
     use super::*;
 
-    use expect_test::{expect_file, ExpectFile};
+    use expect_test::{ExpectFile, expect_file};
     use lsp_types::ClientCapabilities;
     use paths::Utf8Path;
 
@@ -537,7 +531,8 @@ mod tests {
     }
 
     fn check_with_config(config: DiagnosticsMapConfig, diagnostics_json: &str, expect: ExpectFile) {
-        let diagnostic: flycheck::Diagnostic = serde_json::from_str(diagnostics_json).unwrap();
+        let diagnostic: crate::flycheck::Diagnostic =
+            serde_json::from_str(diagnostics_json).unwrap();
         let workspace_root: &AbsPath = Utf8Path::new("/test/").try_into().unwrap();
         let (sender, _) = crossbeam_channel::unbounded();
         let state = GlobalState::new(
@@ -546,7 +541,6 @@ mod tests {
                 workspace_root.to_path_buf(),
                 ClientCapabilities::default(),
                 Vec::new(),
-                None,
                 None,
             ),
         );

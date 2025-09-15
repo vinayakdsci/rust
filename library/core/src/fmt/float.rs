@@ -1,7 +1,6 @@
 use crate::fmt::{Debug, Display, Formatter, LowerExp, Result, UpperExp};
 use crate::mem::MaybeUninit;
-use crate::num::flt2dec;
-use crate::num::fmt as numfmt;
+use crate::num::{flt2dec, fmt as numfmt};
 
 #[doc(hidden)]
 trait GeneralFormat: PartialOrd {
@@ -14,13 +13,15 @@ macro_rules! impl_general_format {
     ($($t:ident)*) => {
         $(impl GeneralFormat for $t {
             fn already_rounded_value_should_use_exponential(&self) -> bool {
-                let abs = $t::abs_private(*self);
+                let abs = $t::abs(*self);
                 (abs != 0.0 && abs < 1e-4) || abs >= 1e+16
             }
         })*
     }
 }
 
+#[cfg(target_has_reliable_f16)]
+impl_general_format! { f16 }
 impl_general_format! { f32 f64 }
 
 // Don't inline this so callers don't use the stack space this function
@@ -30,7 +31,7 @@ fn float_to_decimal_common_exact<T>(
     fmt: &mut Formatter<'_>,
     num: &T,
     sign: flt2dec::Sign,
-    precision: usize,
+    precision: u16,
 ) -> Result
 where
     T: flt2dec::DecodableFloat,
@@ -41,7 +42,7 @@ where
         flt2dec::strategy::grisu::format_exact,
         *num,
         sign,
-        precision,
+        precision.into(),
         &mut buf,
         &mut parts,
     );
@@ -56,7 +57,7 @@ fn float_to_decimal_common_shortest<T>(
     fmt: &mut Formatter<'_>,
     num: &T,
     sign: flt2dec::Sign,
-    precision: usize,
+    precision: u16,
 ) -> Result
 where
     T: flt2dec::DecodableFloat,
@@ -69,7 +70,7 @@ where
         flt2dec::strategy::grisu::format_shortest,
         *num,
         sign,
-        precision,
+        precision.into(),
         &mut buf,
         &mut parts,
     );
@@ -87,7 +88,7 @@ where
         true => flt2dec::Sign::MinusPlus,
     };
 
-    if let Some(precision) = fmt.precision {
+    if let Some(precision) = fmt.options.get_precision() {
         float_to_decimal_common_exact(fmt, num, sign, precision)
     } else {
         let min_precision = 0;
@@ -102,7 +103,7 @@ fn float_to_exponential_common_exact<T>(
     fmt: &mut Formatter<'_>,
     num: &T,
     sign: flt2dec::Sign,
-    precision: usize,
+    precision: u16,
     upper: bool,
 ) -> Result
 where
@@ -114,7 +115,7 @@ where
         flt2dec::strategy::grisu::format_exact,
         *num,
         sign,
-        precision,
+        precision.into(),
         upper,
         &mut buf,
         &mut parts,
@@ -163,7 +164,7 @@ where
         true => flt2dec::Sign::MinusPlus,
     };
 
-    if let Some(precision) = fmt.precision {
+    if let Some(precision) = fmt.options.get_precision() {
         // 1 integral digit + `precision` fractional digits = `precision + 1` total digits
         float_to_exponential_common_exact(fmt, num, sign, precision + 1, upper)
     } else {
@@ -181,7 +182,7 @@ where
         true => flt2dec::Sign::MinusPlus,
     };
 
-    if let Some(precision) = fmt.precision {
+    if let Some(precision) = fmt.options.get_precision() {
         // this behavior of {:.PREC?} predates exponential formatting for {:?}
         float_to_decimal_common_exact(fmt, num, sign, precision)
     } else {
@@ -197,45 +198,80 @@ where
 }
 
 macro_rules! floating {
-    ($ty:ident) => {
-        #[stable(feature = "rust1", since = "1.0.0")]
-        impl Debug for $ty {
-            fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
-                float_to_general_debug(fmt, self)
+    ($($ty:ident)*) => {
+        $(
+            #[stable(feature = "rust1", since = "1.0.0")]
+            impl Debug for $ty {
+                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
+                    float_to_general_debug(fmt, self)
+                }
             }
-        }
 
-        #[stable(feature = "rust1", since = "1.0.0")]
-        impl Display for $ty {
-            fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
-                float_to_decimal_display(fmt, self)
+            #[stable(feature = "rust1", since = "1.0.0")]
+            impl Display for $ty {
+                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
+                    float_to_decimal_display(fmt, self)
+                }
             }
-        }
 
-        #[stable(feature = "rust1", since = "1.0.0")]
-        impl LowerExp for $ty {
-            fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
-                float_to_exponential_common(fmt, self, false)
+            #[stable(feature = "rust1", since = "1.0.0")]
+            impl LowerExp for $ty {
+                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
+                    float_to_exponential_common(fmt, self, false)
+                }
             }
-        }
 
-        #[stable(feature = "rust1", since = "1.0.0")]
-        impl UpperExp for $ty {
-            fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
-                float_to_exponential_common(fmt, self, true)
+            #[stable(feature = "rust1", since = "1.0.0")]
+            impl UpperExp for $ty {
+                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
+                    float_to_exponential_common(fmt, self, true)
+                }
             }
-        }
+        )*
     };
 }
 
-floating! { f32 }
-floating! { f64 }
+floating! { f32 f64 }
 
+#[cfg(target_has_reliable_f16)]
+floating! { f16 }
+
+// FIXME(f16_f128): A fallback is used when the backend+target does not support f16 well, in order
+// to avoid ICEs.
+
+#[cfg(not(target_has_reliable_f16))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Debug for f16 {
     #[inline]
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(f, "{:#06x}", self.to_bits())
+    }
+}
+
+#[cfg(not(target_has_reliable_f16))]
+#[stable(feature = "rust1", since = "1.0.0")]
+impl Display for f16 {
+    #[inline]
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
+        Debug::fmt(self, fmt)
+    }
+}
+
+#[cfg(not(target_has_reliable_f16))]
+#[stable(feature = "rust1", since = "1.0.0")]
+impl LowerExp for f16 {
+    #[inline]
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
+        Debug::fmt(self, fmt)
+    }
+}
+
+#[cfg(not(target_has_reliable_f16))]
+#[stable(feature = "rust1", since = "1.0.0")]
+impl UpperExp for f16 {
+    #[inline]
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
+        Debug::fmt(self, fmt)
     }
 }
 

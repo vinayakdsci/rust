@@ -1,22 +1,24 @@
 #[cfg(feature = "master")]
 use gccjit::{FnAttribute, VarAttribute, Visibility};
 use gccjit::{Function, GlobalKind, LValue, RValue, ToRValue, Type};
-use rustc_codegen_ssa::traits::{BaseTypeMethods, ConstMethods, StaticMethods};
+use rustc_abi::{self as abi, Align, HasDataLayout, Primitive, Size, WrappingRange};
+use rustc_codegen_ssa::traits::{
+    BaseTypeCodegenMethods, ConstCodegenMethods, StaticCodegenMethods,
+};
+use rustc_hir::attrs::Linkage;
 use rustc_hir::def::DefKind;
-use rustc_middle::bug;
+use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::interpret::{
-    self, read_target_uint, ConstAllocation, ErrorHandled, Scalar as InterpScalar,
+    self, ConstAllocation, ErrorHandled, Scalar as InterpScalar, read_target_uint,
 };
-use rustc_middle::span_bug;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::{self, Instance};
+use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::DefId;
-use rustc_target::abi::{self, Align, HasDataLayout, Primitive, Size, WrappingRange};
 
 use crate::base;
 use crate::context::CodegenCx;
-use crate::errors::InvalidMinimumAlignment;
 use crate::type_of::LayoutGccExt;
 
 fn set_global_alignment<'gcc, 'tcx>(
@@ -27,31 +29,22 @@ fn set_global_alignment<'gcc, 'tcx>(
     // The target may require greater alignment for globals than the type does.
     // Note: GCC and Clang also allow `__attribute__((aligned))` on variables,
     // which can force it to be smaller. Rust doesn't support this yet.
-    if let Some(min) = cx.sess().target.min_global_align {
-        match Align::from_bits(min) {
-            Ok(min) => align = align.max(min),
-            Err(err) => {
-                cx.sess().dcx().emit_err(InvalidMinimumAlignment { err: err.to_string() });
-            }
-        }
+    if let Some(min_global) = cx.sess().target.min_global_align {
+        align = Ord::max(align, min_global);
     }
     gv.set_alignment(align.bytes() as i32);
 }
 
-impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
+impl<'gcc, 'tcx> StaticCodegenMethods for CodegenCx<'gcc, 'tcx> {
     fn static_addr_of(&self, cv: RValue<'gcc>, align: Align, kind: Option<&str>) -> RValue<'gcc> {
-        // TODO(antoyo): implement a proper rvalue comparison in libgccjit instead of doing the
-        // following:
-        for (value, variable) in &*self.const_globals.borrow() {
-            if format!("{:?}", value) == format!("{:?}", cv) {
-                if let Some(global_variable) = self.global_lvalues.borrow().get(variable) {
-                    let alignment = align.bits() as i32;
-                    if alignment > global_variable.get_alignment() {
-                        global_variable.set_alignment(alignment);
-                    }
+        if let Some(variable) = self.const_globals.borrow().get(&cv) {
+            if let Some(global_variable) = self.global_lvalues.borrow().get(variable) {
+                let alignment = align.bits() as i32;
+                if alignment > global_variable.get_alignment() {
+                    global_variable.set_alignment(alignment);
                 }
-                return *variable;
             }
+            return *variable;
         }
         let global_value = self.static_addr_of_mut(cv, align, kind);
         #[cfg(feature = "master")]
@@ -65,7 +58,7 @@ impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
     }
 
     #[cfg_attr(not(feature = "master"), allow(unused_mut))]
-    fn codegen_static(&self, def_id: DefId) {
+    fn codegen_static(&mut self, def_id: DefId) {
         let attrs = self.tcx.codegen_fn_attrs(def_id);
 
         let Ok((value, alloc)) = codegen_static_initializer(self, def_id) else {
@@ -88,6 +81,8 @@ impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
         if global.to_rvalue().get_type() != val_llty {
             global.to_rvalue().set_type(val_llty);
         }
+
+        // NOTE: Alignment from attributes has already been applied to the allocation.
         set_global_alignment(self, global, alloc.align);
 
         global.global_set_initializer_rvalue(value);
@@ -129,7 +124,7 @@ impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
             // will use load-unaligned instructions instead, and thus avoiding the crash.
             //
             // We could remove this hack whenever we decide to drop macOS 10.10 support.
-            if self.tcx.sess.target.options.is_like_osx {
+            if self.tcx.sess.target.options.is_like_darwin {
                 // The `inspect` method is okay here because we checked for provenance, and
                 // because we are doing this access to inspect the final interpreter state
                 // (not as part of the interpreter execution).
@@ -144,7 +139,7 @@ impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
 
         // Wasm statics with custom link sections get special treatment as they
         // go into custom sections of the wasm executable.
-        if self.tcx.sess.opts.target_triple.triple().starts_with("wasm32") {
+        if self.tcx.sess.target.is_like_wasm {
             if let Some(_section) = attrs.link_section {
                 unimplemented!();
             }
@@ -152,25 +147,20 @@ impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
             // TODO(antoyo): set link section.
         }
 
-        if attrs.flags.contains(CodegenFnAttrFlags::USED)
+        if attrs.flags.contains(CodegenFnAttrFlags::USED_COMPILER)
             || attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
         {
             self.add_used_global(global.to_rvalue());
         }
     }
-
-    /// Add a global value to a list to be stored in the `llvm.used` variable, an array of i8*.
-    fn add_used_global(&self, _global: RValue<'gcc>) {
-        // TODO(antoyo)
-    }
-
-    fn add_compiler_used_global(&self, global: RValue<'gcc>) {
-        // NOTE: seems like GCC does not make the distinction between compiler.used and used.
-        self.add_used_global(global);
-    }
 }
 
 impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
+    /// Add a global value to a list to be stored in the `llvm.used` variable, an array of i8*.
+    pub fn add_used_global(&mut self, _global: RValue<'gcc>) {
+        // TODO(antoyo)
+    }
+
     #[cfg_attr(not(feature = "master"), allow(unused_variables))]
     pub fn add_used_function(&self, function: Function<'gcc>) {
         #[cfg(feature = "master")]
@@ -189,13 +179,11 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
                 // TODO(antoyo): check if it's okay that no link_section is set.
 
                 let typ = self.val_ty(cv).get_aligned(align.bytes());
-                let global = self.declare_private_global(&name[..], typ);
-                global
+                self.declare_private_global(&name[..], typ)
             }
             _ => {
                 let typ = self.val_ty(cv).get_aligned(align.bytes());
-                let global = self.declare_unnamed_global(typ);
-                global
+                self.declare_unnamed_global(typ)
             }
         };
         global.global_set_initializer_rvalue(cv);
@@ -213,7 +201,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         let gcc_type = if nested {
             self.type_i8()
         } else {
-            let ty = instance.ty(self.tcx, ty::ParamEnv::reveal_all());
+            let ty = instance.ty(self.tcx, ty::TypingEnv::fully_monomorphized());
             self.layout_of(ty).gcc_type(self)
         };
 
@@ -240,24 +228,24 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         let fn_attrs = self.tcx.codegen_fn_attrs(def_id);
 
         let global = if def_id.is_local() && !self.tcx.is_foreign_item(def_id) {
-            if let Some(global) = self.get_declared_value(sym) {
-                if self.val_ty(global) != self.type_ptr_to(gcc_type) {
-                    span_bug!(self.tcx.def_span(def_id), "Conflicting types for static");
-                }
+            if let Some(global) = self.get_declared_value(sym)
+                && self.val_ty(global) != self.type_ptr_to(gcc_type)
+            {
+                span_bug!(self.tcx.def_span(def_id), "Conflicting types for static");
             }
 
             let is_tls = fn_attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL);
             let global = self.declare_global(
                 sym,
                 gcc_type,
-                GlobalKind::Exported,
+                GlobalKind::Imported,
                 is_tls,
                 fn_attrs.link_section,
             );
 
             if !self.tcx.is_reachable_non_generic(def_id) {
                 #[cfg(feature = "master")]
-                global.add_string_attribute(VarAttribute::Visibility(Visibility::Hidden));
+                global.add_attribute(VarAttribute::Visibility(Visibility::Hidden));
             }
 
             global
@@ -299,15 +287,17 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         global
     }
 }
-
-pub fn const_alloc_to_gcc<'gcc, 'tcx>(
-    cx: &CodegenCx<'gcc, 'tcx>,
-    alloc: ConstAllocation<'tcx>,
+/// Converts a given const alloc to a gcc Rvalue, without any caching or deduplication.
+/// YOU SHOULD NOT call this function directly - that may break the semantics of Rust.
+/// Use `const_data_from_alloc` instead.
+pub(crate) fn const_alloc_to_gcc_uncached<'gcc>(
+    cx: &CodegenCx<'gcc, '_>,
+    alloc: ConstAllocation<'_>,
 ) -> RValue<'gcc> {
     let alloc = alloc.inner();
     let mut llvals = Vec::with_capacity(alloc.provenance().ptrs().len() + 1);
     let dl = cx.data_layout();
-    let pointer_size = dl.pointer_size.bytes() as usize;
+    let pointer_size = dl.pointer_size().bytes() as usize;
 
     let mut next_offset = 0;
     for &(offset, prov) in alloc.provenance().ptrs().iter() {
@@ -332,7 +322,7 @@ pub fn const_alloc_to_gcc<'gcc, 'tcx>(
             // and we properly interpret the provenance as a relocation pointer offset.
             alloc.inspect_with_uninit_and_ptr_outside_interpreter(offset..(offset + pointer_size)),
         )
-        .expect("const_alloc_to_llvm: could not read relocation pointer")
+        .expect("const_alloc_to_gcc_uncached: could not read relocation pointer")
             as u64;
 
         let address_space = cx.tcx.global_alloc(alloc_id).address_space(cx);
@@ -344,7 +334,7 @@ pub fn const_alloc_to_gcc<'gcc, 'tcx>(
             ),
             abi::Scalar::Initialized {
                 value: Primitive::Pointer(address_space),
-                valid_range: WrappingRange::full(dl.pointer_size),
+                valid_range: WrappingRange::full(dl.pointer_size()),
             },
             cx.type_i8p_ext(address_space),
         ));
@@ -362,6 +352,7 @@ pub fn const_alloc_to_gcc<'gcc, 'tcx>(
         llvals.push(cx.const_bytes(bytes));
     }
 
+    // FIXME(bjorn3) avoid wrapping in a struct when there is only a single element.
     cx.const_struct(&llvals, true)
 }
 
@@ -370,7 +361,7 @@ fn codegen_static_initializer<'gcc, 'tcx>(
     def_id: DefId,
 ) -> Result<(RValue<'gcc>, ConstAllocation<'tcx>), ErrorHandled> {
     let alloc = cx.tcx.eval_static_initializer(def_id)?;
-    Ok((const_alloc_to_gcc(cx, alloc), alloc))
+    Ok((cx.const_data_from_alloc(alloc), alloc))
 }
 
 fn check_and_apply_linkage<'gcc, 'tcx>(
@@ -385,19 +376,23 @@ fn check_and_apply_linkage<'gcc, 'tcx>(
         let global1 =
             cx.declare_global_with_linkage(sym, cx.type_i8(), base::global_linkage_to_gcc(linkage));
 
+        if linkage == Linkage::ExternalWeak {
+            #[cfg(feature = "master")]
+            global1.add_attribute(VarAttribute::Weak);
+        }
+
         // Declare an internal global `extern_with_linkage_foo` which
         // is initialized with the address of `foo`.  If `foo` is
         // discarded during linking (for example, if `foo` has weak
         // linkage and there are no definitions), then
         // `extern_with_linkage_foo` will instead be initialized to
         // zero.
-        let mut real_name = "_rust_extern_with_linkage_".to_string();
-        real_name.push_str(sym);
+        let real_name =
+            format!("_rust_extern_with_linkage_{:016x}_{sym}", cx.tcx.stable_crate_id(LOCAL_CRATE));
         let global2 = cx.define_global(&real_name, gcc_type, is_tls, attrs.link_section);
         // TODO(antoyo): set linkage.
         let value = cx.const_ptrcast(global1.get_address(None), gcc_type);
         global2.global_set_initializer_rvalue(value);
-        // TODO(antoyo): use global_set_initializer() when it will work.
         global2
     } else {
         // Generate an external declaration.

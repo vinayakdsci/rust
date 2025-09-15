@@ -1,18 +1,18 @@
-use std::env;
-use std::process;
+use std::{env, process};
 
+mod abi_test;
 mod build;
 mod clean;
 mod clone_gcc;
 mod config;
 mod fmt;
+mod fuzz;
 mod info;
 mod prepare;
 mod rust_tools;
 mod rustc_info;
 mod test;
 mod utils;
-
 const BUILD_DIR: &str = "build";
 
 macro_rules! arg_error {
@@ -35,15 +35,17 @@ Options:
         --help    : Displays this help message.
 
 Commands:
-        cargo     : Executes a cargo command. 
+        cargo     : Executes a cargo command.
         rustc     : Compiles the program using the GCC compiler.
         clean     : Cleans the build directory, removing all compiled files and artifacts.
         prepare   : Prepares the environment for building, including fetching dependencies and setting up configurations.
-        build     : Compiles the project. 
+        build     : Compiles the project.
         test      : Runs tests for the project.
         info      : Displays information about the build environment and project configuration.
         clone-gcc : Clones the GCC compiler from a specified source.
-        fmt       : Runs rustfmt"
+        fmt       : Runs rustfmt
+        fuzz      : Fuzzes `cg_gcc` using rustlantis
+        abi-test   : Runs the abi-cafe test suite on the codegen, checking for ABI compatibility with LLVM"
     );
 }
 
@@ -57,11 +59,15 @@ pub enum Command {
     Test,
     Info,
     Fmt,
+    Fuzz,
+    AbiTest,
 }
 
 fn main() {
     if env::var("RUST_BACKTRACE").is_err() {
-        env::set_var("RUST_BACKTRACE", "1");
+        unsafe {
+            env::set_var("RUST_BACKTRACE", "1");
+        }
     }
 
     let command = match env::args().nth(1).as_deref() {
@@ -73,7 +79,9 @@ fn main() {
         Some("test") => Command::Test,
         Some("info") => Command::Info,
         Some("clone-gcc") => Command::CloneGcc,
+        Some("abi-test") => Command::AbiTest,
         Some("fmt") => Command::Fmt,
+        Some("fuzz") => Command::Fuzz,
         Some("--help") => {
             usage();
             process::exit(0);
@@ -96,6 +104,8 @@ fn main() {
         Command::Info => info::run(),
         Command::CloneGcc => clone_gcc::run(),
         Command::Fmt => fmt::run(),
+        Command::Fuzz => fuzz::run(),
+        Command::AbiTest => abi_test::run(),
     } {
         eprintln!("Command failed to run: {e}");
         process::exit(1);

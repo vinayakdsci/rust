@@ -1,15 +1,19 @@
+//@ ignore-backends: gcc
 //@ run-pass
 
-#![feature(repr_simd, intrinsics)]
+#![feature(repr_simd, core_intrinsics)]
 #![allow(non_camel_case_types)]
 
-#[repr(simd, packed)]
-struct Simd<T, const N: usize>([T; N]);
+#[path = "../../auxiliary/minisimd.rs"]
+mod minisimd;
+use minisimd::*;
+
+use std::intrinsics::simd::simd_add;
 
 fn check_size_align<T, const N: usize>() {
     use std::mem;
-    assert_eq!(mem::size_of::<Simd<T, N>>(), mem::size_of::<[T; N]>());
-    assert_eq!(mem::size_of::<Simd<T, N>>() % mem::align_of::<Simd<T, N>>(), 0);
+    assert_eq!(mem::size_of::<PackedSimd<T, N>>(), mem::size_of::<[T; N]>());
+    assert_eq!(mem::size_of::<PackedSimd<T, N>>() % mem::align_of::<PackedSimd<T, N>>(), 0);
 }
 
 fn check_ty<T>() {
@@ -20,10 +24,6 @@ fn check_ty<T>() {
     check_size_align::<T, 8>();
     check_size_align::<T, 9>();
     check_size_align::<T, 15>();
-}
-
-extern "rust-intrinsic" {
-    fn simd_add<T>(a: T, b: T) -> T;
 }
 
 fn main() {
@@ -37,14 +37,21 @@ fn main() {
 
     unsafe {
         // powers-of-two have no padding and have the same layout as #[repr(simd)]
-        let x: Simd<f64, 4> =
-            simd_add(Simd::<f64, 4>([0., 1., 2., 3.]), Simd::<f64, 4>([2., 2., 2., 2.]));
-        assert_eq!(std::mem::transmute::<_, [f64; 4]>(x), [2., 3., 4., 5.]);
+        let x: PackedSimd<f64, 4> =
+            simd_add(
+                PackedSimd::<f64, 4>([0., 1., 2., 3.]),
+                PackedSimd::<f64, 4>([2., 2., 2., 2.]),
+            );
+        assert_eq!(x.into_array(), [2., 3., 4., 5.]);
 
         // non-powers-of-two should have padding (which is removed by #[repr(packed)]),
         // but the intrinsic handles it
-        let x: Simd<f64, 3> = simd_add(Simd::<f64, 3>([0., 1., 2.]), Simd::<f64, 3>([2., 2., 2.]));
-        let arr: [f64; 3] = x.0;
+        let x: PackedSimd<f64, 3> =
+            simd_add(
+                PackedSimd::<f64, 3>([0., 1., 2.]),
+                PackedSimd::<f64, 3>([2., 2., 2.]),
+            );
+        let arr: [f64; 3] = x.into_array();
         assert_eq!(arr, [2., 3., 4.]);
     }
 }

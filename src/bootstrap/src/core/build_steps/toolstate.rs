@@ -4,16 +4,15 @@
 //!
 //! [Toolstate]: https://forge.rust-lang.org/infra/toolstate.html
 
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
-use crate::utils::helpers::{self, t};
-use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
-use std::fmt;
-use std::fs;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time;
+use std::{env, fmt, fs, time};
+
+use serde_derive::{Deserialize, Serialize};
+
+use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
+use crate::utils::helpers::{self, t};
 
 // Each cycle is 42 days long (6 weeks); the last week is 35..=42 then.
 const BETA_WEEK_START: u64 = 35;
@@ -81,10 +80,7 @@ static STABLE_TOOLS: &[(&str, &str)] = &[
 // We do require that we checked whether they build or not on the tools builder,
 // though, as otherwise we will be unable to file an issue if they start
 // failing.
-static NIGHTLY_TOOLS: &[(&str, &str)] = &[
-    ("embedded-book", "src/doc/embedded-book"),
-    // ("rustc-dev-guide", "src/doc/rustc-dev-guide"),
-];
+static NIGHTLY_TOOLS: &[(&str, &str)] = &[("embedded-book", "src/doc/embedded-book")];
 
 fn print_error(tool: &str, submodule: &str) {
     eprintln!();
@@ -102,12 +98,11 @@ fn print_error(tool: &str, submodule: &str) {
 fn check_changed_files(builder: &Builder<'_>, toolstates: &HashMap<Box<str>, ToolState>) {
     // Changed files
     let output = helpers::git(None)
-        .capture()
         .arg("diff")
         .arg("--name-status")
         .arg("HEAD")
         .arg("HEAD^")
-        .run(builder)
+        .run_capture(builder)
         .stdout();
 
     for (tool, submodule) in STABLE_TOOLS.iter().chain(NIGHTLY_TOOLS.iter()) {
@@ -133,7 +128,7 @@ impl Step for ToolStateCheck {
     /// Checks tool state status.
     ///
     /// This is intended to be used in the `checktools.sh` script. To use
-    /// this, set `save-toolstates` in `config.toml` so that tool status will
+    /// this, set `save-toolstates` in `bootstrap.toml` so that tool status will
     /// be saved to a JSON file. Then, run `x.py test --no-fail-fast` for all
     /// of the tools to populate the JSON file. After that is done, this
     /// command can be run to check for any status failures, and exits with an
@@ -259,7 +254,7 @@ impl Builder<'_> {
     /// Updates the actual toolstate of a tool.
     ///
     /// The toolstates are saved to the file specified by the key
-    /// `rust.save-toolstates` in `config.toml`. If unspecified, nothing will be
+    /// `rust.save-toolstates` in `bootstrap.toml`. If unspecified, nothing will be
     /// done. The file is updated immediately after this function completes.
     pub fn save_toolstate(&self, tool: &str, state: ToolState) {
         use std::io::Write;
@@ -359,12 +354,12 @@ fn read_old_toolstate() -> Vec<RepoState> {
 ///   1. Generate a new Personal access token:
 ///
 ///       * Login to the bot account, and go to Settings -> Developer settings ->
-///           Personal access tokens
+///         Personal access tokens
 ///       * Click "Generate new token"
 ///       * Enable the "public_repo" permission, then click "Generate token"
 ///       * Copy the generated token (should be a 40-digit hexadecimal number).
-///           Save it somewhere secure, as the token would be gone once you leave
-///           the page.
+///         Save it somewhere secure, as the token would be gone once you leave
+///         the page.
 ///
 ///   2. Update the variable group in Azure Pipelines
 ///
@@ -373,7 +368,7 @@ fn read_old_toolstate() -> Vec<RepoState> {
 ///   4. Replace the email address below if the bot account identity is changed
 ///
 ///       * See <https://help.github.com/articles/about-commit-email-addresses/>
-///           if a private email by GitHub is wanted.
+///         if a private email by GitHub is wanted.
 fn commit_toolstate_change(builder: &Builder<'_>, current_toolstate: &ToolstateData) {
     let message = format!("({} CI update)", OS.expect("linux/windows only"));
     let mut success = false;
@@ -391,7 +386,7 @@ fn commit_toolstate_change(builder: &Builder<'_>, current_toolstate: &ToolstateD
             .arg("-m")
             .arg(&message)
             .run(builder);
-        if !status.is_success() {
+        if !status {
             success = true;
             break;
         }
@@ -403,7 +398,7 @@ fn commit_toolstate_change(builder: &Builder<'_>, current_toolstate: &ToolstateD
             .arg("master")
             .run(builder);
         // If we successfully push, exit.
-        if status.is_success() {
+        if status {
             success = true;
             break;
         }
@@ -432,7 +427,7 @@ fn commit_toolstate_change(builder: &Builder<'_>, current_toolstate: &ToolstateD
 /// `publish_toolstate.py` script if the PR passes all tests and is merged to
 /// master.
 fn publish_test_results(builder: &Builder<'_>, current_toolstate: &ToolstateData) {
-    let commit = helpers::git(None).capture().arg("rev-parse").arg("HEAD").run(builder).stdout();
+    let commit = helpers::git(None).arg("rev-parse").arg("HEAD").run_capture(builder).stdout();
 
     let toolstate_serialized = t!(serde_json::to_string(&current_toolstate));
 

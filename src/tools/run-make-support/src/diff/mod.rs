@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use build_helper::drop_bomb::DropBomb;
 use regex::Regex;
 use similar::TextDiff;
-
-use build_helper::drop_bomb::DropBomb;
 
 use crate::fs;
 
@@ -24,6 +23,7 @@ pub struct Diff {
     actual: Option<String>,
     actual_name: Option<String>,
     normalizers: Vec<(String, String)>,
+    bless_dir: Option<String>,
     drop_bomb: DropBomb,
 }
 
@@ -38,6 +38,7 @@ impl Diff {
             actual: None,
             actual_name: None,
             normalizers: Vec::new(),
+            bless_dir: std::env::var("RUSTC_BLESS_TEST").ok(),
             drop_bomb: DropBomb::arm("diff"),
         }
     }
@@ -45,6 +46,13 @@ impl Diff {
     /// Specify the expected output for the diff from a file.
     pub fn expected_file<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
         let path = path.as_ref();
+        // In `--bless` mode, create the snapshot file if it doesn't already exist.
+        // The empty file will be overwritten with the actual text.
+        if self.bless_dir.is_some()
+            && let Ok(false) = std::fs::exists(path)
+        {
+            fs::write(path, "");
+        }
         let content = fs::read_to_string(path);
         let name = path.to_string_lossy().to_string();
 
@@ -113,14 +121,8 @@ impl Diff {
         let (expected_name, actual_name, output, actual) = self.run_common();
 
         if !output.is_empty() {
-            // If we can bless (meaning we have a file to write into and the `RUSTC_BLESS_TEST`
-            // environment variable set), then we write into the file and return.
-            if let Some(ref expected_file) = self.expected_file {
-                if std::env::var("RUSTC_BLESS_TEST").is_ok() {
-                    println!("Blessing `{}`", expected_file.display());
-                    fs::write(expected_file, actual);
-                    return;
-                }
+            if self.maybe_bless_expected_file(&actual) {
+                return;
             }
             panic!(
                 "test failed: `{}` is different from `{}`\n\n{}",
@@ -135,19 +137,33 @@ impl Diff {
         let (expected_name, actual_name, output, actual) = self.run_common();
 
         if output.is_empty() {
-            // If we can bless (meaning we have a file to write into and the `RUSTC_BLESS_TEST`
-            // environment variable set), then we write into the file and return.
-            if let Some(ref expected_file) = self.expected_file {
-                if std::env::var("RUSTC_BLESS_TEST").is_ok() {
-                    println!("Blessing `{}`", expected_file.display());
-                    fs::write(expected_file, actual);
-                    return;
-                }
+            if self.maybe_bless_expected_file(&actual) {
+                return;
             }
             panic!(
                 "test failed: `{}` is not different from `{}`\n\n{}",
                 expected_name, actual_name, output
             )
         }
+    }
+
+    /// If we have an expected file to write into, and `RUSTC_BLESS_TEST` is
+    /// set, then write the actual output into the file and return `true`.
+    ///
+    /// We assume that `RUSTC_BLESS_TEST` contains the path to the original test's
+    /// source directory. That lets us bless the original snapshot file in the
+    /// source tree, not the copy in `rmake_out` that we would normally use.
+    fn maybe_bless_expected_file(&self, actual: &str) -> bool {
+        let Some(ref expected_file) = self.expected_file else {
+            return false;
+        };
+        let Some(ref bless_dir) = self.bless_dir else {
+            return false;
+        };
+
+        let bless_file = Path::new(&bless_dir).join(expected_file);
+        println!("Blessing `{}`", bless_file.display());
+        fs::write(bless_file, actual);
+        true
     }
 }

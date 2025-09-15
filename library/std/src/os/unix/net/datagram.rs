@@ -1,7 +1,22 @@
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
-use super::{recv_vectored_with_ancillary_from, send_vectored_with_ancillary_to, SocketAncillary};
-use super::{sockaddr_un, SocketAddr};
-#[cfg(any(doc, target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    target_os = "haiku",
+    target_os = "nto",
+    target_os = "cygwin"
+))]
+use libc::MSG_NOSIGNAL;
+
+use super::{SocketAddr, sockaddr_un};
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
+use super::{SocketAncillary, recv_vectored_with_ancillary_from, send_vectored_with_ancillary_to};
+#[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
 use crate::io::{IoSlice, IoSliceMut};
 use crate::net::Shutdown;
 use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -12,18 +27,6 @@ use crate::sys::net::Socket;
 use crate::sys_common::{AsInner, FromInner, IntoInner};
 use crate::time::Duration;
 use crate::{fmt, io};
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "haiku",
-    target_os = "nto",
-))]
-use libc::MSG_NOSIGNAL;
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
@@ -31,8 +34,11 @@ use libc::MSG_NOSIGNAL;
     target_os = "freebsd",
     target_os = "openbsd",
     target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
     target_os = "haiku",
     target_os = "nto",
+    target_os = "cygwin"
 )))]
 const MSG_NOSIGNAL: core::ffi::c_int = 0x0;
 
@@ -96,7 +102,7 @@ impl UnixDatagram {
             let socket = UnixDatagram::unbound()?;
             let (addr, len) = sockaddr_un(path.as_ref())?;
 
-            cvt(libc::bind(socket.as_raw_fd(), core::ptr::addr_of!(addr) as *const _, len as _))?;
+            cvt(libc::bind(socket.as_raw_fd(), (&raw const addr) as *const _, len as _))?;
 
             Ok(socket)
         }
@@ -129,7 +135,7 @@ impl UnixDatagram {
             let socket = UnixDatagram::unbound()?;
             cvt(libc::bind(
                 socket.as_raw_fd(),
-                core::ptr::addr_of!(socket_addr.addr) as *const _,
+                (&raw const socket_addr.addr) as *const _,
                 socket_addr.len as _,
             ))?;
             Ok(socket)
@@ -211,7 +217,7 @@ impl UnixDatagram {
         unsafe {
             let (addr, len) = sockaddr_un(path.as_ref())?;
 
-            cvt(libc::connect(self.as_raw_fd(), core::ptr::addr_of!(addr) as *const _, len))?;
+            cvt(libc::connect(self.as_raw_fd(), (&raw const addr) as *const _, len))?;
         }
         Ok(())
     }
@@ -243,7 +249,7 @@ impl UnixDatagram {
         unsafe {
             cvt(libc::connect(
                 self.as_raw_fd(),
-                core::ptr::addr_of!(socket_addr.addr) as *const _,
+                (&raw const socket_addr.addr) as *const _,
                 socket_addr.len,
             ))?;
         }
@@ -391,8 +397,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;
@@ -422,7 +434,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn recv_vectored_with_ancillary_from(
         &self,
@@ -441,8 +453,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary, AncillaryData};
     /// use std::io::IoSliceMut;
@@ -472,7 +490,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn recv_vectored_with_ancillary(
         &self,
@@ -510,7 +528,7 @@ impl UnixDatagram {
                 buf.as_ptr() as *const _,
                 buf.len(),
                 MSG_NOSIGNAL,
-                core::ptr::addr_of!(addr) as *const _,
+                (&raw const addr) as *const _,
                 len,
             ))?;
             Ok(count as usize)
@@ -545,7 +563,7 @@ impl UnixDatagram {
                 buf.as_ptr() as *const _,
                 buf.len(),
                 MSG_NOSIGNAL,
-                core::ptr::addr_of!(socket_addr.addr) as *const _,
+                (&raw const socket_addr.addr) as *const _,
                 socket_addr.len,
             ))?;
             Ok(count as usize)
@@ -582,8 +600,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary};
     /// use std::io::IoSlice;
@@ -607,7 +631,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn send_vectored_with_ancillary_to<P: AsRef<Path>>(
         &self,
@@ -624,8 +648,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    #[cfg_attr(any(target_os = "android", target_os = "linux"), doc = "```no_run")]
-    #[cfg_attr(not(any(target_os = "android", target_os = "linux")), doc = "```ignore")]
+    #[cfg_attr(
+        any(target_os = "android", target_os = "linux", target_os = "cygwin"),
+        doc = "```no_run"
+    )]
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "linux", target_os = "cygwin")),
+        doc = "```ignore"
+    )]
     /// #![feature(unix_socket_ancillary_data)]
     /// use std::os::unix::net::{UnixDatagram, SocketAncillary};
     /// use std::io::IoSlice;
@@ -649,7 +679,7 @@ impl UnixDatagram {
     ///     Ok(())
     /// }
     /// ```
-    #[cfg(any(doc, target_os = "android", target_os = "linux"))]
+    #[cfg(any(doc, target_os = "android", target_os = "linux", target_os = "cygwin"))]
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
     pub fn send_vectored_with_ancillary(
         &self,

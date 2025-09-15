@@ -8,23 +8,19 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use core::cmp::{self, Ordering};
-use core::fmt;
 use core::hash::{Hash, Hasher};
-use core::iter::{repeat_n, repeat_with, ByRefSized};
-use core::mem::{ManuallyDrop, SizedTypeProperties};
-use core::ops::{Index, IndexMut, Range, RangeBounds};
-use core::ptr;
-use core::slice;
-
+use core::iter::{ByRefSized, repeat_n, repeat_with};
 // This is used in a bunch of intra-doc links.
 // FIXME: For some reason, `#[cfg(doc)]` wasn't sufficient, resulting in
 // failures in linkchecker even though rustdoc built the docs just fine.
 #[allow(unused_imports)]
 use core::mem;
+use core::mem::{ManuallyDrop, SizedTypeProperties};
+use core::ops::{Index, IndexMut, Range, RangeBounds};
+use core::{fmt, ptr, slice};
 
 use crate::alloc::{Allocator, Global};
-use crate::collections::TryReserveError;
-use crate::collections::TryReserveErrorKind;
+use crate::collections::{TryReserveError, TryReserveErrorKind};
 use crate::raw_vec::RawVec;
 use crate::vec::Vec;
 
@@ -107,6 +103,7 @@ pub struct VecDeque<
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone, A: Allocator + Clone> Clone for VecDeque<T, A> {
+    #[track_caller]
     fn clone(&self) -> Self {
         let mut deq = Self::with_capacity_in(self.len(), self.allocator().clone());
         deq.extend(self.iter().cloned());
@@ -117,6 +114,7 @@ impl<T: Clone, A: Allocator + Clone> Clone for VecDeque<T, A> {
     ///
     /// This method is preferred over simply assigning `source.clone()` to `self`,
     /// as it avoids reallocation if possible.
+    #[track_caller]
     fn clone_from(&mut self, source: &Self) {
         self.clear();
         self.extend(source.iter().cloned());
@@ -184,11 +182,16 @@ impl<T, A: Allocator> VecDeque<T, A> {
         unsafe { ptr::read(self.ptr().add(off)) }
     }
 
-    /// Writes an element into the buffer, moving it.
+    /// Writes an element into the buffer, moving it and returning a pointer to it.
+    /// # Safety
+    ///
+    /// May only be called if `off < self.capacity()`.
     #[inline]
-    unsafe fn buffer_write(&mut self, off: usize, value: T) {
+    unsafe fn buffer_write(&mut self, off: usize, value: T) -> &mut T {
         unsafe {
-            ptr::write(self.ptr().add(off), value);
+            let ptr = self.ptr().add(off);
+            ptr::write(ptr, value);
+            &mut *ptr
         }
     }
 
@@ -558,8 +561,8 @@ impl<T> VecDeque<T> {
     #[rustc_const_stable(feature = "const_vec_deque_new", since = "1.68.0")]
     #[must_use]
     pub const fn new() -> VecDeque<T> {
-        // FIXME: This should just be `VecDeque::new_in(Global)` once that hits stable.
-        VecDeque { head: 0, len: 0, buf: RawVec::NEW }
+        // FIXME(const-hack): This should just be `VecDeque::new_in(Global)` once that hits stable.
+        VecDeque { head: 0, len: 0, buf: RawVec::new() }
     }
 
     /// Creates an empty deque with space for at least `capacity` elements.
@@ -574,6 +577,7 @@ impl<T> VecDeque<T> {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[must_use]
+    #[track_caller]
     pub fn with_capacity(capacity: usize) -> VecDeque<T> {
         Self::with_capacity_in(capacity, Global)
     }
@@ -629,6 +633,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// let deque: VecDeque<u32> = VecDeque::with_capacity(10);
     /// ```
     #[unstable(feature = "allocator_api", issue = "32838")]
+    #[track_caller]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> VecDeque<T, A> {
         VecDeque { head: 0, len: 0, buf: RawVec::with_capacity_in(capacity, alloc) }
     }
@@ -645,6 +650,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// initialized rather than only supporting `0..len`.  Requires that
     /// `initialized.start` ≤ `initialized.end` ≤ `capacity`.
     #[inline]
+    #[cfg(not(test))]
     pub(crate) unsafe fn from_contiguous_raw_parts_in(
         ptr: *mut T,
         initialized: Range<usize>,
@@ -793,6 +799,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// [`reserve`]: VecDeque::reserve
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[track_caller]
     pub fn reserve_exact(&mut self, additional: usize) {
         let new_cap = self.len.checked_add(additional).expect("capacity overflow");
         let old_cap = self.capacity();
@@ -822,6 +829,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 11);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "vecdeque_reserve")]
+    #[track_caller]
     pub fn reserve(&mut self, additional: usize) {
         let new_cap = self.len.checked_add(additional).expect("capacity overflow");
         let old_cap = self.capacity();
@@ -953,6 +962,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 4);
     /// ```
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
+    #[track_caller]
     pub fn shrink_to_fit(&mut self) {
         self.shrink_to(0);
     }
@@ -978,6 +988,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert!(buf.capacity() >= 4);
     /// ```
     #[stable(feature = "shrink_to", since = "1.56.0")]
+    #[track_caller]
     pub fn shrink_to(&mut self, min_capacity: usize) {
         let target_cap = min_capacity.max(self.len);
 
@@ -1182,6 +1193,73 @@ impl<T, A: Allocator> VecDeque<T, A> {
         }
     }
 
+    /// Shortens the deque, keeping the last `len` elements and dropping
+    /// the rest.
+    ///
+    /// If `len` is greater or equal to the deque's current length, this has
+    /// no effect.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #![feature(vec_deque_truncate_front)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut buf = VecDeque::new();
+    /// buf.push_front(5);
+    /// buf.push_front(10);
+    /// buf.push_front(15);
+    /// assert_eq!(buf, [15, 10, 5]);
+    /// assert_eq!(buf.as_slices(), (&[15, 10, 5][..], &[][..]));
+    /// buf.truncate_front(1);
+    /// assert_eq!(buf.as_slices(), (&[5][..], &[][..]));
+    /// ```
+    #[unstable(feature = "vec_deque_truncate_front", issue = "140667")]
+    pub fn truncate_front(&mut self, len: usize) {
+        /// Runs the destructor for all items in the slice when it gets dropped (normally or
+        /// during unwinding).
+        struct Dropper<'a, T>(&'a mut [T]);
+
+        impl<'a, T> Drop for Dropper<'a, T> {
+            fn drop(&mut self) {
+                unsafe {
+                    ptr::drop_in_place(self.0);
+                }
+            }
+        }
+
+        unsafe {
+            if len >= self.len {
+                // No action is taken
+                return;
+            }
+
+            let (front, back) = self.as_mut_slices();
+            if len > back.len() {
+                // The 'back' slice remains unchanged.
+                // front.len() + back.len() == self.len, so 'end' is non-negative
+                // and end < front.len()
+                let end = front.len() - (len - back.len());
+                let drop_front = front.get_unchecked_mut(..end) as *mut _;
+                self.head += end;
+                self.len = len;
+                ptr::drop_in_place(drop_front);
+            } else {
+                let drop_front = front as *mut _;
+                // 'end' is non-negative by the condition above
+                let end = back.len() - len;
+                let drop_back = back.get_unchecked_mut(..end) as *mut _;
+                self.head = self.to_physical_idx(self.len - len);
+                self.len = len;
+
+                // Make sure the second half is dropped even when a destructor
+                // in the first one panics.
+                let _back_dropper = Dropper(&mut *drop_back);
+                ptr::drop_in_place(drop_front);
+            }
+        }
+    }
+
     /// Returns a reference to the underlying allocator.
     #[unstable(feature = "allocator_api", issue = "32838")]
     #[inline]
@@ -1205,6 +1283,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(&c[..], b);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "vecdeque_iter")]
     pub fn iter(&self) -> Iter<'_, T> {
         let (a, b) = self.as_slices();
         Iter::new(a.iter(), b.iter())
@@ -1238,6 +1317,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// If [`make_contiguous`] was previously called, all elements of the
     /// deque will be in the first slice and the second slice will be empty.
+    /// Otherwise, the exact split point depends on implementation details
+    /// and is not guaranteed.
     ///
     /// [`make_contiguous`]: VecDeque::make_contiguous
     ///
@@ -1252,12 +1333,18 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// deque.push_back(1);
     /// deque.push_back(2);
     ///
-    /// assert_eq!(deque.as_slices(), (&[0, 1, 2][..], &[][..]));
+    /// let expected = [0, 1, 2];
+    /// let (front, back) = deque.as_slices();
+    /// assert_eq!(&expected[..front.len()], front);
+    /// assert_eq!(&expected[front.len()..], back);
     ///
     /// deque.push_front(10);
     /// deque.push_front(9);
     ///
-    /// assert_eq!(deque.as_slices(), (&[9, 10][..], &[0, 1, 2][..]));
+    /// let expected = [9, 10, 0, 1, 2];
+    /// let (front, back) = deque.as_slices();
+    /// assert_eq!(&expected[..front.len()], front);
+    /// assert_eq!(&expected[front.len()..], back);
     /// ```
     #[inline]
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
@@ -1273,6 +1360,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// If [`make_contiguous`] was previously called, all elements of the
     /// deque will be in the first slice and the second slice will be empty.
+    /// Otherwise, the exact split point depends on implementation details
+    /// and is not guaranteed.
     ///
     /// [`make_contiguous`]: VecDeque::make_contiguous
     ///
@@ -1289,9 +1378,22 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// deque.push_front(10);
     /// deque.push_front(9);
     ///
-    /// deque.as_mut_slices().0[0] = 42;
-    /// deque.as_mut_slices().1[0] = 24;
-    /// assert_eq!(deque.as_slices(), (&[42, 10][..], &[24, 1][..]));
+    /// // Since the split point is not guaranteed, we may need to update
+    /// // either slice.
+    /// let mut update_nth = |index: usize, val: u32| {
+    ///     let (front, back) = deque.as_mut_slices();
+    ///     if index > front.len() - 1 {
+    ///         back[index - front.len()] = val;
+    ///     } else {
+    ///         front[index] = val;
+    ///     }
+    /// };
+    ///
+    /// update_nth(0, 42);
+    /// update_nth(2, 24);
+    ///
+    /// let v: Vec<_> = deque.into();
+    /// assert_eq!(v, [42, 10, 24, 1]);
     /// ```
     #[inline]
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
@@ -1730,6 +1832,52 @@ impl<T, A: Allocator> VecDeque<T, A> {
         }
     }
 
+    /// Removes and returns the first element from the deque if the predicate
+    /// returns `true`, or [`None`] if the predicate returns false or the deque
+    /// is empty (the predicate will not be called in that case).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(vec_deque_pop_if)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut deque: VecDeque<i32> = vec![0, 1, 2, 3, 4].into();
+    /// let pred = |x: &mut i32| *x % 2 == 0;
+    ///
+    /// assert_eq!(deque.pop_front_if(pred), Some(0));
+    /// assert_eq!(deque, [1, 2, 3, 4]);
+    /// assert_eq!(deque.pop_front_if(pred), None);
+    /// ```
+    #[unstable(feature = "vec_deque_pop_if", issue = "135889")]
+    pub fn pop_front_if(&mut self, predicate: impl FnOnce(&mut T) -> bool) -> Option<T> {
+        let first = self.front_mut()?;
+        if predicate(first) { self.pop_front() } else { None }
+    }
+
+    /// Removes and returns the last element from the deque if the predicate
+    /// returns `true`, or [`None`] if the predicate returns false or the deque
+    /// is empty (the predicate will not be called in that case).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(vec_deque_pop_if)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut deque: VecDeque<i32> = vec![0, 1, 2, 3, 4].into();
+    /// let pred = |x: &mut i32| *x % 2 == 0;
+    ///
+    /// assert_eq!(deque.pop_back_if(pred), Some(4));
+    /// assert_eq!(deque, [0, 1, 2, 3]);
+    /// assert_eq!(deque.pop_back_if(pred), None);
+    /// ```
+    #[unstable(feature = "vec_deque_pop_if", issue = "135889")]
+    pub fn pop_back_if(&mut self, predicate: impl FnOnce(&mut T) -> bool) -> Option<T> {
+        let first = self.back_mut()?;
+        if predicate(first) { self.pop_back() } else { None }
+    }
+
     /// Prepends an element to the deque.
     ///
     /// # Examples
@@ -1743,17 +1891,36 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(d.front(), Some(&2));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[track_caller]
     pub fn push_front(&mut self, value: T) {
+        let _ = self.push_front_mut(value);
+    }
+
+    /// Prepends an element to the deque, returning a reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(push_mut)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut d = VecDeque::from([1, 2, 3]);
+    /// let x = d.push_front_mut(8);
+    /// *x -= 1;
+    /// assert_eq!(d.front(), Some(&7));
+    /// ```
+    #[unstable(feature = "push_mut", issue = "135974")]
+    #[track_caller]
+    #[must_use = "if you don't need a reference to the value, use `VecDeque::push_front` instead"]
+    pub fn push_front_mut(&mut self, value: T) -> &mut T {
         if self.is_full() {
             self.grow();
         }
 
         self.head = self.wrap_sub(self.head, 1);
         self.len += 1;
-
-        unsafe {
-            self.buffer_write(self.head, value);
-        }
+        // SAFETY: We know that self.head is within range of the deque.
+        unsafe { self.buffer_write(self.head, value) }
     }
 
     /// Appends an element to the back of the deque.
@@ -1770,13 +1937,35 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_confusables("push", "put", "append")]
+    #[track_caller]
     pub fn push_back(&mut self, value: T) {
+        let _ = self.push_back_mut(value);
+    }
+
+    /// Appends an element to the back of the deque, returning a reference to it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(push_mut)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut d = VecDeque::from([1, 2, 3]);
+    /// let x = d.push_back_mut(9);
+    /// *x += 1;
+    /// assert_eq!(d.back(), Some(&10));
+    /// ```
+    #[unstable(feature = "push_mut", issue = "135974")]
+    #[track_caller]
+    #[must_use = "if you don't need a reference to the value, use `VecDeque::push_back` instead"]
+    pub fn push_back_mut(&mut self, value: T) -> &mut T {
         if self.is_full() {
             self.grow();
         }
 
-        unsafe { self.buffer_write(self.to_physical_idx(self.len), value) }
+        let len = self.len;
         self.len += 1;
+        unsafe { self.buffer_write(self.to_physical_idx(len), value) }
     }
 
     #[inline]
@@ -1862,7 +2051,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// # Panics
     ///
-    /// Panics if `index` is greater than deque's length
+    /// Panics if `index` is strictly greater than the deque's length.
     ///
     /// # Examples
     ///
@@ -1877,10 +2066,44 @@ impl<T, A: Allocator> VecDeque<T, A> {
     ///
     /// vec_deque.insert(1, 'd');
     /// assert_eq!(vec_deque, &['a', 'd', 'b', 'c']);
+    ///
+    /// vec_deque.insert(4, 'e');
+    /// assert_eq!(vec_deque, &['a', 'd', 'b', 'c', 'e']);
     /// ```
     #[stable(feature = "deque_extras_15", since = "1.5.0")]
+    #[track_caller]
     pub fn insert(&mut self, index: usize, value: T) {
+        let _ = self.insert_mut(index, value);
+    }
+
+    /// Inserts an element at `index` within the deque, shifting all elements
+    /// with indices greater than or equal to `index` towards the back, and
+    /// returning a reference to it.
+    ///
+    /// Element at index 0 is the front of the queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is strictly greater than the deque's length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(push_mut)]
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut vec_deque = VecDeque::from([1, 2, 3]);
+    ///
+    /// let x = vec_deque.insert_mut(1, 5);
+    /// *x += 7;
+    /// assert_eq!(vec_deque, &[1, 12, 2, 3]);
+    /// ```
+    #[unstable(feature = "push_mut", issue = "135974")]
+    #[track_caller]
+    #[must_use = "if you don't need a reference to the value, use `VecDeque::insert` instead"]
+    pub fn insert_mut(&mut self, index: usize, value: T) -> &mut T {
         assert!(index <= self.len(), "index out of bounds");
+
         if self.is_full() {
             self.grow();
         }
@@ -1893,16 +2116,16 @@ impl<T, A: Allocator> VecDeque<T, A> {
             unsafe {
                 // see `remove()` for explanation why this wrap_copy() call is safe.
                 self.wrap_copy(self.to_physical_idx(index), self.to_physical_idx(index + 1), k);
-                self.buffer_write(self.to_physical_idx(index), value);
                 self.len += 1;
+                self.buffer_write(self.to_physical_idx(index), value)
             }
         } else {
             let old_head = self.head;
             self.head = self.wrap_sub(self.head, 1);
             unsafe {
                 self.wrap_copy(old_head, self.head, index);
-                self.buffer_write(self.to_physical_idx(index), value);
                 self.len += 1;
+                self.buffer_write(self.to_physical_idx(index), value)
             }
         }
     }
@@ -1920,13 +2143,13 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// use std::collections::VecDeque;
     ///
     /// let mut buf = VecDeque::new();
-    /// buf.push_back(1);
-    /// buf.push_back(2);
-    /// buf.push_back(3);
-    /// assert_eq!(buf, [1, 2, 3]);
+    /// buf.push_back('a');
+    /// buf.push_back('b');
+    /// buf.push_back('c');
+    /// assert_eq!(buf, ['a', 'b', 'c']);
     ///
-    /// assert_eq!(buf.remove(1), Some(2));
-    /// assert_eq!(buf, [1, 3]);
+    /// assert_eq!(buf.remove(1), Some('b'));
+    /// assert_eq!(buf, ['a', 'c']);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_confusables("delete", "take")]
@@ -1974,14 +2197,15 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     /// use std::collections::VecDeque;
     ///
-    /// let mut buf: VecDeque<_> = [1, 2, 3].into();
+    /// let mut buf: VecDeque<_> = ['a', 'b', 'c'].into();
     /// let buf2 = buf.split_off(1);
-    /// assert_eq!(buf, [1]);
-    /// assert_eq!(buf2, [2, 3]);
+    /// assert_eq!(buf, ['a']);
+    /// assert_eq!(buf2, ['b', 'c']);
     /// ```
     #[inline]
     #[must_use = "use `.truncate()` if you don't need the other half"]
     #[stable(feature = "split_off", since = "1.4.0")]
+    #[track_caller]
     pub fn split_off(&mut self, at: usize) -> Self
     where
         A: Clone,
@@ -2048,6 +2272,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// ```
     #[inline]
     #[stable(feature = "append", since = "1.4.0")]
+    #[track_caller]
     pub fn append(&mut self, other: &mut Self) {
         if T::IS_ZST {
             self.len = self.len.checked_add(other.len).expect("capacity overflow");
@@ -2112,7 +2337,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
 
     /// Retains only the elements specified by the predicate.
     ///
-    /// In other words, remove all elements `e` for which `f(&e)` returns false.
+    /// In other words, remove all elements `e` for which `f(&mut e)` returns false.
     /// This method operates in place, visiting each element exactly once in the
     /// original order, and preserves the order of the retained elements.
     ///
@@ -2170,6 +2395,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     // be called in cold paths.
     // This may panic or abort
     #[inline(never)]
+    #[track_caller]
     fn grow(&mut self) {
         // Extend or possibly remove this assertion when valid use-cases for growing the
         // buffer without it being full emerge
@@ -2208,6 +2434,7 @@ impl<T, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(buf, [5, 10, 101, 102, 103]);
     /// ```
     #[stable(feature = "vec_resize_with", since = "1.33.0")]
+    #[track_caller]
     pub fn resize_with(&mut self, new_len: usize, generator: impl FnMut() -> T) {
         let len = self.len;
 
@@ -2754,6 +2981,7 @@ impl<T: Clone, A: Allocator> VecDeque<T, A> {
     /// assert_eq!(buf, [5, 10, 20, 20, 20]);
     /// ```
     #[stable(feature = "deque_extras", since = "1.16.0")]
+    #[track_caller]
     pub fn resize(&mut self, new_len: usize, value: T) {
         if new_len > self.len() {
             let extra = new_len - self.len();
@@ -2873,6 +3101,7 @@ impl<T, A: Allocator> IndexMut<usize> for VecDeque<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> FromIterator<T> for VecDeque<T> {
+    #[track_caller]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> VecDeque<T> {
         SpecFromIter::spec_from_iter(iter.into_iter())
     }
@@ -2912,16 +3141,19 @@ impl<'a, T, A: Allocator> IntoIterator for &'a mut VecDeque<T, A> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T, A: Allocator> Extend<T> for VecDeque<T, A> {
+    #[track_caller]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         <Self as SpecExtend<T, I::IntoIter>>::spec_extend(self, iter.into_iter());
     }
 
     #[inline]
+    #[track_caller]
     fn extend_one(&mut self, elem: T) {
         self.push_back(elem);
     }
 
     #[inline]
+    #[track_caller]
     fn extend_reserve(&mut self, additional: usize) {
         self.reserve(additional);
     }
@@ -2937,16 +3169,19 @@ impl<T, A: Allocator> Extend<T> for VecDeque<T, A> {
 
 #[stable(feature = "extend_ref", since = "1.2.0")]
 impl<'a, T: 'a + Copy, A: Allocator> Extend<&'a T> for VecDeque<T, A> {
+    #[track_caller]
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.spec_extend(iter.into_iter());
     }
 
     #[inline]
+    #[track_caller]
     fn extend_one(&mut self, &elem: &'a T) {
         self.push_back(elem);
     }
 
     #[inline]
+    #[track_caller]
     fn extend_reserve(&mut self, additional: usize) {
         self.reserve(additional);
     }
@@ -3044,6 +3279,7 @@ impl<T, const N: usize> From<[T; N]> for VecDeque<T> {
     /// let deq2: VecDeque<_> = [1, 2, 3, 4].into();
     /// assert_eq!(deq1, deq2);
     /// ```
+    #[track_caller]
     fn from(arr: [T; N]) -> Self {
         let mut deq = VecDeque::with_capacity(N);
         let arr = ManuallyDrop::new(arr);

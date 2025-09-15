@@ -1,10 +1,12 @@
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 
 use crate::command::Command;
 use crate::env::env_var;
 use crate::path_helpers::cwd;
-use crate::util::set_host_rpath;
+use crate::util::set_host_compiler_dylib_path;
+use crate::{is_aix, is_darwin, is_windows, is_windows_msvc, target, uname};
 
 /// Construct a new `rustc` invocation. This will automatically set the library
 /// search path as `-L cwd()`. Use [`bare_rustc`] to avoid this.
@@ -13,17 +15,11 @@ pub fn rustc() -> Rustc {
     Rustc::new()
 }
 
-/// Construct a plain `rustc` invocation with no flags set. Note that [`set_host_rpath`]
-/// still presets the environment variable `HOST_RPATH_DIR` by default.
+/// Construct a plain `rustc` invocation with no flags set. Note that [`set_host_compiler_dylib_path`]
+/// still presets the environment variable `HOST_RUSTC_DYLIB_PATH` by default.
 #[track_caller]
 pub fn bare_rustc() -> Rustc {
     Rustc::bare()
-}
-
-/// Construct a new `rustc` aux-build invocation.
-#[track_caller]
-pub fn aux_build() -> Rustc {
-    Rustc::new_aux_build()
 }
 
 /// A `rustc` invocation builder.
@@ -31,15 +27,24 @@ pub fn aux_build() -> Rustc {
 #[must_use]
 pub struct Rustc {
     cmd: Command,
+    target: Option<String>,
 }
 
-crate::macros::impl_common_helpers!(Rustc);
+// Only fill in the target just before execution, so that it can be overridden.
+crate::macros::impl_common_helpers!(Rustc, |rustc: &mut Rustc| {
+    if let Some(target) = &rustc.target {
+        rustc.cmd.arg(&format!("--target={target}"));
+    }
+});
+
+pub fn rustc_path() -> String {
+    env_var("RUSTC")
+}
 
 #[track_caller]
 fn setup_common() -> Command {
-    let rustc = env_var("RUSTC");
-    let mut cmd = Command::new(rustc);
-    set_host_rpath(&mut cmd);
+    let mut cmd = Command::new(rustc_path());
+    set_host_compiler_dylib_path(&mut cmd);
     cmd
 }
 
@@ -47,27 +52,29 @@ impl Rustc {
     // `rustc` invocation constructor methods
 
     /// Construct a new `rustc` invocation. This will automatically set the library
-    /// search path as `-L cwd()`. Use [`bare_rustc`] to avoid this.
+    /// search path as `-L cwd()`, configure the compilation target and enable
+    /// dynamic linkage by default on musl hosts.
+    /// Use [`bare_rustc`] to avoid this.
     #[track_caller]
     pub fn new() -> Self {
         let mut cmd = setup_common();
         cmd.arg("-L").arg(cwd());
-        Self { cmd }
+
+        // FIXME: On musl hosts, we currently default to static linkage, while
+        // for running run-make tests, we rely on dynamic linkage by default
+        if std::env::var("IS_MUSL_HOST").is_ok_and(|i| i == "1") {
+            cmd.arg("-Ctarget-feature=-crt-static");
+        }
+
+        // Automatically default to cross-compilation
+        Self { cmd, target: Some(target()) }
     }
 
     /// Construct a bare `rustc` invocation with no flags set.
     #[track_caller]
     pub fn bare() -> Self {
         let cmd = setup_common();
-        Self { cmd }
-    }
-
-    /// Construct a new `rustc` invocation with `aux_build` preset (setting `--crate-type=lib`).
-    #[track_caller]
-    pub fn new_aux_build() -> Self {
-        let mut cmd = setup_common();
-        cmd.arg("--crate-type=lib");
-        Self { cmd }
+        Self { cmd, target: None }
     }
 
     // Argument provider methods
@@ -79,7 +86,7 @@ impl Rustc {
         self
     }
 
-    /// Specify default optimization level `-O` (alias for `-C opt-level=2`).
+    /// Specify default optimization level `-O` (alias for `-C opt-level=3`).
     pub fn opt(&mut self) -> &mut Self {
         self.cmd.arg("-O");
         self
@@ -166,6 +173,12 @@ impl Rustc {
         self
     }
 
+    /// This flag enables LTO in the specified form.
+    pub fn lto(&mut self, option: &str) -> &mut Self {
+        self.cmd.arg(format!("-Clto={option}"));
+        self
+    }
+
     /// This flag defers LTO optimizations to the linker.
     pub fn linker_plugin_lto(&mut self, option: &str) -> &mut Self {
         self.cmd.arg(format!("-Clinker-plugin-lto={option}"));
@@ -211,6 +224,18 @@ impl Rustc {
         self
     }
 
+    /// Specify option of `-C symbol-mangling-version`.
+    pub fn symbol_mangling_version(&mut self, option: &str) -> &mut Self {
+        self.cmd.arg(format!("-Csymbol-mangling-version={option}"));
+        self
+    }
+
+    /// Specify `-C prefer-dynamic`.
+    pub fn prefer_dynamic(&mut self) -> &mut Self {
+        self.cmd.arg(format!("-Cprefer-dynamic"));
+        self
+    }
+
     /// Specify error format to use
     pub fn error_format(&mut self, format: &str) -> &mut Self {
         self.cmd.arg(format!("--error-format={format}"));
@@ -223,10 +248,24 @@ impl Rustc {
         self
     }
 
+    /// Normalize the line number in the stderr output
+    pub fn ui_testing(&mut self) -> &mut Self {
+        self.cmd.arg(format!("-Zui-testing"));
+        self
+    }
+
     /// Specify the target triple, or a path to a custom target json spec file.
     pub fn target<S: AsRef<str>>(&mut self, target: S) -> &mut Self {
-        let target = target.as_ref();
-        self.cmd.arg(format!("--target={target}"));
+        // We store the target as a separate field, so that it can be specified multiple times.
+        // This is in particular useful to override the default target set in Rustc::new().
+        self.target = Some(target.as_ref().to_string());
+        self
+    }
+
+    /// Specify the target CPU.
+    pub fn target_cpu<S: AsRef<str>>(&mut self, target_cpu: S) -> &mut Self {
+        let target_cpu = target_cpu.as_ref();
+        self.cmd.arg(format!("-Ctarget-cpu={target_cpu}"));
         self
     }
 
@@ -290,9 +329,9 @@ impl Rustc {
         self
     }
 
-    /// Specify a stdin input
-    pub fn stdin<I: AsRef<[u8]>>(&mut self, input: I) -> &mut Self {
-        self.cmd.stdin(input);
+    /// Specify a stdin input buffer.
+    pub fn stdin_buf<I: AsRef<[u8]>>(&mut self, input: I) -> &mut Self {
+        self.cmd.stdin_buf(input);
         self
     }
 
@@ -314,4 +353,69 @@ impl Rustc {
         self.cmd.arg(format!("-Clinker-flavor={linker_flavor}"));
         self
     }
+
+    /// Specify `-C debuginfo=...`.
+    pub fn debuginfo(&mut self, level: &str) -> &mut Self {
+        self.cmd.arg(format!("-Cdebuginfo={level}"));
+        self
+    }
+
+    /// Specify `-C split-debuginfo={packed,unpacked,off}`.
+    pub fn split_debuginfo(&mut self, split_kind: &str) -> &mut Self {
+        self.cmd.arg(format!("-Csplit-debuginfo={split_kind}"));
+        self
+    }
+
+    /// Pass the `--verbose` flag.
+    pub fn verbose(&mut self) -> &mut Self {
+        self.cmd.arg("--verbose");
+        self
+    }
+
+    /// `EXTRARSCXXFLAGS`
+    pub fn extra_rs_cxx_flags(&mut self) -> &mut Self {
+        if is_windows() {
+            // So this is a bit hacky: we can't use the DLL version of libstdc++ because
+            // it pulls in the DLL version of libgcc, which means that we end up with 2
+            // instances of the DW2 unwinding implementation. This is a problem on
+            // i686-pc-windows-gnu because each module (DLL/EXE) needs to register its
+            // unwind information with the unwinding implementation, and libstdc++'s
+            // __cxa_throw won't see the unwinding info we registered with our statically
+            // linked libgcc.
+            //
+            // Now, simply statically linking libstdc++ would fix this problem, except
+            // that it is compiled with the expectation that pthreads is dynamically
+            // linked as a DLL and will fail to link with a statically linked libpthread.
+            //
+            // So we end up with the following hack: we link use static:-bundle to only
+            // link the parts of libstdc++ that we actually use, which doesn't include
+            // the dependency on the pthreads DLL.
+            if !is_windows_msvc() {
+                self.cmd.arg("-lstatic:-bundle=stdc++");
+            };
+        } else if is_darwin() {
+            self.cmd.arg("-lc++");
+        } else if is_aix() {
+            self.cmd.arg("-lc++");
+            self.cmd.arg("-lc++abi");
+        } else {
+            if !matches!(&uname()[..], "FreeBSD" | "SunOS" | "OpenBSD") {
+                self.cmd.arg("-lstdc++");
+            };
+        };
+        self
+    }
+
+    /// Make that the generated LLVM IR is in source order.
+    pub fn codegen_source_order(&mut self) -> &mut Self {
+        self.cmd.arg("-Zcodegen-source-order");
+        self
+    }
+}
+
+/// Query the sysroot path corresponding `rustc --print=sysroot`.
+#[track_caller]
+pub fn sysroot() -> PathBuf {
+    let path = rustc().print("sysroot").run().stdout_utf8();
+    PathBuf::from_str(path.trim()).unwrap()
 }

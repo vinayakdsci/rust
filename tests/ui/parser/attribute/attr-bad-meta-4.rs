@@ -1,8 +1,7 @@
 macro_rules! mac {
     ($attr_item: meta) => {
         #[cfg($attr_item)]
-        //~^ ERROR expected unsuffixed literal, found `an(arbitrary token stream)`
-        //~| ERROR expected unsuffixed literal, found `an(arbitrary token stream)`
+        //~^ ERROR expected a literal (`1u8`, `1.0f32`, `"string"`, etc.) here, found `meta` metavariable
         struct S;
     }
 }
@@ -10,8 +9,7 @@ macro_rules! mac {
 mac!(an(arbitrary token stream));
 
 #[cfg(feature = -1)]
-//~^ ERROR expected unsuffixed literal, found `-`
-//~| ERROR expected unsuffixed literal, found `-`
+//~^ ERROR expected a literal (`1u8`, `1.0f32`, `"string"`, etc.) here, found `-`
 fn handler() {}
 
 fn main() {}

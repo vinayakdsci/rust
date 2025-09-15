@@ -1,31 +1,33 @@
 //! Contains `ParseSess` which holds state living beyond what one `Parser` might.
 //! It also serves as an input to the parser itself.
 
+use std::str;
+use std::sync::Arc;
+
+use rustc_ast::attr::AttrIdGenerator;
+use rustc_ast::node_id::NodeId;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
+use rustc_data_structures::sync::{AppendOnlyVec, Lock};
+use rustc_errors::emitter::{FatalOnlyEmitter, HumanEmitter, stderr_destination};
+use rustc_errors::translation::Translator;
+use rustc_errors::{
+    BufferedEarlyLint, ColorConfig, DecorateDiagCompat, Diag, DiagCtxt, DiagCtxtHandle,
+    DiagMessage, EmissionGuarantee, MultiSpan, StashKey,
+};
+use rustc_feature::{GateIssue, UnstableFeatures, find_feature_issue};
+use rustc_span::edition::Edition;
+use rustc_span::hygiene::ExpnId;
+use rustc_span::source_map::{FilePathMapping, SourceMap};
+use rustc_span::{Span, Symbol, sym};
+
+use crate::Session;
 use crate::config::{Cfg, CheckCfg};
 use crate::errors::{
     CliFeatureDiagnosticHelp, FeatureDiagnosticForIssue, FeatureDiagnosticHelp,
     FeatureDiagnosticSuggestion, FeatureGateError, SuggestUpgradeCompiler,
 };
-use crate::lint::{
-    builtin::UNSTABLE_SYNTAX_PRE_EXPANSION, BufferedEarlyLint, BuiltinLintDiag, Lint, LintId,
-};
-use crate::Session;
-use rustc_ast::node_id::NodeId;
-use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
-use rustc_data_structures::sync::{AppendOnlyVec, Lock, Lrc};
-use rustc_errors::emitter::{stderr_destination, HumanEmitter, SilentEmitter};
-use rustc_errors::{
-    fallback_fluent_bundle, ColorConfig, Diag, DiagCtxt, DiagCtxtHandle, DiagMessage,
-    EmissionGuarantee, MultiSpan, StashKey,
-};
-use rustc_feature::{find_feature_issue, GateIssue, UnstableFeatures};
-use rustc_span::edition::Edition;
-use rustc_span::hygiene::ExpnId;
-use rustc_span::source_map::{FilePathMapping, SourceMap};
-use rustc_span::{Span, Symbol};
-
-use rustc_ast::attr::AttrIdGenerator;
-use std::str;
+use crate::lint::builtin::UNSTABLE_SYNTAX_PRE_EXPANSION;
+use crate::lint::{Lint, LintId};
 
 /// Collected spans during parsing for places where a certain feature was
 /// used and should be feature gated accordingly in `check_crate`.
@@ -66,7 +68,7 @@ impl GatedSpans {
 #[derive(Default)]
 pub struct SymbolGallery {
     /// All symbols occurred and their first occurrence span.
-    pub symbols: Lock<FxHashMap<Symbol, Span>>,
+    pub symbols: Lock<FxIndexMap<Symbol, Span>>,
 }
 
 impl SymbolGallery {
@@ -79,7 +81,7 @@ impl SymbolGallery {
 
 // todo: this function now accepts `Session` instead of `ParseSess` and should be relocated
 /// Construct a diagnostic for a language feature error due to the given `span`.
-/// The `feature`'s `Symbol` is the one you used in `unstable.rs` and `rustc_span::symbols`.
+/// The `feature`'s `Symbol` is the one you used in `unstable.rs` and `rustc_span::symbol`.
 #[track_caller]
 pub fn feature_err(
     sess: &Session,
@@ -105,10 +107,10 @@ pub fn feature_err_issue(
     let span = span.into();
 
     // Cancel an earlier warning for this same error, if it exists.
-    if let Some(span) = span.primary_span() {
-        if let Some(err) = sess.dcx().steal_non_err(span, StashKey::EarlySyntaxWarning) {
-            err.cancel()
-        }
+    if let Some(span) = span.primary_span()
+        && let Some(err) = sess.dcx().steal_non_err(span, StashKey::EarlySyntaxWarning)
+    {
+        err.cancel()
     }
 
     let mut err = sess.dcx().create_err(FeatureGateError { span, explain: explain.into() });
@@ -155,6 +157,7 @@ pub fn feature_warn_issue(
 }
 
 /// Adds the diagnostics for a feature to an existing error.
+/// Must be a language feature!
 pub fn add_feature_diagnostics<G: EmissionGuarantee>(
     err: &mut Diag<'_, G>,
     sess: &Session,
@@ -190,13 +193,56 @@ pub fn add_feature_diagnostics_for_issue<G: EmissionGuarantee>(
         } else {
             err.subdiagnostic(FeatureDiagnosticHelp { feature });
         }
-
-        if sess.opts.unstable_opts.ui_testing {
+        if feature == sym::rustc_attrs {
+            // We're unlikely to stabilize something out of `rustc_attrs`
+            // without at least renaming it, so pointing out how old
+            // the compiler is will do little good.
+        } else if sess.opts.unstable_opts.ui_testing {
             err.subdiagnostic(SuggestUpgradeCompiler::ui_testing());
         } else if let Some(suggestion) = SuggestUpgradeCompiler::new() {
             err.subdiagnostic(suggestion);
         }
     }
+}
+
+/// This is only used by unstable_feature_bound as it does not have issue number information for now.
+/// This is basically the same as `feature_err_issue`
+/// but without the feature issue note. If we can do a lookup for issue number from feature name,
+/// then we should directly use `feature_err_issue` for ambiguity error of
+/// `#[unstable_feature_bound]`.
+#[track_caller]
+pub fn feature_err_unstable_feature_bound(
+    sess: &Session,
+    feature: Symbol,
+    span: impl Into<MultiSpan>,
+    explain: impl Into<DiagMessage>,
+) -> Diag<'_> {
+    let span = span.into();
+
+    // Cancel an earlier warning for this same error, if it exists.
+    if let Some(span) = span.primary_span() {
+        if let Some(err) = sess.dcx().steal_non_err(span, StashKey::EarlySyntaxWarning) {
+            err.cancel()
+        }
+    }
+
+    let mut err = sess.dcx().create_err(FeatureGateError { span, explain: explain.into() });
+
+    // #23973: do not suggest `#![feature(...)]` if we are in beta/stable
+    if sess.psess.unstable_features.is_nightly_build() {
+        err.subdiagnostic(FeatureDiagnosticHelp { feature });
+
+        if feature == sym::rustc_attrs {
+            // We're unlikely to stabilize something out of `rustc_attrs`
+            // without at least renaming it, so pointing out how old
+            // the compiler is will do little good.
+        } else if sess.opts.unstable_opts.ui_testing {
+            err.subdiagnostic(SuggestUpgradeCompiler::ui_testing());
+        } else if let Some(suggestion) = SuggestUpgradeCompiler::new() {
+            err.subdiagnostic(suggestion);
+        }
+    }
+    err
 }
 
 /// Info about a parsing session.
@@ -213,7 +259,7 @@ pub struct ParseSess {
     /// should be. Useful to avoid bad tokenization when encountering emoji. We group them to
     /// provide a single error per unique incorrect identifier.
     pub bad_unicode_identifiers: Lock<FxIndexMap<Symbol, Vec<Span>>>,
-    source_map: Lrc<SourceMap>,
+    source_map: Arc<SourceMap>,
     pub buffered_lints: Lock<Vec<BufferedEarlyLint>>,
     /// Contains the spans of block expressions that could have been incomplete based on the
     /// operation token that followed it, but that the parser cannot identify without further
@@ -237,17 +283,17 @@ pub struct ParseSess {
 impl ParseSess {
     /// Used for testing.
     pub fn new(locale_resources: Vec<&'static str>) -> Self {
-        let fallback_bundle = fallback_fluent_bundle(locale_resources, false);
-        let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
+        let translator = Translator::with_fallback_bundle(locale_resources, false);
+        let sm = Arc::new(SourceMap::new(FilePathMapping::empty()));
         let emitter = Box::new(
-            HumanEmitter::new(stderr_destination(ColorConfig::Auto), fallback_bundle)
-                .sm(Some(sm.clone())),
+            HumanEmitter::new(stderr_destination(ColorConfig::Auto), translator)
+                .sm(Some(Arc::clone(&sm))),
         );
         let dcx = DiagCtxt::new(emitter);
         ParseSess::with_dcx(dcx, sm)
     }
 
-    pub fn with_dcx(dcx: DiagCtxt, source_map: Lrc<SourceMap>) -> Self {
+    pub fn with_dcx(dcx: DiagCtxt, source_map: Arc<SourceMap>) -> Self {
         Self {
             dcx,
             unstable_features: UnstableFeatures::from_environment(None),
@@ -269,23 +315,14 @@ impl ParseSess {
         }
     }
 
-    pub fn with_silent_emitter(
-        locale_resources: Vec<&'static str>,
-        fatal_note: String,
-        emit_fatal_diagnostic: bool,
-    ) -> Self {
-        let fallback_bundle = fallback_fluent_bundle(locale_resources, false);
-        let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-        let emitter = Box::new(HumanEmitter::new(
-            stderr_destination(ColorConfig::Auto),
-            fallback_bundle.clone(),
-        ));
-        let fatal_dcx = DiagCtxt::new(emitter);
-        let dcx = DiagCtxt::new(Box::new(SilentEmitter {
-            fallback_bundle,
-            fatal_dcx,
+    pub fn with_fatal_emitter(locale_resources: Vec<&'static str>, fatal_note: String) -> Self {
+        let translator = Translator::with_fallback_bundle(locale_resources, false);
+        let sm = Arc::new(SourceMap::new(FilePathMapping::empty()));
+        let fatal_emitter =
+            Box::new(HumanEmitter::new(stderr_destination(ColorConfig::Auto), translator));
+        let dcx = DiagCtxt::new(Box::new(FatalOnlyEmitter {
+            fatal_emitter,
             fatal_note: Some(fatal_note),
-            emit_fatal_diagnostic,
         }))
         .disable_warnings();
         ParseSess::with_dcx(dcx, sm)
@@ -296,8 +333,8 @@ impl ParseSess {
         &self.source_map
     }
 
-    pub fn clone_source_map(&self) -> Lrc<SourceMap> {
-        self.source_map.clone()
+    pub fn clone_source_map(&self) -> Arc<SourceMap> {
+        Arc::clone(&self.source_map)
     }
 
     pub fn buffer_lint(
@@ -305,11 +342,21 @@ impl ParseSess {
         lint: &'static Lint,
         span: impl Into<MultiSpan>,
         node_id: NodeId,
-        diagnostic: BuiltinLintDiag,
+        diagnostic: impl Into<DecorateDiagCompat>,
+    ) {
+        self.opt_span_buffer_lint(lint, Some(span.into()), node_id, diagnostic.into())
+    }
+
+    pub(crate) fn opt_span_buffer_lint(
+        &self,
+        lint: &'static Lint,
+        span: Option<MultiSpan>,
+        node_id: NodeId,
+        diagnostic: DecorateDiagCompat,
     ) {
         self.buffered_lints.with_lock(|buffered_lints| {
             buffered_lints.push(BufferedEarlyLint {
-                span: span.into(),
+                span,
                 node_id,
                 lint_id: LintId::of(lint),
                 diagnostic,
@@ -321,7 +368,7 @@ impl ParseSess {
         self.proc_macro_quoted_spans.push(span)
     }
 
-    pub fn proc_macro_quoted_spans(&self) -> impl Iterator<Item = (usize, Span)> + '_ {
+    pub fn proc_macro_quoted_spans(&self) -> impl Iterator<Item = (usize, Span)> {
         // This is equivalent to `.iter().copied().enumerate()`, but that isn't possible for
         // AppendOnlyVec, so we resort to this scheme.
         self.proc_macro_quoted_spans.iter_enumerated()

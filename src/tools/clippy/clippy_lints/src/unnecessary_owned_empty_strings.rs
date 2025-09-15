@@ -1,6 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::ty::is_type_lang_item;
-use clippy_utils::{match_def_path, paths};
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::{BorrowKind, Expr, ExprKind, LangItem, Mutability};
@@ -42,7 +41,8 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryOwnedEmptyStrings {
             && let ty::Ref(_, inner_str, _) = cx.typeck_results().expr_ty_adjusted(expr).kind()
             && inner_str.is_str()
         {
-            if match_def_path(cx, fun_def_id, &paths::STRING_NEW) {
+            let fun_name = cx.tcx.get_diagnostic_name(fun_def_id);
+            if fun_name == Some(sym::string_new) {
                 span_lint_and_sugg(
                     cx,
                     UNNECESSARY_OWNED_EMPTY_STRINGS,
@@ -52,9 +52,9 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryOwnedEmptyStrings {
                     "\"\"".to_owned(),
                     Applicability::MachineApplicable,
                 );
-            } else if cx.tcx.is_diagnostic_item(sym::from_fn, fun_def_id)
-                && let [.., last_arg] = args
-                && let ExprKind::Lit(spanned) = &last_arg.kind
+            } else if fun_name == Some(sym::from_fn)
+                && let [arg] = args
+                && let ExprKind::Lit(spanned) = &arg.kind
                 && let LitKind::Str(symbol, _) = spanned.node
                 && symbol.is_empty()
                 && let inner_expr_type = cx.typeck_results().expr_ty(inner_expr)

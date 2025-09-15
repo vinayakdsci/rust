@@ -1,10 +1,10 @@
 // This test case checks if function arguments already have the correct value when breaking at the
 // beginning of a function.
 
-//@ min-lldb-version: 310
+//@ min-lldb-version: 1800
 //@ ignore-gdb
-//@ ignore-test // Test temporarily ignored due to debuginfo tests being disabled, see PR 47155
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // lldb-command:breakpoint set --name immediate_args
 // lldb-command:breakpoint set --name non_immediate_args
@@ -117,8 +117,6 @@
 // lldb-command:continue
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 fn immediate_args(a: isize, b: bool, c: f64) {
     ()

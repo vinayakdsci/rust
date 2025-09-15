@@ -3,7 +3,8 @@
 //! destructors for terminated tasks, we still keep our own list.
 
 use crate::cell::Cell;
-use crate::sys::pal::{abi, itron::task};
+use crate::sys::pal::abi;
+use crate::sys::pal::itron::task;
 use crate::sys::thread_local::destructors;
 
 pub fn enable() {
@@ -18,6 +19,9 @@ pub fn enable() {
     }
 
     unsafe extern "C" fn tls_dtor(_unused: *mut u8) {
-        unsafe { destructors::run() };
+        unsafe {
+            destructors::run();
+            crate::rt::thread_cleanup();
+        }
     }
 }

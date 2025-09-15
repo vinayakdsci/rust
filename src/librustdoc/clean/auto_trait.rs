@@ -1,18 +1,17 @@
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet, IndexEntry};
 use rustc_hir as hir;
-use rustc_infer::infer::region_constraints::{Constraint, RegionConstraintData};
+use rustc_infer::infer::region_constraints::{ConstraintKind, RegionConstraintData};
 use rustc_middle::bug;
-use rustc_middle::ty::{self, Region, Ty};
+use rustc_middle::ty::{self, Region, Ty, fold_regions};
 use rustc_span::def_id::DefId;
-use rustc_span::symbol::{kw, Symbol};
+use rustc_span::symbol::{Symbol, kw};
 use rustc_trait_selection::traits::auto_trait::{self, RegionTarget};
-
 use thin_vec::ThinVec;
+use tracing::{debug, instrument};
 
-use crate::clean::{self, simplify, Lifetime};
 use crate::clean::{
-    clean_generic_param_def, clean_middle_ty, clean_predicate, clean_trait_ref_with_constraints,
-    clean_ty_generics,
+    self, Lifetime, clean_generic_param_def, clean_middle_ty, clean_predicate,
+    clean_trait_ref_with_constraints, clean_ty_generics_inner, simplify,
 };
 use crate::core::DocContext;
 
@@ -22,7 +21,7 @@ pub(crate) fn synthesize_auto_trait_impls<'tcx>(
     item_def_id: DefId,
 ) -> Vec<clean::Item> {
     let tcx = cx.tcx;
-    let param_env = tcx.param_env(item_def_id);
+    let typing_env = ty::TypingEnv::non_body_analysis(tcx, item_def_id);
     let ty = tcx.type_of(item_def_id).instantiate_identity();
 
     let finder = auto_trait::AutoTraitFinder::new(tcx);
@@ -35,7 +34,7 @@ pub(crate) fn synthesize_auto_trait_impls<'tcx>(
                 cx,
                 ty,
                 trait_def_id,
-                param_env,
+                typing_env,
                 item_def_id,
                 &finder,
                 DiscardPositiveImpls::No,
@@ -43,13 +42,13 @@ pub(crate) fn synthesize_auto_trait_impls<'tcx>(
         })
         .collect();
     // We are only interested in case the type *doesn't* implement the `Sized` trait.
-    if !ty.is_sized(tcx, param_env)
+    if !ty.is_sized(tcx, typing_env)
         && let Some(sized_trait_def_id) = tcx.lang_items().sized_trait()
         && let Some(impl_item) = synthesize_auto_trait_impl(
             cx,
             ty,
             sized_trait_def_id,
-            param_env,
+            typing_env,
             item_def_id,
             &finder,
             DiscardPositiveImpls::Yes,
@@ -65,7 +64,7 @@ fn synthesize_auto_trait_impl<'tcx>(
     cx: &mut DocContext<'tcx>,
     ty: Ty<'tcx>,
     trait_def_id: DefId,
-    param_env: ty::ParamEnv<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
     item_def_id: DefId,
     finder: &auto_trait::AutoTraitFinder<'tcx>,
     discard_positive_impls: DiscardPositiveImpls,
@@ -77,7 +76,7 @@ fn synthesize_auto_trait_impl<'tcx>(
         return None;
     }
 
-    let result = finder.find_auto_trait_generics(ty, param_env, trait_def_id, |info| {
+    let result = finder.find_auto_trait_generics(ty, typing_env, trait_def_id, |info| {
         clean_param_env(cx, item_def_id, info.full_user_env, info.region_data, info.vid_to_region)
     });
 
@@ -102,7 +101,7 @@ fn synthesize_auto_trait_impl<'tcx>(
             // Instead, we generate `impl !Send for Foo<T>`, which better
             // expresses the fact that `Foo<T>` never implements `Send`,
             // regardless of the choice of `T`.
-            let mut generics = clean_ty_generics(
+            let mut generics = clean_ty_generics_inner(
                 cx,
                 tcx.generics_of(item_def_id),
                 ty::GenericPredicates::default(),
@@ -115,20 +114,23 @@ fn synthesize_auto_trait_impl<'tcx>(
     };
 
     Some(clean::Item {
-        name: None,
-        attrs: Default::default(),
-        item_id: clean::ItemId::Auto { trait_: trait_def_id, for_: item_def_id },
-        kind: Box::new(clean::ImplItem(Box::new(clean::Impl {
-            safety: hir::Safety::Safe,
-            generics,
-            trait_: Some(clean_trait_ref_with_constraints(cx, trait_ref, ThinVec::new())),
-            for_: clean_middle_ty(ty::Binder::dummy(ty), cx, None, None),
-            items: Vec::new(),
-            polarity,
-            kind: clean::ImplKind::Auto,
-        }))),
-        cfg: None,
-        inline_stmt_id: None,
+        inner: Box::new(clean::ItemInner {
+            name: None,
+            attrs: Default::default(),
+            stability: None,
+            kind: clean::ImplItem(Box::new(clean::Impl {
+                safety: hir::Safety::Safe,
+                generics,
+                trait_: Some(clean_trait_ref_with_constraints(cx, trait_ref, ThinVec::new())),
+                for_: clean_middle_ty(ty::Binder::dummy(ty), cx, None, None),
+                items: Vec::new(),
+                polarity,
+                kind: clean::ImplKind::Auto,
+            })),
+            item_id: clean::ItemId::Auto { trait_: trait_def_id, for_: item_def_id },
+            cfg: None,
+            inline_stmt_id: None,
+        }),
     })
 }
 
@@ -154,7 +156,7 @@ fn clean_param_env<'tcx>(
         .iter()
         .inspect(|param| {
             if cfg!(debug_assertions) {
-                debug_assert!(!param.is_anonymous_lifetime() && !param.is_host_effect());
+                debug_assert!(!param.is_anonymous_lifetime());
                 if let ty::GenericParamDefKind::Type { synthetic, .. } = param.kind {
                     debug_assert!(!synthetic && param.name != kw::SelfUpper);
                 }
@@ -180,7 +182,7 @@ fn clean_param_env<'tcx>(
                     .is_some_and(|pred| tcx.lang_items().sized_trait() == Some(pred.def_id()))
         })
         .map(|pred| {
-            tcx.fold_regions(pred, |r, _| match *r {
+            fold_regions(tcx, pred, |r, _| match r.kind() {
                 // FIXME: Don't `unwrap_or`, I think we should panic if we encounter an infer var that
                 // we can't map to a concrete region. However, `AutoTraitFinder` *does* leak those kinds
                 // of `ReVar`s for some reason at the time of writing. See `rustdoc-ui/` tests.
@@ -231,31 +233,35 @@ fn clean_region_outlives_constraints<'tcx>(
     // Each `RegionTarget` (a `RegionVid` or a `Region`) maps to its smaller and larger regions.
     // Note that "larger" regions correspond to sub regions in the surface language.
     // E.g., in `'a: 'b`, `'a` is the larger region.
-    for (constraint, _) in &regions.constraints {
-        match *constraint {
-            Constraint::VarSubVar(vid1, vid2) => {
-                let deps1 = map.entry(RegionTarget::RegionVid(vid1)).or_default();
-                deps1.larger.insert(RegionTarget::RegionVid(vid2));
+    for (c, _) in &regions.constraints {
+        match c.kind {
+            ConstraintKind::VarSubVar => {
+                let sub_vid = c.sub.as_var();
+                let sup_vid = c.sup.as_var();
+                let deps1 = map.entry(RegionTarget::RegionVid(sub_vid)).or_default();
+                deps1.larger.insert(RegionTarget::RegionVid(sup_vid));
 
-                let deps2 = map.entry(RegionTarget::RegionVid(vid2)).or_default();
-                deps2.smaller.insert(RegionTarget::RegionVid(vid1));
+                let deps2 = map.entry(RegionTarget::RegionVid(sup_vid)).or_default();
+                deps2.smaller.insert(RegionTarget::RegionVid(sub_vid));
             }
-            Constraint::RegSubVar(region, vid) => {
-                let deps = map.entry(RegionTarget::RegionVid(vid)).or_default();
-                deps.smaller.insert(RegionTarget::Region(region));
+            ConstraintKind::RegSubVar => {
+                let sup_vid = c.sup.as_var();
+                let deps = map.entry(RegionTarget::RegionVid(sup_vid)).or_default();
+                deps.smaller.insert(RegionTarget::Region(c.sub));
             }
-            Constraint::VarSubReg(vid, region) => {
-                let deps = map.entry(RegionTarget::RegionVid(vid)).or_default();
-                deps.larger.insert(RegionTarget::Region(region));
+            ConstraintKind::VarSubReg => {
+                let sub_vid = c.sub.as_var();
+                let deps = map.entry(RegionTarget::RegionVid(sub_vid)).or_default();
+                deps.larger.insert(RegionTarget::Region(c.sup));
             }
-            Constraint::RegSubReg(r1, r2) => {
+            ConstraintKind::RegSubReg => {
                 // The constraint is already in the form that we want, so we're done with it
                 // The desired order is [larger, smaller], so flip them.
-                if early_bound_region_name(r1) != early_bound_region_name(r2) {
+                if early_bound_region_name(c.sub) != early_bound_region_name(c.sup) {
                     outlives_predicates
-                        .entry(early_bound_region_name(r2).expect("no region_name found"))
+                        .entry(early_bound_region_name(c.sup).expect("no region_name found"))
                         .or_default()
-                        .push(r1);
+                        .push(c.sub);
                 }
             }
         }
@@ -343,7 +349,7 @@ fn clean_region_outlives_constraints<'tcx>(
                 .map(|&region| {
                     let lifetime = early_bound_region_name(region)
                         .inspect(|name| assert!(region_params.contains(name)))
-                        .map(|name| Lifetime(name))
+                        .map(Lifetime)
                         .unwrap_or(Lifetime::statik());
                     clean::GenericBound::Outlives(lifetime)
                 })
@@ -360,7 +366,7 @@ fn clean_region_outlives_constraints<'tcx>(
 }
 
 fn early_bound_region_name(region: Region<'_>) -> Option<Symbol> {
-    match *region {
+    match region.kind() {
         ty::ReEarlyParam(r) => Some(r.name),
         _ => None,
     }

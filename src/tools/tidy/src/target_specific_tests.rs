@@ -4,40 +4,24 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::iter_header::{iter_header, HeaderLine};
+use crate::iter_header::{HeaderLine, iter_header};
 use crate::walk::filter_not_rust;
 
 const LLVM_COMPONENTS_HEADER: &str = "needs-llvm-components:";
 const COMPILE_FLAGS_HEADER: &str = "compile-flags:";
 
-const KNOWN_LLVM_COMPONENTS: &[&str] = &[
-    "aarch64",
-    "arm",
-    "avr",
-    "bpf",
-    "csky",
-    "hexagon",
-    "loongarch",
-    "m68k",
-    "mips",
-    "msp430",
-    "nvptx",
-    "powerpc",
-    "riscv",
-    "sparc",
-    "systemz",
-    "webassembly",
-    "x86",
-];
-
 #[derive(Default, Debug)]
 struct RevisionInfo<'a> {
-    target_arch: Option<&'a str>,
+    target_arch: Option<Option<&'a str>>,
     llvm_components: Option<Vec<&'a str>>,
 }
 
-pub fn check(path: &Path, bad: &mut bool) {
-    crate::walk::walk(path, |path, _is_dir| filter_not_rust(path), &mut |entry, content| {
+pub fn check(tests_path: &Path, bad: &mut bool) {
+    crate::walk::walk(tests_path, |path, _is_dir| filter_not_rust(path), &mut |entry, content| {
+        if content.contains("// ignore-tidy-target-specific-tests") {
+            return;
+        }
+
         let file = entry.path().display();
         let mut header_map = BTreeMap::new();
         iter_header(content, &mut |HeaderLine { revision, directive, .. }| {
@@ -50,58 +34,84 @@ pub fn check(path: &Path, bad: &mut bool) {
                         comp_vec.push(component);
                     }
                 }
-            } else if directive.starts_with(COMPILE_FLAGS_HEADER) {
-                let compile_flags = &directive[COMPILE_FLAGS_HEADER.len()..];
-                if let Some((_, v)) = compile_flags.split_once("--target") {
-                    let v = v.trim_start_matches(|c| c == ' ' || c == '=');
-                    let v = if v == "{{target}}" { Some((v, v)) } else { v.split_once("-") };
-                    if let Some((arch, _)) = v {
-                        let info = header_map.entry(revision).or_insert(RevisionInfo::default());
-                        info.target_arch.replace(arch);
-                    } else {
-                        eprintln!("{file}: seems to have a malformed --target value");
-                        *bad = true;
-                    }
+            } else if let Some(compile_flags) = directive.strip_prefix(COMPILE_FLAGS_HEADER)
+                && let Some((_, v)) = compile_flags.split_once("--target")
+            {
+                let v = v.trim_start_matches([' ', '=']);
+                let info = header_map.entry(revision).or_insert(RevisionInfo::default());
+                if v.starts_with("{{") {
+                    info.target_arch.replace(None);
+                } else if let Some((arch, _)) = v.split_once("-") {
+                    info.target_arch.replace(Some(arch));
+                } else {
+                    eprintln!("{file}: seems to have a malformed --target value");
+                    *bad = true;
                 }
             }
         });
+
+        // Skip run-make tests as revisions are not supported.
+        if entry.path().strip_prefix(tests_path).is_ok_and(|rest| rest.starts_with("run-make")) {
+            return;
+        }
+
         for (rev, RevisionInfo { target_arch, llvm_components }) in &header_map {
             let rev = rev.unwrap_or("[unspecified]");
             match (target_arch, llvm_components) {
                 (None, None) => {}
-                (Some(_), None) => {
+                (Some(target_arch), None) => {
+                    let llvm_component =
+                        target_arch.map_or_else(|| "<arch>".to_string(), arch_to_llvm_component);
                     eprintln!(
-                        "{}: revision {} should specify `{}` as it has `--target` set",
-                        file, rev, LLVM_COMPONENTS_HEADER
+                        "{file}: revision {rev} should specify `{LLVM_COMPONENTS_HEADER} {llvm_component}` as it has `--target` set"
                     );
                     *bad = true;
                 }
                 (None, Some(_)) => {
                     eprintln!(
-                        "{}: revision {} should not specify `{}` as it doesn't need `--target`",
-                        file, rev, LLVM_COMPONENTS_HEADER
+                        "{file}: revision {rev} should not specify `{LLVM_COMPONENTS_HEADER}` as it doesn't need `--target`"
                     );
                     *bad = true;
                 }
-                (Some(_), Some(_)) => {
-                    // FIXME: check specified components against the target architectures we
-                    // gathered.
-                }
-            }
-            if let Some(llvm_components) = llvm_components {
-                for component in llvm_components {
-                    // Ensure the given component even exists.
-                    // This is somewhat redundant with COMPILETEST_REQUIRE_ALL_LLVM_COMPONENTS,
-                    // but helps detect such problems earlier (PR CI rather than bors CI).
-                    if !KNOWN_LLVM_COMPONENTS.contains(component) {
-                        eprintln!(
-                            "{}: revision {} specifies unknown LLVM component `{}`",
-                            file, rev, component
-                        );
-                        *bad = true;
+                (Some(target_arch), Some(llvm_components)) => {
+                    if let Some(target_arch) = target_arch {
+                        let llvm_component = arch_to_llvm_component(target_arch);
+                        if !llvm_components.contains(&llvm_component.as_str()) {
+                            eprintln!(
+                                "{file}: revision {rev} should specify `{LLVM_COMPONENTS_HEADER} {llvm_component}` as it has `--target` set"
+                            );
+                            *bad = true;
+                        }
                     }
                 }
             }
         }
     });
+}
+
+fn arch_to_llvm_component(arch: &str) -> String {
+    // NOTE: This is an *approximate* mapping of Rust's `--target` architecture to LLVM component
+    // names. It is not intended to be an authoritative source, but rather a best-effort that's good
+    // enough for the purpose of this tidy check.
+    match arch {
+        "amdgcn" => "amdgpu".into(),
+        "aarch64_be" | "arm64_32" | "arm64e" | "arm64ec" => "aarch64".into(),
+        "i386" | "i586" | "i686" | "x86" | "x86_64" | "x86_64h" => "x86".into(),
+        "loongarch32" | "loongarch64" => "loongarch".into(),
+        "nvptx64" => "nvptx".into(),
+        "s390x" => "systemz".into(),
+        "sparc64" | "sparcv9" => "sparc".into(),
+        "wasm32" | "wasm32v1" | "wasm64" => "webassembly".into(),
+        _ if arch.starts_with("armeb")
+            || arch.starts_with("armv")
+            || arch.starts_with("thumbv") =>
+        {
+            "arm".into()
+        }
+        _ if arch.starts_with("bpfe") => "bpf".into(),
+        _ if arch.starts_with("mips") => "mips".into(),
+        _ if arch.starts_with("powerpc") => "powerpc".into(),
+        _ if arch.starts_with("riscv") => "riscv".into(),
+        _ => arch.to_ascii_lowercase(),
+    }
 }

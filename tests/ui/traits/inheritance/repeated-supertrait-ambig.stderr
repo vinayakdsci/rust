@@ -18,7 +18,7 @@ LL |     c.same_as(22)
    |       |
    |       required by a bound introduced by this call
    |
-help: consider further restricting this bound
+help: consider further restricting type parameter `C` with trait `CompareTo`
    |
 LL | fn with_trait<C:CompareToInts + CompareTo<i32>>(c: &C) -> bool {
    |                               ++++++++++++++++
@@ -34,14 +34,14 @@ LL |     <dyn CompareToInts>::same_as(c, 22)
              `i64` implements `CompareTo<u64>`
 
 error[E0277]: the trait bound `C: CompareTo<i32>` is not satisfied
-  --> $DIR/repeated-supertrait-ambig.rs:38:27
+  --> $DIR/repeated-supertrait-ambig.rs:38:24
    |
 LL |     CompareTo::same_as(c, 22)
-   |     ------------------    ^^ the trait `CompareTo<i32>` is not implemented for `C`
+   |     ------------------ ^ the trait `CompareTo<i32>` is not implemented for `C`
    |     |
    |     required by a bound introduced by this call
    |
-help: consider further restricting this bound
+help: consider further restricting type parameter `C` with trait `CompareTo`
    |
 LL | fn with_ufcs2<C:CompareToInts + CompareTo<i32>>(c: &C) -> bool {
    |                               ++++++++++++++++

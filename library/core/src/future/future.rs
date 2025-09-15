@@ -4,7 +4,8 @@ use crate::ops;
 use crate::pin::Pin;
 use crate::task::{Context, Poll};
 
-/// A future represents an asynchronous computation obtained by use of [`async`].
+/// A future represents an asynchronous computation, commonly obtained by use of
+/// [`async`].
 ///
 /// A future is a value that might not have finished computing yet. This kind of
 /// "asynchronous value" makes it possible for a thread to continue doing useful
@@ -25,6 +26,7 @@ use crate::task::{Context, Poll};
 /// [`async`]: ../../std/keyword.async.html
 /// [`Waker`]: crate::task::Waker
 #[doc(notable_trait)]
+#[doc(search_unbox)]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 #[stable(feature = "futures_api", since = "1.36.0")]
 #[lang = "future_trait"]
@@ -38,7 +40,7 @@ pub trait Future {
     #[lang = "future_output"]
     type Output;
 
-    /// Attempt to resolve the future to a final value, registering
+    /// Attempts to resolve the future to a final value, registering
     /// the current task for wakeup if the value is not yet available.
     ///
     /// # Return value
@@ -67,13 +69,21 @@ pub trait Future {
     ///
     /// # Runtime characteristics
     ///
-    /// Futures alone are *inert*; they must be *actively* `poll`ed to make
-    /// progress, meaning that each time the current task is woken up, it should
-    /// actively re-`poll` pending futures that it still has an interest in.
+    /// Futures alone are *inert*; they must be *actively* `poll`ed for the
+    /// underlying computation to make progress, meaning that each time the
+    /// current task is woken up, it should actively re-`poll` pending futures
+    /// that it still has an interest in.
     ///
-    /// The `poll` function is not called repeatedly in a tight loop -- instead,
-    /// it should only be called when the future indicates that it is ready to
-    /// make progress (by calling `wake()`). If you're familiar with the
+    /// Having said that, some Futures may represent a value that is being
+    /// computed in a different task. In this case, the future's underlying
+    /// computation is simply acting as a conduit for a value being computed
+    /// by that other task, which will proceed independently of the Future.
+    /// Futures of this kind are typically obtained when spawning a new task into an
+    /// async runtime.
+    ///
+    /// The `poll` function should not be called repeatedly in a tight loop --
+    /// instead, it should only be called when the future indicates that it is
+    /// ready to make progress (by calling `wake()`). If you're familiar with the
     /// `poll(2)` or `select(2)` syscalls on Unix it's worth noting that futures
     /// typically do *not* suffer the same problems of "all wakeups must poll
     /// all events"; they are more like `epoll(4)`.

@@ -1,9 +1,10 @@
 //! Checks that no Fluent messages or attributes end in periods (except ellipses)
 
+use std::path::Path;
+
 use fluent_syntax::ast::{Entry, PatternElement};
 
 use crate::walk::{filter_dirs, walk};
-use std::path::Path;
 
 fn filter_fluent(path: &Path) -> bool {
     if let Some(ext) = path.extension() { ext.to_str() != Some("ftl") } else { true }
@@ -17,7 +18,6 @@ const ALLOWLIST: &[&str] = &[
     "const_eval_validation_failure_note",
     "driver_impl_ice",
     "incremental_corrupt_file",
-    "mir_build_pointer_pattern",
 ];
 
 fn check_period(filename: &str, contents: &str, bad: &mut bool) {
@@ -33,14 +33,14 @@ fn check_period(filename: &str, contents: &str, bad: &mut bool) {
                 continue;
             }
 
-            if let Some(pat) = &m.value {
-                if let Some(PatternElement::TextElement { value }) = pat.elements.last() {
-                    // We don't care about ellipses.
-                    if value.ends_with(".") && !value.ends_with("...") {
-                        let ll = find_line(contents, *value);
-                        let name = m.id.name;
-                        tidy_error!(bad, "{filename}:{ll}: message `{name}` ends in a period");
-                    }
+            if let Some(pat) = &m.value
+                && let Some(PatternElement::TextElement { value }) = pat.elements.last()
+            {
+                // We don't care about ellipses.
+                if value.ends_with(".") && !value.ends_with("...") {
+                    let ll = find_line(contents, value);
+                    let name = m.id.name;
+                    tidy_error!(bad, "{filename}:{ll}: message `{name}` ends in a period");
                 }
             }
 
@@ -50,12 +50,13 @@ fn check_period(filename: &str, contents: &str, bad: &mut bool) {
                     continue;
                 }
 
-                if let Some(PatternElement::TextElement { value }) = attr.value.elements.last() {
-                    if value.ends_with(".") && !value.ends_with("...") {
-                        let ll = find_line(contents, *value);
-                        let name = attr.id.name;
-                        tidy_error!(bad, "{filename}:{ll}: attr `{name}` ends in a period");
-                    }
+                if let Some(PatternElement::TextElement { value }) = attr.value.elements.last()
+                    && value.ends_with(".")
+                    && !value.ends_with("...")
+                {
+                    let ll = find_line(contents, value);
+                    let name = attr.id.name;
+                    tidy_error!(bad, "{filename}:{ll}: attr `{name}` ends in a period");
                 }
             }
         }

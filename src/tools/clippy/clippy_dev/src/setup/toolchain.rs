@@ -1,3 +1,4 @@
+use crate::utils::{cargo_cmd, run_exit_on_err};
 use std::env::consts::EXE_SUFFIX;
 use std::env::current_dir;
 use std::ffi::OsStr;
@@ -5,13 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use super::verify_inside_clippy_dir;
-
-pub fn create(force: bool, release: bool, name: &str) {
-    if !verify_inside_clippy_dir() {
-        return;
-    }
-
+pub fn create(standalone: bool, force: bool, release: bool, name: &str) {
     let rustup_home = std::env::var("RUSTUP_HOME").unwrap();
     let toolchain = std::env::var("RUSTUP_TOOLCHAIN").unwrap();
 
@@ -48,14 +43,21 @@ pub fn create(force: bool, release: bool, name: &str) {
         }
     }
 
-    symlink_bin("cargo-clippy", &dest, release);
-    symlink_bin("clippy-driver", &dest, release);
+    run_exit_on_err(
+        "cargo build",
+        cargo_cmd().arg("build").args(release.then_some("--release")),
+    );
+
+    install_bin("cargo-clippy", &dest, standalone, release);
+    install_bin("clippy-driver", &dest, standalone, release);
 
     println!("Created toolchain {name}, use it in other projects with e.g. `cargo +{name} clippy`");
-    println!("Note: This will need to be re-run whenever the Clippy `rust-toolchain` changes");
+    if !standalone {
+        println!("Note: This will need to be re-run whenever the Clippy `rust-toolchain.toml` changes");
+    }
 }
 
-fn symlink_bin(bin: &str, dest: &Path, release: bool) {
+fn install_bin(bin: &str, dest: &Path, standalone: bool, release: bool) {
     #[cfg(windows)]
     use std::os::windows::fs::symlink_file as symlink;
 
@@ -71,5 +73,9 @@ fn symlink_bin(bin: &str, dest: &Path, release: bool) {
     let mut dest = dest.to_path_buf();
     dest.extend(["bin", &file_name]);
 
-    symlink(src, dest).unwrap();
+    if standalone {
+        fs::copy(src, dest).unwrap();
+    } else {
+        symlink(src, dest).unwrap();
+    }
 }

@@ -1,8 +1,7 @@
-//@ min-lldb-version: 310
-//@ ignore-gdb-version: 7.11.90 - 7.12.9
-//@ ignore-test // Test temporarily ignored due to debuginfo tests being disabled, see PR 47155
+//@ min-lldb-version: 1800
 
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
@@ -10,16 +9,13 @@
 // gdb-command:run
 
 // gdb-command:print case1
-// gdbg-check:$1 = {{RUST$ENUM$DISR = Case1, __0 = 0, __1 = {x = 2088533116, y = 2088533116, z = 31868}}, {RUST$ENUM$DISR = Case1, [...]}}
-// gdbr-check:$1 = struct_in_enum::Regular::Case1(0, struct_in_enum::Struct {x: 2088533116, y: 2088533116, z: 31868})
+// gdb-check:$1 = struct_in_enum::Regular::Case1(0, struct_in_enum::Struct {x: 2088533116, y: 2088533116, z: 31868})
 
 // gdb-command:print case2
-// gdbg-check:$2 = {{RUST$ENUM$DISR = Case2, [...]}, {RUST$ENUM$DISR = Case2, __0 = 0, __1 = 1229782938247303441, __2 = 4369}}
-// gdbr-check:$2 = struct_in_enum::Regular::Case2(0, 1229782938247303441, 4369)
+// gdb-check:$2 = struct_in_enum::Regular::Case2(0, 1229782938247303441, 4369)
 
 // gdb-command:print univariant
-// gdbg-check:$3 = {{__0 = {x = 123, y = 456, z = 789}}}
-// gdbr-check:$3 = struct_in_enum::Univariant::TheOnlyCase(struct_in_enum::Struct {x: 123, y: 456, z: 789})
+// gdb-check:$3 = struct_in_enum::Univariant::TheOnlyCase(struct_in_enum::Struct {x: 123, y: 456, z: 789})
 
 
 // === LLDB TESTS ==================================================================================
@@ -35,8 +31,6 @@
 // lldb-check:[...] TheOnlyCase(Struct { x: 123, y: 456, z: 789 })
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 use self::Regular::{Case1, Case2};
 use self::Univariant::TheOnlyCase;

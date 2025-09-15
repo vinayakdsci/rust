@@ -1,7 +1,7 @@
-use run_make_support::rustc;
-use std::path::Path;
+//@ needs-target-std
+use run_make_support::{path, rustc};
 
 fn main() {
     rustc().input("bar.rs").crate_name("foo").run();
-    assert!(Path::new("libfoo.rlib").is_file());
+    assert!(path("libfoo.rlib").is_file());
 }

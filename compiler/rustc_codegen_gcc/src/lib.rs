@@ -3,10 +3,12 @@
  * TODO(antoyo): support #[inline] attributes.
  * TODO(antoyo): support LTO (gcc's equivalent to Full LTO is -flto -flto-partition=one — https://documentation.suse.com/sbp/all/html/SBP-GCC-10/index.html).
  * For Thin LTO, this might be helpful:
+// cspell:disable-next-line
  * In gcc 4.6 -fwhopr was removed and became default with -flto. The non-whopr path can still be executed via -flto-partition=none.
  * Or the new incremental LTO (https://www.phoronix.com/news/GCC-Incremental-LTO-Patches)?
  *
- * Maybe some missing optizations enabled by rustc's LTO is in there: https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
+ * Maybe some missing optimizations enabled by rustc's LTO is in there: https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
+// cspell:disable-next-line
  * Like -fipa-icf (should be already enabled) and maybe -fdevirtualize-at-ltrans.
  * TODO: disable debug info always being emitted. Perhaps this slows down things?
  *
@@ -16,17 +18,23 @@
 #![allow(internal_features)]
 #![doc(rust_logo)]
 #![feature(rustdoc_internals)]
-#![feature(rustc_private, decl_macro, never_type, trusted_len, hash_raw_entry, let_chains)]
-#![allow(broken_intra_doc_links)]
+#![feature(rustc_private)]
 #![recursion_limit = "256"]
 #![warn(rust_2018_idioms)]
 #![warn(unused_lifetimes)]
 #![deny(clippy::pattern_type_mismatch)]
-#![allow(clippy::needless_lifetimes)]
+#![allow(clippy::needless_lifetimes, clippy::uninlined_format_args)]
 
+// These crates are pulled from the sysroot because they are part of
+// rustc's public API, so we need to ensure version compatibility.
+extern crate smallvec;
+#[macro_use]
+extern crate tracing;
+
+// The rustc crates we need
+extern crate rustc_abi;
 extern crate rustc_apfloat;
 extern crate rustc_ast;
-extern crate rustc_attr;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
@@ -37,13 +45,12 @@ extern crate rustc_index;
 #[cfg(feature = "master")]
 extern crate rustc_interface;
 extern crate rustc_macros;
-extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_symbol_mangling;
 extern crate rustc_target;
-#[macro_use]
-extern crate tracing;
+extern crate rustc_type_ir;
 
 // This prevents duplicating functions and statics that are already part of the host rustc process.
 #[allow(unused_extern_crates)]
@@ -51,7 +58,6 @@ extern crate rustc_driver;
 
 mod abi;
 mod allocator;
-mod archive;
 mod asm;
 mod attributes;
 mod back;
@@ -75,39 +81,36 @@ mod type_of;
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Deref;
+use std::path::PathBuf;
 #[cfg(not(feature = "master"))]
 use std::sync::atomic::AtomicBool;
 #[cfg(not(feature = "master"))]
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use back::lto::ThinBuffer;
-use back::lto::ThinData;
-use errors::LTONotSupported;
-use gccjit::CType;
-use gccjit::{Context, OptimizationLevel};
+use back::lto::{ThinBuffer, ThinData};
+use gccjit::{CType, Context, OptimizationLevel};
 #[cfg(feature = "master")]
 use gccjit::{TargetInfo, Version};
 use rustc_ast::expand::allocator::AllocatorKind;
-use rustc_codegen_ssa::back::lto::{LtoModuleCodegen, SerializedModule, ThinModule};
+use rustc_codegen_ssa::back::lto::{SerializedModule, ThinModule};
 use rustc_codegen_ssa::back::write::{
     CodegenContext, FatLtoInput, ModuleConfig, TargetMachineFactoryFn,
 };
 use rustc_codegen_ssa::base::codegen_crate;
+use rustc_codegen_ssa::target_features::cfg_target_feature;
 use rustc_codegen_ssa::traits::{CodegenBackend, ExtraBackendMethods, WriteBackendMethods};
-use rustc_codegen_ssa::{CodegenResults, CompiledModule, ModuleCodegen};
+use rustc_codegen_ssa::{CodegenResults, CompiledModule, ModuleCodegen, TargetConfig};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sync::IntoDynSyncSend;
-use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
-use rustc_metadata::EncodedMetadata;
+use rustc_errors::DiagCtxtHandle;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
-use rustc_session::config::{Lto, OptLevel, OutputFilenames};
 use rustc_session::Session;
-use rustc_span::fatal_error::FatalError;
+use rustc_session::config::{OptLevel, OutputFilenames};
 use rustc_span::Symbol;
+use rustc_target::spec::RelocModel;
 use tempfile::TempDir;
 
 use crate::back::lto::ModuleBuffer;
@@ -137,11 +140,15 @@ impl TargetInfo {
         false
     }
 
-    fn supports_128bit_int(&self) -> bool {
-        self.supports_128bit_integers.load(Ordering::SeqCst)
-    }
-
-    fn supports_target_dependent_type(&self, _typ: CType) -> bool {
+    fn supports_target_dependent_type(&self, typ: CType) -> bool {
+        match typ {
+            CType::UInt128t | CType::Int128t => {
+                if self.supports_128bit_integers.load(Ordering::SeqCst) {
+                    return true;
+                }
+            }
+            _ => (),
+        }
         false
     }
 }
@@ -162,10 +169,6 @@ impl LockedTargetInfo {
         self.info.lock().expect("lock").cpu_supports(feature)
     }
 
-    fn supports_128bit_int(&self) -> bool {
-        self.info.lock().expect("lock").supports_128bit_int()
-    }
-
     fn supports_target_dependent_type(&self, typ: CType) -> bool {
         self.info.lock().expect("lock").supports_target_dependent_type(typ)
     }
@@ -181,10 +184,10 @@ impl CodegenBackend for GccCodegenBackend {
         crate::DEFAULT_LOCALE_RESOURCE
     }
 
-    fn init(&self, sess: &Session) {
+    fn init(&self, _sess: &Session) {
         #[cfg(feature = "master")]
         {
-            let target_cpu = target_cpu(sess);
+            let target_cpu = target_cpu(_sess);
 
             // Get the second TargetInfo with the correct CPU features by setting the arch.
             let context = Context::default();
@@ -198,14 +201,10 @@ impl CodegenBackend for GccCodegenBackend {
         #[cfg(feature = "master")]
         gccjit::set_global_personality_function_name(b"rust_eh_personality\0");
 
-        if sess.lto() == Lto::Thin {
-            sess.dcx().emit_warn(LTONotSupported {});
-        }
-
         #[cfg(not(feature = "master"))]
         {
             let temp_dir = TempDir::new().expect("cannot create temporary directory");
-            let temp_file = temp_dir.into_path().join("result.asm");
+            let temp_file = temp_dir.keep().join("result.asm");
             let check_context = Context::default();
             check_context.set_print_errors_to_stderr(false);
             let _int128_ty = check_context.new_c_type(CType::UInt128t);
@@ -227,20 +226,9 @@ impl CodegenBackend for GccCodegenBackend {
         providers.global_backend_features = |tcx, ()| gcc_util::global_gcc_features(tcx.sess, true)
     }
 
-    fn codegen_crate(
-        &self,
-        tcx: TyCtxt<'_>,
-        metadata: EncodedMetadata,
-        need_metadata_module: bool,
-    ) -> Box<dyn Any> {
+    fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
         let target_cpu = target_cpu(tcx.sess);
-        let res = codegen_crate(
-            self.clone(),
-            tcx,
-            target_cpu.to_string(),
-            metadata,
-            need_metadata_module,
-        );
+        let res = codegen_crate(self.clone(), tcx, target_cpu.to_string());
 
         Box::new(res)
     }
@@ -257,19 +245,8 @@ impl CodegenBackend for GccCodegenBackend {
             .join(sess)
     }
 
-    fn link(
-        &self,
-        sess: &Session,
-        codegen_results: CodegenResults,
-        outputs: &OutputFilenames,
-    ) -> Result<(), ErrorGuaranteed> {
-        use rustc_codegen_ssa::back::link::link_binary;
-
-        link_binary(sess, &crate::archive::ArArchiveBuilderBuilder, &codegen_results, outputs)
-    }
-
-    fn target_features(&self, sess: &Session, allow_unstable: bool) -> Vec<Symbol> {
-        target_features(sess, allow_unstable, &self.target_info)
+    fn target_config(&self, sess: &Session) -> TargetConfig {
+        target_config(sess, &self.target_info)
     }
 }
 
@@ -295,6 +272,10 @@ fn new_context<'gcc, 'tcx>(tcx: TyCtxt<'tcx>) -> Context<'gcc> {
 }
 
 impl ExtraBackendMethods for GccCodegenBackend {
+    fn supports_parallel(&self) -> bool {
+        false
+    }
+
     fn codegen_allocator(
         &self,
         tcx: TyCtxt<'_>,
@@ -304,6 +285,7 @@ impl ExtraBackendMethods for GccCodegenBackend {
     ) -> Self::Module {
         let mut mods = GccContext {
             context: Arc::new(SyncContext::new(new_context(tcx))),
+            relocation_model: tcx.sess.relocation_model(),
             should_combine_object_files: false,
             temp_dir: None,
         };
@@ -335,6 +317,9 @@ impl ExtraBackendMethods for GccCodegenBackend {
 
 pub struct GccContext {
     context: Arc<SyncContext>,
+    /// This field is needed in order to be able to set the flag -fPIC when necessary when doing
+    /// LTO.
+    relocation_model: RelocModel,
     should_combine_object_files: bool,
     // Temporary directory used by LTO. We keep it here so that it's not removed before linking.
     temp_dir: Option<TempDir>,
@@ -359,8 +344,7 @@ impl Deref for SyncContext {
 }
 
 unsafe impl Send for SyncContext {}
-// FIXME(antoyo): that shouldn't be Sync. Parallel compilation is currently disabled with "-Zno-parallel-llvm".
-// TODO: disable it here by returing false in CodegenBackend::supports_parallel().
+// FIXME(antoyo): that shouldn't be Sync. Parallel compilation is currently disabled with "CodegenBackend::supports_parallel()".
 unsafe impl Sync for SyncContext {}
 
 impl WriteBackendMethods for GccCodegenBackend {
@@ -371,20 +355,25 @@ impl WriteBackendMethods for GccCodegenBackend {
     type ThinData = ThinData;
     type ThinBuffer = ThinBuffer;
 
-    fn run_fat_lto(
+    fn run_and_optimize_fat_lto(
         cgcx: &CodegenContext<Self>,
+        // FIXME(bjorn3): Limit LTO exports to these symbols
+        _exported_symbols_for_lto: &[String],
+        each_linked_rlib_for_lto: &[PathBuf],
         modules: Vec<FatLtoInput<Self>>,
-        cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
-    ) -> Result<LtoModuleCodegen<Self>, FatalError> {
-        back::lto::run_fat(cgcx, modules, cached_modules)
+    ) -> ModuleCodegen<Self::Module> {
+        back::lto::run_fat(cgcx, each_linked_rlib_for_lto, modules)
     }
 
     fn run_thin_lto(
         cgcx: &CodegenContext<Self>,
+        // FIXME(bjorn3): Limit LTO exports to these symbols
+        _exported_symbols_for_lto: &[String],
+        each_linked_rlib_for_lto: &[PathBuf],
         modules: Vec<(String, Self::ThinBuffer)>,
         cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
-    ) -> Result<(Vec<LtoModuleCodegen<Self>>, Vec<WorkProduct>), FatalError> {
-        back::lto::run_thin(cgcx, modules, cached_modules)
+    ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
+        back::lto::run_thin(cgcx, each_linked_rlib_for_lto, modules, cached_modules)
     }
 
     fn print_pass_timings(&self) {
@@ -395,62 +384,41 @@ impl WriteBackendMethods for GccCodegenBackend {
         unimplemented!()
     }
 
-    unsafe fn optimize(
+    fn optimize(
         _cgcx: &CodegenContext<Self>,
         _dcx: DiagCtxtHandle<'_>,
-        module: &ModuleCodegen<Self::Module>,
+        module: &mut ModuleCodegen<Self::Module>,
         config: &ModuleConfig,
-    ) -> Result<(), FatalError> {
+    ) {
         module.module_llvm.context.set_optimization_level(to_gcc_opt_level(config.opt_level));
-        Ok(())
     }
 
-    fn optimize_fat(
-        _cgcx: &CodegenContext<Self>,
-        _module: &mut ModuleCodegen<Self::Module>,
-    ) -> Result<(), FatalError> {
-        // TODO(antoyo)
-        Ok(())
-    }
-
-    unsafe fn optimize_thin(
+    fn optimize_thin(
         cgcx: &CodegenContext<Self>,
         thin: ThinModule<Self>,
-    ) -> Result<ModuleCodegen<Self::Module>, FatalError> {
+    ) -> ModuleCodegen<Self::Module> {
         back::lto::optimize_thin_module(thin, cgcx)
     }
 
-    unsafe fn codegen(
+    fn codegen(
         cgcx: &CodegenContext<Self>,
-        dcx: DiagCtxtHandle<'_>,
         module: ModuleCodegen<Self::Module>,
         config: &ModuleConfig,
-    ) -> Result<CompiledModule, FatalError> {
-        back::write::codegen(cgcx, dcx, module, config)
+    ) -> CompiledModule {
+        back::write::codegen(cgcx, module, config)
     }
 
-    fn prepare_thin(
-        module: ModuleCodegen<Self::Module>,
-        emit_summary: bool,
-    ) -> (String, Self::ThinBuffer) {
-        back::lto::prepare_thin(module, emit_summary)
+    fn prepare_thin(module: ModuleCodegen<Self::Module>) -> (String, Self::ThinBuffer) {
+        back::lto::prepare_thin(module)
     }
 
     fn serialize_module(_module: ModuleCodegen<Self::Module>) -> (String, Self::ModuleBuffer) {
         unimplemented!();
     }
-
-    fn run_link(
-        cgcx: &CodegenContext<Self>,
-        dcx: DiagCtxtHandle<'_>,
-        modules: Vec<ModuleCodegen<Self::Module>>,
-    ) -> Result<ModuleCodegen<Self::Module>, FatalError> {
-        back::write::link(cgcx, dcx, modules)
-    }
 }
 
 /// This is the entrypoint for a hot plugged rustc_codegen_gccjit
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     #[cfg(feature = "master")]
     let info = {
@@ -473,42 +441,41 @@ fn to_gcc_opt_level(optlevel: Option<OptLevel>) -> OptimizationLevel {
         Some(level) => match level {
             OptLevel::No => OptimizationLevel::None,
             OptLevel::Less => OptimizationLevel::Limited,
-            OptLevel::Default => OptimizationLevel::Standard,
+            OptLevel::More => OptimizationLevel::Standard,
             OptLevel::Aggressive => OptimizationLevel::Aggressive,
             OptLevel::Size | OptLevel::SizeMin => OptimizationLevel::Limited,
         },
     }
 }
 
-pub fn target_features(
-    sess: &Session,
-    allow_unstable: bool,
-    target_info: &LockedTargetInfo,
-) -> Vec<Symbol> {
-    // TODO(antoyo): use global_gcc_features.
-    sess.target
-        .supported_target_features()
-        .iter()
-        .filter_map(|&(feature, gate)| {
-            if sess.is_nightly_build() || allow_unstable || gate.is_stable() {
-                Some(feature)
-            } else {
-                None
-            }
-        })
-        .filter(|feature| {
-            // TODO: we disable Neon for now since we don't support the LLVM intrinsics for it.
-            if *feature == "neon" {
-                return false;
-            }
-            target_info.cpu_supports(feature)
-            /*
-              adx, aes, avx, avx2, avx512bf16, avx512bitalg, avx512bw, avx512cd, avx512dq, avx512er, avx512f, avx512fp16, avx512ifma,
-              avx512pf, avx512vbmi, avx512vbmi2, avx512vl, avx512vnni, avx512vp2intersect, avx512vpopcntdq,
-              bmi1, bmi2, cmpxchg16b, ermsb, f16c, fma, fxsr, gfni, lzcnt, movbe, pclmulqdq, popcnt, rdrand, rdseed, rtm,
-              sha, sse, sse2, sse3, sse4.1, sse4.2, sse4a, ssse3, tbm, vaes, vpclmulqdq, xsave, xsavec, xsaveopt, xsaves
-            */
-        })
-        .map(Symbol::intern)
-        .collect()
+/// Returns the features that should be set in `cfg(target_feature)`.
+fn target_config(sess: &Session, target_info: &LockedTargetInfo) -> TargetConfig {
+    let (unstable_target_features, target_features) = cfg_target_feature(sess, |feature| {
+        // TODO: we disable Neon for now since we don't support the LLVM intrinsics for it.
+        if feature == "neon" {
+            return false;
+        }
+        target_info.cpu_supports(feature)
+        // cSpell:disable
+        /*
+          adx, aes, avx, avx2, avx512bf16, avx512bitalg, avx512bw, avx512cd, avx512dq, avx512er, avx512f, avx512fp16, avx512ifma,
+          avx512pf, avx512vbmi, avx512vbmi2, avx512vl, avx512vnni, avx512vp2intersect, avx512vpopcntdq,
+          bmi1, bmi2, cmpxchg16b, ermsb, f16c, fma, fxsr, gfni, lzcnt, movbe, pclmulqdq, popcnt, rdrand, rdseed, rtm,
+          sha, sse, sse2, sse3, sse4.1, sse4.2, sse4a, ssse3, tbm, vaes, vpclmulqdq, xsave, xsavec, xsaveopt, xsaves
+        */
+        // cSpell:enable
+    });
+
+    let has_reliable_f16 = target_info.supports_target_dependent_type(CType::Float16);
+    let has_reliable_f128 = target_info.supports_target_dependent_type(CType::Float128);
+
+    TargetConfig {
+        target_features,
+        unstable_target_features,
+        // There are no known bugs with GCC support for f16 or f128
+        has_reliable_f16,
+        has_reliable_f16_math: has_reliable_f16,
+        has_reliable_f128,
+        has_reliable_f128_math: has_reliable_f128,
+    }
 }

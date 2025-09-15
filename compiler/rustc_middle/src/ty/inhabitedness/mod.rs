@@ -43,12 +43,12 @@
 //! This code should only compile in modules where the uninhabitedness of `Foo`
 //! is visible.
 
+use rustc_type_ir::TyKind::*;
+use tracing::instrument;
+
 use crate::query::Providers;
 use crate::ty::context::TyCtxt;
 use crate::ty::{self, DefId, Ty, TypeVisitableExt, VariantDef, Visibility};
-
-use rustc_type_ir::TyKind::*;
-use tracing::instrument;
 
 pub mod inhabited_predicate;
 
@@ -81,10 +81,6 @@ impl<'tcx> VariantDef {
         adt: ty::AdtDef<'_>,
     ) -> InhabitedPredicate<'tcx> {
         debug_assert!(!adt.is_union());
-        if self.is_field_list_non_exhaustive() && !self.def_id.is_local() {
-            // Non-exhaustive variants from other crates are always considered inhabited.
-            return InhabitedPredicate::True;
-        }
         InhabitedPredicate::all(
             tcx,
             self.fields.iter().map(|field| {
@@ -111,11 +107,13 @@ impl<'tcx> Ty<'tcx> {
             // For now, unions are always considered inhabited
             Adt(adt, _) if adt.is_union() => InhabitedPredicate::True,
             // Non-exhaustive ADTs from other crates are always considered inhabited
-            Adt(adt, _) if adt.is_variant_list_non_exhaustive() && !adt.did().is_local() => {
+            Adt(adt, _) if adt.variant_list_has_applicable_non_exhaustive() => {
                 InhabitedPredicate::True
             }
             Never => InhabitedPredicate::False,
-            Param(_) | Alias(ty::Projection | ty::Weak, _) => InhabitedPredicate::GenericType(self),
+            Param(_) | Alias(ty::Inherent | ty::Projection | ty::Free, _) => {
+                InhabitedPredicate::GenericType(self)
+            }
             Alias(ty::Opaque, alias_ty) => {
                 match alias_ty.def_id.as_local() {
                     // Foreign opaque is considered inhabited.
@@ -126,12 +124,6 @@ impl<'tcx> Ty<'tcx> {
                         InhabitedPredicate::OpaqueType(key)
                     }
                 }
-            }
-            // FIXME(inherent_associated_types): Most likely we can just map to `GenericType` like above.
-            // However it's unclear if the args passed to `InhabitedPredicate::instantiate` are of the correct
-            // format, i.e. don't contain parent args. If you hit this case, please verify this beforehand.
-            Alias(ty::Inherent, _) => {
-                bug!("unimplemented: inhabitedness checking for inherent projections")
             }
             Tuple(tys) if tys.is_empty() => InhabitedPredicate::True,
             // use a query for more complex cases
@@ -185,18 +177,18 @@ impl<'tcx> Ty<'tcx> {
         self,
         tcx: TyCtxt<'tcx>,
         module: DefId,
-        param_env: ty::ParamEnv<'tcx>,
+        typing_env: ty::TypingEnv<'tcx>,
     ) -> bool {
-        self.inhabited_predicate(tcx).apply(tcx, param_env, module)
+        self.inhabited_predicate(tcx).apply(tcx, typing_env, module)
     }
 
     /// Returns true if the type is uninhabited without regard to visibility
     pub fn is_privately_uninhabited(
         self,
         tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
+        typing_env: ty::TypingEnv<'tcx>,
     ) -> bool {
-        !self.inhabited_predicate(tcx).apply_ignore_module(tcx, param_env)
+        !self.inhabited_predicate(tcx).apply_ignore_module(tcx, typing_env)
     }
 }
 

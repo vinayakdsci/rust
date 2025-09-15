@@ -44,9 +44,7 @@ error[E0575]: expected method or associated constant, found associated type `Tra
   --> $DIR/bad-resolve.rs:27:11
    |
 LL |     reuse <F as Trait>::Type;
-   |           ^^^^^^^^^^^^^^^^^^
-   |
-   = note: can't use a type alias as a constructor
+   |           ^^^^^^^^^^^^^^^^^^ not a method or associated constant
 
 error[E0576]: cannot find method or associated constant `baz` in trait `Trait`
   --> $DIR/bad-resolve.rs:30:25
@@ -81,11 +79,13 @@ LL |     type Type;
 LL | impl Trait for S {
    | ^^^^^^^^^^^^^^^^ missing `Type` in implementation
 
-error[E0433]: failed to resolve: use of undeclared crate or module `unresolved_prefix`
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `unresolved_prefix`
   --> $DIR/bad-resolve.rs:43:7
    |
 LL | reuse unresolved_prefix::{a, b, c};
-   |       ^^^^^^^^^^^^^^^^^ use of undeclared crate or module `unresolved_prefix`
+   |       ^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `unresolved_prefix`
+   |
+   = help: you might be missing a crate named `unresolved_prefix`
 
 error[E0433]: failed to resolve: `crate` in paths can only be used in start position
   --> $DIR/bad-resolve.rs:44:29

@@ -1,6 +1,6 @@
-//@ known-bug: #103507
+//@ ignore-backends: gcc
 
-#![feature(const_trait_impl, const_mut_refs)]
+#![feature(const_trait_impl)]
 
 struct Foo<'a> {
     bar: &'a mut Vec<usize>,
@@ -9,9 +9,9 @@ struct Foo<'a> {
 impl<'a> Foo<'a> {
     const fn spam(&mut self, baz: &mut Vec<u32>) {
         self.bar[0] = baz.len();
-        //FIXME ~^ ERROR: cannot call
-        //FIXME ~| ERROR: cannot call
-        //FIXME ~| ERROR: the trait bound
+        //~^ ERROR: `Vec<usize>: [const] Index<_>` is not satisfied
+        //~| ERROR: `Vec<usize>: [const] Index<usize>` is not satisfied
+        //~| ERROR: `Vec<usize>: [const] IndexMut<usize>` is not satisfied
     }
 }
 

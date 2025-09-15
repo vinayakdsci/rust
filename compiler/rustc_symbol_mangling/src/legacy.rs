@@ -1,12 +1,15 @@
-use rustc_data_structures::stable_hasher::{Hash64, HashStable, StableHasher};
-use rustc_hir::def_id::CrateNum;
+use std::fmt::{self, Write};
+use std::mem::{self, discriminant};
+
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_hashes::Hash64;
+use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
 use rustc_middle::bug;
 use rustc_middle::ty::print::{PrettyPrinter, Print, PrintError, Printer};
-use rustc_middle::ty::{self, Instance, ReifyReason, Ty, TyCtxt, TypeVisitableExt};
-use rustc_middle::ty::{GenericArg, GenericArgKind};
-use std::fmt::{self, Write};
-use std::mem::{self, discriminant};
+use rustc_middle::ty::{
+    self, GenericArg, GenericArgKind, Instance, ReifyReason, Ty, TyCtxt, TypeVisitableExt,
+};
 use tracing::debug;
 
 pub(super) fn mangle<'tcx>(
@@ -17,15 +20,18 @@ pub(super) fn mangle<'tcx>(
     let def_id = instance.def_id();
 
     // We want to compute the "type" of this item. Unfortunately, some
-    // kinds of items (e.g., closures) don't have an entry in the
-    // item-type array. So walk back up the find the closest parent
-    // that DOES have an entry.
+    // kinds of items (e.g., synthetic static allocations from const eval)
+    // don't have a proper implementation for the `type_of` query. So walk
+    // back up the find the closest parent that DOES have a type.
     let mut ty_def_id = def_id;
     let instance_ty;
     loop {
         let key = tcx.def_key(ty_def_id);
         match key.disambiguated_data.data {
-            DefPathData::TypeNs(_) | DefPathData::ValueNs(_) => {
+            DefPathData::TypeNs(_)
+            | DefPathData::ValueNs(_)
+            | DefPathData::Closure
+            | DefPathData::SyntheticCoroutineBody => {
                 instance_ty = tcx.type_of(ty_def_id).instantiate_identity();
                 debug!(?instance_ty);
                 break;
@@ -48,55 +54,61 @@ pub(super) fn mangle<'tcx>(
 
     // Erase regions because they may not be deterministic when hashed
     // and should not matter anyhow.
-    let instance_ty = tcx.erase_regions(instance_ty);
+    let instance_ty = tcx.erase_and_anonymize_regions(instance_ty);
 
     let hash = get_symbol_hash(tcx, instance, instance_ty, instantiating_crate);
 
-    let mut printer = SymbolPrinter { tcx, path: SymbolPath::new(), keep_within_component: false };
-    printer
-        .print_def_path(
-            def_id,
-            if let ty::InstanceKind::DropGlue(_, _)
-            | ty::InstanceKind::AsyncDropGlueCtorShim(_, _) = instance.def
-            {
-                // Add the name of the dropped type to the symbol name
-                &*instance.args
-            } else {
-                &[]
-            },
-        )
-        .unwrap();
+    let mut p = LegacySymbolMangler { tcx, path: SymbolPath::new(), keep_within_component: false };
+    p.print_def_path(
+        def_id,
+        if let ty::InstanceKind::DropGlue(_, _)
+        | ty::InstanceKind::AsyncDropGlueCtorShim(_, _)
+        | ty::InstanceKind::FutureDropPollShim(_, _, _) = instance.def
+        {
+            // Add the name of the dropped type to the symbol name
+            &*instance.args
+        } else if let ty::InstanceKind::AsyncDropGlue(_, ty) = instance.def {
+            let ty::Coroutine(_, cor_args) = ty.kind() else {
+                bug!();
+            };
+            let drop_ty = cor_args.first().unwrap().expect_ty();
+            tcx.mk_args(&[GenericArg::from(drop_ty)])
+        } else {
+            &[]
+        },
+    )
+    .unwrap();
 
     match instance.def {
         ty::InstanceKind::ThreadLocalShim(..) => {
-            printer.write_str("{{tls-shim}}").unwrap();
+            p.write_str("{{tls-shim}}").unwrap();
         }
         ty::InstanceKind::VTableShim(..) => {
-            printer.write_str("{{vtable-shim}}").unwrap();
+            p.write_str("{{vtable-shim}}").unwrap();
         }
         ty::InstanceKind::ReifyShim(_, reason) => {
-            printer.write_str("{{reify-shim").unwrap();
+            p.write_str("{{reify-shim").unwrap();
             match reason {
-                Some(ReifyReason::FnPtr) => printer.write_str("-fnptr").unwrap(),
-                Some(ReifyReason::Vtable) => printer.write_str("-vtable").unwrap(),
+                Some(ReifyReason::FnPtr) => p.write_str("-fnptr").unwrap(),
+                Some(ReifyReason::Vtable) => p.write_str("-vtable").unwrap(),
                 None => (),
             }
-            printer.write_str("}}").unwrap();
+            p.write_str("}}").unwrap();
         }
         // FIXME(async_closures): This shouldn't be needed when we fix
         // `Instance::ty`/`Instance::def_id`.
         ty::InstanceKind::ConstructCoroutineInClosureShim { receiver_by_ref, .. } => {
-            printer
-                .write_str(if receiver_by_ref { "{{by-move-shim}}" } else { "{{by-ref-shim}}" })
+            p.write_str(if receiver_by_ref { "{{by-move-shim}}" } else { "{{by-ref-shim}}" })
                 .unwrap();
-        }
-        ty::InstanceKind::CoroutineKindShim { .. } => {
-            printer.write_str("{{by-move-body-shim}}").unwrap();
         }
         _ => {}
     }
 
-    printer.path.finish(hash)
+    if let ty::InstanceKind::FutureDropPollShim(..) = instance.def {
+        let _ = p.write_str("{{drop-shim}}");
+    }
+
+    p.path.finish(hash)
 }
 
 fn get_symbol_hash<'tcx>(
@@ -201,13 +213,13 @@ impl SymbolPath {
     }
 }
 
-struct SymbolPrinter<'tcx> {
+struct LegacySymbolMangler<'tcx> {
     tcx: TyCtxt<'tcx>,
     path: SymbolPath,
 
     // When `true`, `finalize_pending_component` isn't used.
-    // This is needed when recursing into `path_qualified`,
-    // or `path_generic_args`, as any nested paths are
+    // This is needed when recursing into `print_path_with_qualified`,
+    // or `print_path_with_generic_args`, as any nested paths are
     // logically within one component.
     keep_within_component: bool,
 }
@@ -216,12 +228,15 @@ struct SymbolPrinter<'tcx> {
 // `PrettyPrinter` aka pretty printing of e.g. types in paths,
 // symbol names should have their own printing machinery.
 
-impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
+impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
     fn print_region(&mut self, _region: ty::Region<'_>) -> Result<(), PrintError> {
+        // This might be reachable (via `pretty_print_dyn_existential`) even though
+        // `<Self As PrettyPrinter>::should_print_optional_region` returns false and
+        // `print_path_with_generic_args` filters out lifetimes. See #144994.
         Ok(())
     }
 
@@ -275,14 +290,15 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
     fn print_const(&mut self, ct: ty::Const<'tcx>) -> Result<(), PrintError> {
         // only print integers
         match ct.kind() {
-            ty::ConstKind::Value(ty, ty::ValTree::Leaf(scalar)) if ty.is_integral() => {
+            ty::ConstKind::Value(cv) if cv.ty.is_integral() => {
                 // The `pretty_print_const` formatting depends on -Zverbose-internals
                 // flag, so we cannot reuse it here.
-                let signed = matches!(ty.kind(), ty::Int(_));
+                let scalar = cv.valtree.unwrap_leaf();
+                let signed = matches!(cv.ty.kind(), ty::Int(_));
                 write!(
                     self,
                     "{:#?}",
-                    ty::ConstInt::new(scalar, signed, ty.is_ptr_sized_integral())
+                    ty::ConstInt::new(scalar, signed, cv.ty.is_ptr_sized_integral())
                 )?;
             }
             _ => self.write_str("_")?,
@@ -290,16 +306,17 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
         Ok(())
     }
 
-    fn path_crate(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
+    fn print_crate_name(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
         self.write_str(self.tcx.crate_name(cnum).as_str())?;
         Ok(())
     }
-    fn path_qualified(
+
+    fn print_path_with_qualified(
         &mut self,
         self_ty: Ty<'tcx>,
         trait_ref: Option<ty::TraitRef<'tcx>>,
     ) -> Result<(), PrintError> {
-        // Similar to `pretty_path_qualified`, but for the other
+        // Similar to `pretty_print_path_with_qualified`, but for the other
         // types that are printed as paths (see `print_type` above).
         match self_ty.kind() {
             ty::FnDef(..)
@@ -312,18 +329,17 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
                 self.print_type(self_ty)
             }
 
-            _ => self.pretty_path_qualified(self_ty, trait_ref),
+            _ => self.pretty_print_path_with_qualified(self_ty, trait_ref),
         }
     }
 
-    fn path_append_impl(
+    fn print_path_with_impl(
         &mut self,
         print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
-        _disambiguated_data: &DisambiguatedDefPathData,
         self_ty: Ty<'tcx>,
         trait_ref: Option<ty::TraitRef<'tcx>>,
     ) -> Result<(), PrintError> {
-        self.pretty_path_append_impl(
+        self.pretty_print_path_with_impl(
             |cx| {
                 print_prefix(cx)?;
 
@@ -340,7 +356,8 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
             trait_ref,
         )
     }
-    fn path_append(
+
+    fn print_path_with_simple(
         &mut self,
         print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
         disambiguated_data: &DisambiguatedDefPathData,
@@ -363,7 +380,8 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
 
         Ok(())
     }
-    fn path_generic_args(
+
+    fn print_path_with_generic_args(
         &mut self,
         print_prefix: impl FnOnce(&mut Self) -> Result<(), PrintError>,
         args: &[GenericArg<'tcx>],
@@ -371,20 +389,84 @@ impl<'tcx> Printer<'tcx> for SymbolPrinter<'tcx> {
         print_prefix(self)?;
 
         let args =
-            args.iter().cloned().filter(|arg| !matches!(arg.unpack(), GenericArgKind::Lifetime(_)));
-
+            args.iter().cloned().filter(|arg| !matches!(arg.kind(), GenericArgKind::Lifetime(_)));
         if args.clone().next().is_some() {
             self.generic_delimiters(|cx| cx.comma_sep(args))
         } else {
             Ok(())
         }
     }
+
+    fn print_impl_path(
+        &mut self,
+        impl_def_id: DefId,
+        args: &'tcx [GenericArg<'tcx>],
+    ) -> Result<(), PrintError> {
+        let self_ty = self.tcx.type_of(impl_def_id);
+        let impl_trait_ref = self.tcx.impl_trait_ref(impl_def_id);
+        let generics = self.tcx.generics_of(impl_def_id);
+        // We have two cases to worry about here:
+        // 1. We're printing a nested item inside of an impl item, like an inner
+        // function inside of a method. Due to the way that def path printing works,
+        // we'll render this something like `<Ty as Trait>::method::inner_fn`
+        // but we have no substs for this impl since it's not really inheriting
+        // generics from the outer item. We need to use the identity substs, and
+        // to normalize we need to use the correct param-env too.
+        // 2. We're mangling an item with identity substs. This seems to only happen
+        // when generating coverage, since we try to generate coverage for unused
+        // items too, and if something isn't monomorphized then we necessarily don't
+        // have anything to substitute the instance with.
+        // NOTE: We don't support mangling partially substituted but still polymorphic
+        // instances, like `impl<A> Tr<A> for ()` where `A` is substituted w/ `(T,)`.
+        let (typing_env, mut self_ty, mut impl_trait_ref) = if generics.count() > args.len()
+            || &args[..generics.count()]
+                == self
+                    .tcx
+                    .erase_and_anonymize_regions(ty::GenericArgs::identity_for_item(
+                        self.tcx,
+                        impl_def_id,
+                    ))
+                    .as_slice()
+        {
+            (
+                ty::TypingEnv::post_analysis(self.tcx, impl_def_id),
+                self_ty.instantiate_identity(),
+                impl_trait_ref.map(|impl_trait_ref| impl_trait_ref.instantiate_identity()),
+            )
+        } else {
+            assert!(
+                !args.has_non_region_param(),
+                "should not be mangling partially substituted \
+                polymorphic instance: {impl_def_id:?} {args:?}"
+            );
+            (
+                ty::TypingEnv::fully_monomorphized(),
+                self_ty.instantiate(self.tcx, args),
+                impl_trait_ref.map(|impl_trait_ref| impl_trait_ref.instantiate(self.tcx, args)),
+            )
+        };
+
+        match &mut impl_trait_ref {
+            Some(impl_trait_ref) => {
+                assert_eq!(impl_trait_ref.self_ty(), self_ty);
+                *impl_trait_ref = self.tcx.normalize_erasing_regions(typing_env, *impl_trait_ref);
+                self_ty = impl_trait_ref.self_ty();
+            }
+            None => {
+                self_ty = self.tcx.normalize_erasing_regions(typing_env, self_ty);
+            }
+        }
+
+        self.default_print_impl_path(impl_def_id, self_ty, impl_trait_ref)
+    }
 }
 
-impl<'tcx> PrettyPrinter<'tcx> for SymbolPrinter<'tcx> {
-    fn should_print_region(&self, _region: ty::Region<'_>) -> bool {
+impl<'tcx> PrettyPrinter<'tcx> for LegacySymbolMangler<'tcx> {
+    fn should_print_optional_region(&self, _region: ty::Region<'_>) -> bool {
         false
     }
+
+    // Identical to `PrettyPrinter::comma_sep` except there is no space after each comma.
     fn comma_sep<T>(&mut self, mut elems: impl Iterator<Item = T>) -> Result<(), PrintError>
     where
         T: Print<'tcx, Self>,
@@ -415,7 +497,7 @@ impl<'tcx> PrettyPrinter<'tcx> for SymbolPrinter<'tcx> {
     }
 }
 
-impl fmt::Write for SymbolPrinter<'_> {
+impl fmt::Write for LegacySymbolMangler<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         // Name sanitation. LLVM will happily accept identifiers with weird names, but
         // gas doesn't!

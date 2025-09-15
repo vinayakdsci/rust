@@ -6,18 +6,21 @@
 #![feature(rustc_private)]
 
 #[allow(dead_code)]
+//~^ useless_attribute
 #[cfg_attr(clippy, allow(dead_code))]
+//~^ useless_attribute
 #[rustfmt::skip]
 #[allow(unused_imports)]
 #[allow(unused_extern_crates)]
 #[macro_use]
-extern crate rustc_middle;
+extern crate regex as regex_crate;
 
 #[macro_use]
 extern crate proc_macro_derive;
 
 fn test_indented_attr() {
     #[allow(clippy::almost_swapped)]
+    //~^ useless_attribute
     use std::collections::HashSet;
 
     let _ = HashSet::<u32>::default();
@@ -133,4 +136,25 @@ pub mod ambiguous_glob_exports {
     #[allow(ambiguous_glob_reexports)]
     pub use my_prelude::*;
     pub use my_type::*;
+}
+
+// Regression test for https://github.com/rust-lang/rust-clippy/issues/13764
+pub mod unknown_namespace {
+    pub mod some_module {
+        pub struct SomeType;
+    }
+    #[allow(rustc::non_glob_import_of_type_ir_inherent)]
+    use some_module::SomeType;
+}
+
+// Regression test for https://github.com/rust-lang/rust-clippy/issues/15316
+pub mod redundant_imports_issue {
+    macro_rules! empty {
+        () => {};
+    }
+
+    #[expect(redundant_imports)]
+    pub(crate) use empty;
+
+    empty!();
 }

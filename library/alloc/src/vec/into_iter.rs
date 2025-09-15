@@ -1,11 +1,3 @@
-#[cfg(not(no_global_oom_handling))]
-use super::AsVecIntoIter;
-use crate::alloc::{Allocator, Global};
-#[cfg(not(no_global_oom_handling))]
-use crate::collections::VecDeque;
-use crate::raw_vec::RawVec;
-use core::array;
-use core::fmt;
 use core::iter::{
     FusedIterator, InPlaceIterable, SourceIter, TrustedFused, TrustedLen,
     TrustedRandomAccessNoCoerce,
@@ -17,15 +9,23 @@ use core::num::NonZero;
 use core::ops::Deref;
 use core::ptr::{self, NonNull};
 use core::slice::{self};
+use core::{array, fmt};
+
+#[cfg(not(no_global_oom_handling))]
+use super::AsVecIntoIter;
+use crate::alloc::{Allocator, Global};
+#[cfg(not(no_global_oom_handling))]
+use crate::collections::VecDeque;
+use crate::raw_vec::RawVec;
 
 macro non_null {
     (mut $place:expr, $t:ident) => {{
         #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
-        unsafe { &mut *(ptr::addr_of_mut!($place) as *mut NonNull<$t>) }
+        unsafe { &mut *((&raw mut $place) as *mut NonNull<$t>) }
     }},
     ($place:expr, $t:ident) => {{
         #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
-        unsafe { *(ptr::addr_of!($place) as *const NonNull<$t>) }
+        unsafe { *((&raw const $place) as *const NonNull<$t>) }
     }},
 }
 
@@ -114,8 +114,9 @@ impl<T, A: Allocator> IntoIter<T, A> {
     }
 
     /// Drops remaining elements and relinquishes the backing allocation.
-    /// This method guarantees it won't panic before relinquishing
-    /// the backing allocation.
+    ///
+    /// This method guarantees it won't panic before relinquishing the backing
+    /// allocation.
     ///
     /// This is roughly equivalent to the following, but more efficient
     ///
@@ -141,7 +142,7 @@ impl<T, A: Allocator> IntoIter<T, A> {
         // struct and then overwriting &mut self.
         // this creates less assembly
         self.cap = 0;
-        self.buf = RawVec::NEW.non_null();
+        self.buf = RawVec::new().non_null();
         self.ptr = self.buf;
         self.end = self.buf.as_ptr();
 
@@ -167,7 +168,7 @@ impl<T, A: Allocator> IntoIter<T, A> {
 
         // SAFETY: This allocation originally came from a `Vec`, so it passes
         // all those checks. We have `this.buf` ≤ `this.ptr` ≤ `this.end`,
-        // so the `sub_ptr`s below cannot wrap, and will produce a well-formed
+        // so the `offset_from_unsigned`s below cannot wrap, and will produce a well-formed
         // range. `end` ≤ `buf + cap`, so the range will be in-bounds.
         // Taking `alloc` is ok because nothing else is going to look at it,
         // since our `Drop` impl isn't going to run so there's no more code.
@@ -178,7 +179,7 @@ impl<T, A: Allocator> IntoIter<T, A> {
                 // say that they're all at the beginning of the "allocation".
                 0..this.len()
             } else {
-                this.ptr.sub_ptr(this.buf)..this.end.sub_ptr(buf)
+                this.ptr.offset_from_unsigned(this.buf)..this.end.offset_from_unsigned(buf)
             };
             let cap = this.cap;
             let alloc = ManuallyDrop::take(&mut this.alloc);
@@ -229,7 +230,7 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
         let exact = if T::IS_ZST {
             self.end.addr().wrapping_sub(self.ptr.as_ptr().addr())
         } else {
-            unsafe { non_null!(self.end, T).sub_ptr(self.ptr) }
+            unsafe { non_null!(self.end, T).offset_from_unsigned(self.ptr) }
         };
         (exact, Some(exact))
     }
@@ -255,6 +256,11 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
     #[inline]
     fn count(self) -> usize {
         self.len()
+    }
+
+    #[inline]
+    fn last(mut self) -> Option<T> {
+        self.next_back()
     }
 
     #[inline]
@@ -287,11 +293,11 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
 
         // Safety: `len` is larger than the array size. Copy a fixed amount here to fully initialize
         // the array.
-        return unsafe {
+        unsafe {
             ptr::copy_nonoverlapping(self.ptr.as_ptr(), raw_ary.as_mut_ptr() as *mut T, N);
             self.ptr = self.ptr.add(N);
             Ok(raw_ary.transpose().assume_init())
-        };
+        }
     }
 
     fn fold<B, F>(mut self, mut accum: B, mut f: F) -> B
@@ -471,13 +477,8 @@ where
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "vec_into_iter_clone", since = "1.8.0")]
 impl<T: Clone, A: Allocator + Clone> Clone for IntoIter<T, A> {
-    #[cfg(not(test))]
     fn clone(&self) -> Self {
         self.as_slice().to_vec_in(self.alloc.deref().clone()).into_iter()
-    }
-    #[cfg(test)]
-    fn clone(&self) -> Self {
-        crate::slice::to_vec(self.as_slice(), self.alloc.deref().clone()).into_iter()
     }
 }
 

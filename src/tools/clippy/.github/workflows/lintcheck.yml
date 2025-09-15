@@ -1,6 +1,12 @@
 name: Lintcheck
 
-on: pull_request
+on:
+  pull_request:
+    paths-ignore:
+      - 'book/**'
+      - 'util/**'
+      - 'tests/**'
+      - '*.md'
 
 env:
   RUST_BACKTRACE: 1
@@ -18,9 +24,11 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         fetch-depth: 2
+        # Unsetting this would make so that any malicious package could get our Github Token
+        persist-credentials: false
 
     # HEAD is the generated merge commit `refs/pull/N/merge` between the PR and `master`, `HEAD^`
     # being the commit from `master` that is the base of the merge
@@ -53,18 +61,18 @@ jobs:
       id: cache-json
       uses: actions/cache@v4
       with:
-        path: lintcheck-logs/lintcheck_crates_logs.json
+        path: lintcheck-logs/ci_crates_logs.json
         key: ${{ steps.key.outputs.key }}
 
     - name: Run lintcheck
       if: steps.cache-json.outputs.cache-hit != 'true'
-      run: ./target/debug/lintcheck --format json --warn-all
+      run: env CLIPPY_CONF_DIR="$PWD/lintcheck/ci-config" ./target/debug/lintcheck --format json --all-lints --crates-toml ./lintcheck/ci_crates.toml
 
     - name: Upload base JSON
       uses: actions/upload-artifact@v4
       with:
         name: base
-        path: lintcheck-logs/lintcheck_crates_logs.json
+        path: lintcheck-logs/ci_crates_logs.json
 
   # Runs lintcheck on the PR and stores the results as an artifact
   head:
@@ -72,7 +80,10 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
+      with:
+        # Unsetting this would make so that any malicious package could get our Github Token
+        persist-credentials: false
 
     - name: Cache lintcheck bin
       id: cache-lintcheck-bin
@@ -86,13 +97,13 @@ jobs:
       run: cargo build --manifest-path=lintcheck/Cargo.toml
 
     - name: Run lintcheck
-      run: ./target/debug/lintcheck --format json --warn-all
+      run: env CLIPPY_CONF_DIR="$PWD/lintcheck/ci-config" ./target/debug/lintcheck --format json --all-lints --crates-toml ./lintcheck/ci_crates.toml
 
     - name: Upload head JSON
       uses: actions/upload-artifact@v4
       with:
         name: head
-        path: lintcheck-logs/lintcheck_crates_logs.json
+        path: lintcheck-logs/ci_crates_logs.json
 
   # Retrieves the head and base JSON results and prints the diff to the GH actions step summary
   diff:
@@ -102,7 +113,10 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
+      with:
+        # Unsetting this would make so that any malicious package could get our Github Token
+        persist-credentials: false
 
     - name: Restore lintcheck bin
       uses: actions/cache/restore@v4
@@ -114,5 +128,27 @@ jobs:
     - name: Download JSON
       uses: actions/download-artifact@v4
 
+    - name: Store PR number
+      run: echo ${{ github.event.pull_request.number }} > pr.txt
+
     - name: Diff results
-      run: ./target/debug/lintcheck diff {base,head}/lintcheck_crates_logs.json >> $GITHUB_STEP_SUMMARY
+      # GH's summery has a maximum size of 1MiB:
+      # https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#step-isolation-and-limits
+      # We upload the full diff as an artifact in case it's truncated
+      run: |
+        ./target/debug/lintcheck diff {base,head}/ci_crates_logs.json --truncate | head -c 1M > $GITHUB_STEP_SUMMARY
+        ./target/debug/lintcheck diff {base,head}/ci_crates_logs.json --write-summary summary.json > full_diff.md
+
+    - name: Upload full diff
+      uses: actions/upload-artifact@v4
+      with:
+        name: full_diff
+        path: full_diff.md
+
+    - name: Upload summary
+      uses: actions/upload-artifact@v4
+      with:
+        name: summary
+        path: |
+          summary.json
+          pr.txt

@@ -1,18 +1,15 @@
-//@ min-lldb-version: 310
-
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
 // gdb-command:run
 
 // gdb-command:print *boxed_with_padding
-// gdbg-check:$1 = {x = 99, y = 999, z = 9999, w = 99999}
-// gdbr-check:$1 = boxed_struct::StructWithSomePadding {x: 99, y: 999, z: 9999, w: 99999}
+// gdb-check:$1 = boxed_struct::StructWithSomePadding {x: 99, y: 999, z: 9999, w: 99999}
 
 // gdb-command:print *boxed_with_dtor
-// gdbg-check:$2 = {x = 77, y = 777, z = 7777, w = 77777}
-// gdbr-check:$2 = boxed_struct::StructWithDestructor {x: 77, y: 777, z: 7777, w: 77777}
+// gdb-check:$2 = boxed_struct::StructWithDestructor {x: 77, y: 777, z: 7777, w: 77777}
 
 
 // === LLDB TESTS ==================================================================================
@@ -20,16 +17,12 @@
 // lldb-command:run
 
 // lldb-command:v *boxed_with_padding
-// lldbg-check:[...] { x = 99 y = 999 z = 9999 w = 99999 }
-// lldbr-check:(boxed_struct::StructWithSomePadding) *boxed_with_padding = { x = 99 y = 999 z = 9999 w = 99999 }
+// lldb-check:[...] { x = 99 y = 999 z = 9999 w = 99999 }
 
 // lldb-command:v *boxed_with_dtor
-// lldbg-check:[...] { x = 77 y = 777 z = 7777 w = 77777 }
-// lldbr-check:(boxed_struct::StructWithDestructor) *boxed_with_dtor = { x = 77 y = 777 z = 7777 w = 77777 }
+// lldb-check:[...] { x = 77 y = 777 z = 7777 w = 77777 }
 
 #![allow(unused_variables)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
 
 struct StructWithSomePadding {
     x: i16,

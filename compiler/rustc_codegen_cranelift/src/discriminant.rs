@@ -3,7 +3,8 @@
 //! Adapted from <https://github.com/rust-lang/rust/blob/31c0645b9d2539f47eecb096142474b29dc542f7/compiler/rustc_codegen_ssa/src/mir/place.rs>
 //! (<https://github.com/rust-lang/rust/pull/104535>)
 
-use rustc_target::abi::{Int, TagEncoding, Variants};
+use rustc_abi::Primitive::Int;
+use rustc_abi::{TagEncoding, Variants};
 
 use crate::prelude::*;
 
@@ -13,10 +14,11 @@ pub(crate) fn codegen_set_discriminant<'tcx>(
     variant_index: VariantIdx,
 ) {
     let layout = place.layout();
-    if layout.for_variant(fx, variant_index).abi.is_uninhabited() {
+    if layout.for_variant(fx, variant_index).is_uninhabited() {
         return;
     }
     match layout.variants {
+        Variants::Empty => unreachable!("we already handled uninhabited types"),
         Variants::Single { index } => {
             assert_eq!(index, variant_index);
         }
@@ -26,7 +28,7 @@ pub(crate) fn codegen_set_discriminant<'tcx>(
             tag_encoding: TagEncoding::Direct,
             variants: _,
         } => {
-            let ptr = place.place_field(fx, FieldIdx::new(tag_field));
+            let ptr = place.place_field(fx, tag_field);
             let to = layout.ty.discriminant_for_variant(fx.tcx, variant_index).unwrap().val;
             let to = match ptr.layout().ty.kind() {
                 ty::Uint(UintTy::U128) | ty::Int(IntTy::I128) => {
@@ -51,7 +53,7 @@ pub(crate) fn codegen_set_discriminant<'tcx>(
             variants: _,
         } => {
             if variant_index != untagged_variant {
-                let niche = place.place_field(fx, FieldIdx::new(tag_field));
+                let niche = place.place_field(fx, tag_field);
                 let niche_type = fx.clif_type(niche.layout().ty).unwrap();
                 let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
                 let niche_value = (niche_value as u128).wrapping_add(niche_start);
@@ -79,11 +81,12 @@ pub(crate) fn codegen_get_discriminant<'tcx>(
 ) {
     let layout = value.layout();
 
-    if layout.abi.is_uninhabited() {
+    if layout.is_uninhabited() {
         return;
     }
 
     let (tag_scalar, tag_field, tag_encoding) = match &layout.variants {
+        Variants::Empty => unreachable!("we already handled uninhabited types"),
         Variants::Single { index } => {
             let discr_val = layout
                 .ty
@@ -115,7 +118,7 @@ pub(crate) fn codegen_get_discriminant<'tcx>(
     let cast_to = fx.clif_type(dest_layout.ty).unwrap();
 
     // Read the tag/niche-encoded discriminant from memory.
-    let tag = value.value_field(fx, FieldIdx::new(tag_field));
+    let tag = value.value_field(fx, tag_field);
     let tag = tag.load_scalar(fx);
 
     // Decode the discriminant (specifically if it's niche-encoded).

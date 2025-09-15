@@ -4,21 +4,22 @@
 //! tests. This module also implements a couple of magic tricks, like renaming
 //! `self` and to `self` (to switch between associated function and method).
 
-use hir::{AsAssocItem, HirFileIdExt, InFile, Semantics};
+use hir::{AsAssocItem, InFile, Name, Semantics, sym};
 use ide_db::{
-    base_db::{FileId, FileRange},
+    FileId, FileRange, RootDatabase,
     defs::{Definition, NameClass, NameRefClass},
-    rename::{bail, format_err, source_edit_from_references, IdentifierKind},
+    rename::{IdentifierKind, RenameDefinition, bail, format_err, source_edit_from_references},
     source_change::SourceChangeBuilder,
-    RootDatabase,
 };
 use itertools::Itertools;
-use stdx::{always, never};
+use std::fmt::Write;
+use stdx::{always, format_to, never};
 use syntax::{
-    ast, utils::is_raw_identifier, AstNode, SmolStr, SyntaxKind, SyntaxNode, TextRange, TextSize,
+    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
+    ast::{self, HasArgList, prec::ExprPrecedence},
 };
 
-use text_edit::TextEdit;
+use ide_db::text_edit::TextEdit;
 
 use crate::{FilePosition, RangeInfo, SourceChange};
 
@@ -33,17 +34,12 @@ pub(crate) fn prepare_rename(
     position: FilePosition,
 ) -> RenameResult<RangeInfo<()>> {
     let sema = Semantics::new(db);
-    let source_file = sema.parse(position.file_id);
+    let source_file = sema.parse_guess_edition(position.file_id);
     let syntax = source_file.syntax();
 
-    let res = find_definitions(&sema, syntax, position)?
-        .map(|(frange, kind, def)| {
-            // ensure all ranges are valid
-
-            if def.range_for_rename(&sema).is_none() {
-                bail!("No references found at position")
-            }
-
+    let res = find_definitions(&sema, syntax, position, &Name::new_symbol_root(sym::underscore))?
+        .filter(|(_, _, def, _, _)| def.range_for_rename(&sema).is_some())
+        .map(|(frange, kind, _, _, _)| {
             always!(
                 frange.range.contains_inclusive(position.offset)
                     && frange.file_id == position.file_id
@@ -74,42 +70,49 @@ pub(crate) fn prepare_rename(
 //
 // Renames the item below the cursor and all of its references
 //
-// |===
-// | Editor  | Shortcut
+// | Editor  | Shortcut |
+// |---------|----------|
+// | VS Code | <kbd>F2</kbd> |
 //
-// | VS Code | kbd:[F2]
-// |===
-//
-// image::https://user-images.githubusercontent.com/48062697/113065582-055aae80-91b1-11eb-8ade-2b58e6d81883.gif[]
+// ![Rename](https://user-images.githubusercontent.com/48062697/113065582-055aae80-91b1-11eb-8ade-2b58e6d81883.gif)
 pub(crate) fn rename(
     db: &RootDatabase,
     position: FilePosition,
     new_name: &str,
 ) -> RenameResult<SourceChange> {
     let sema = Semantics::new(db);
-    let source_file = sema.parse(position.file_id);
+    let file_id = sema
+        .attach_first_edition(position.file_id)
+        .ok_or_else(|| format_err!("No references found at position"))?;
+    let source_file = sema.parse(file_id);
     let syntax = source_file.syntax();
 
-    let defs = find_definitions(&sema, syntax, position)?;
-    let alias_fallback = alias_fallback(syntax, position, new_name);
+    let edition = file_id.edition(db);
+    let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
+
+    let defs = find_definitions(&sema, syntax, position, &new_name)?;
+    let alias_fallback =
+        alias_fallback(syntax, position, &new_name.display(db, edition).to_string());
 
     let ops: RenameResult<Vec<SourceChange>> = match alias_fallback {
         Some(_) => defs
             // FIXME: This can use the `ide_db::rename_reference` (or def.rename) method once we can
             // properly find "direct" usages/references.
-            .map(|(.., def)| {
-                match IdentifierKind::classify(new_name)? {
+            .map(|(.., def, new_name, _)| {
+                match kind {
                     IdentifierKind::Ident => (),
                     IdentifierKind::Lifetime => {
                         bail!("Cannot alias reference to a lifetime identifier")
                     }
                     IdentifierKind::Underscore => bail!("Cannot alias reference to `_`"),
+                    IdentifierKind::LowercaseSelf => {
+                        bail!("Cannot rename alias reference to `self`")
+                    }
                 };
-
                 let mut usages = def.usages(&sema).all();
 
                 // FIXME: hack - removes the usage that triggered this rename operation.
-                match usages.references.get_mut(&position.file_id).and_then(|refs| {
+                match usages.references.get_mut(&file_id).and_then(|refs| {
                     refs.iter()
                         .position(|ref_| ref_.range.contains_inclusive(position.offset))
                         .map(|idx| refs.remove(idx))
@@ -119,26 +122,29 @@ pub(crate) fn rename(
                 };
 
                 let mut source_change = SourceChange::default();
-                source_change.extend(usages.references.get_mut(&position.file_id).iter().map(
-                    |refs| (position.file_id, source_edit_from_references(refs, def, new_name)),
-                ));
+                source_change.extend(usages.references.get_mut(&file_id).iter().map(|refs| {
+                    (
+                        position.file_id,
+                        source_edit_from_references(db, refs, def, &new_name, edition),
+                    )
+                }));
 
                 Ok(source_change)
             })
             .collect(),
         None => defs
-            .map(|(.., def)| {
+            .map(|(.., def, new_name, rename_def)| {
                 if let Definition::Local(local) = def {
                     if let Some(self_param) = local.as_self_param(sema.db) {
                         cov_mark::hit!(rename_self_to_param);
-                        return rename_self_to_param(&sema, local, self_param, new_name);
+                        return rename_self_to_param(&sema, local, self_param, &new_name, kind);
                     }
-                    if new_name == "self" {
+                    if kind == IdentifierKind::LowercaseSelf {
                         cov_mark::hit!(rename_to_self);
                         return rename_to_self(&sema, local);
                     }
                 }
-                def.rename(&sema, new_name)
+                def.rename(&sema, new_name.as_str(), rename_def)
             })
             .collect(),
     };
@@ -158,11 +164,7 @@ pub(crate) fn will_rename_file(
     let sema = Semantics::new(db);
     let module = sema.file_to_module_def(file_id)?;
     let def = Definition::Module(module);
-    let mut change = if is_raw_identifier(new_name_stem) {
-        def.rename(&sema, &SmolStr::from_iter(["r#", new_name_stem])).ok()?
-    } else {
-        def.rename(&sema, new_name_stem).ok()?
-    };
+    let mut change = def.rename(&sema, new_name_stem, RenameDefinition::Yes).ok()?;
     change.file_system_edits.clear();
     Some(change)
 }
@@ -203,22 +205,40 @@ fn find_definitions(
     sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
     FilePosition { file_id, offset }: FilePosition,
-) -> RenameResult<impl Iterator<Item = (FileRange, SyntaxKind, Definition)>> {
-    let token = syntax.token_at_offset(offset).find(|t| matches!(t.kind(), SyntaxKind::STRING));
+    new_name: &Name,
+) -> RenameResult<impl Iterator<Item = (FileRange, SyntaxKind, Definition, Name, RenameDefinition)>>
+{
+    let maybe_format_args =
+        syntax.token_at_offset(offset).find(|t| matches!(t.kind(), SyntaxKind::STRING));
 
-    if let Some((range, Some(resolution))) =
-        token.and_then(|token| sema.check_for_format_args_template(token, offset))
+    if let Some((range, _, _, Some(resolution))) =
+        maybe_format_args.and_then(|token| sema.check_for_format_args_template(token, offset))
     {
         return Ok(vec![(
             FileRange { file_id, range },
             SyntaxKind::STRING,
             Definition::from(resolution),
+            new_name.clone(),
+            RenameDefinition::Yes,
         )]
         .into_iter());
     }
 
+    let original_ident = syntax
+        .token_at_offset(offset)
+        .max_by_key(|t| {
+            t.kind().is_any_identifier() || matches!(t.kind(), SyntaxKind::LIFETIME_IDENT)
+        })
+        .map(|t| {
+            if t.kind() == SyntaxKind::LIFETIME_IDENT {
+                Name::new_lifetime(t.text())
+            } else {
+                Name::new_root(t.text())
+            }
+        })
+        .ok_or_else(|| format_err!("No references found at position"))?;
     let symbols =
-        sema.find_nodes_at_offset_with_descend::<ast::NameLike>(syntax, offset).map(|name_like| {
+        sema.find_namelike_at_offset_with_descend(syntax, offset).map(|name_like| {
             let kind = name_like.syntax().kind();
             let range = sema
                 .original_range_opt(name_like.syntax())
@@ -228,8 +248,7 @@ fn find_definitions(
                 ast::NameLike::Name(name)
                     if name
                         .syntax()
-                        .parent()
-                        .map_or(false, |it| ast::Rename::can_cast(it.kind()))
+                        .parent().is_some_and(|it| ast::Rename::can_cast(it.kind()))
                         // FIXME: uncomment this once we resolve to usages to extern crate declarations
                         // && name
                         //     .syntax()
@@ -243,7 +262,7 @@ fn find_definitions(
                 ast::NameLike::Name(name) => NameClass::classify(sema, name)
                     .map(|class| match class {
                         NameClass::Definition(it) | NameClass::ConstReference(it) => it,
-                        NameClass::PatFieldShorthand { local_def, field_ref: _ } => {
+                        NameClass::PatFieldShorthand { local_def, field_ref: _, adt_subst: _ } => {
                             Definition::Local(local_def)
                         }
                     })
@@ -251,8 +270,8 @@ fn find_definitions(
                 ast::NameLike::NameRef(name_ref) => {
                     NameRefClass::classify(sema, name_ref)
                         .map(|class| match class {
-                            NameRefClass::Definition(def) => def,
-                            NameRefClass::FieldShorthand { local_ref, field_ref: _ } => {
+                            NameRefClass::Definition(def, _) => def,
+                            NameRefClass::FieldShorthand { local_ref, field_ref: _, adt_subst: _ } => {
                                 Definition::Local(local_ref)
                             }
                             NameRefClass::ExternCrateShorthand { decl, .. } => {
@@ -265,8 +284,7 @@ fn find_definitions(
                         .and_then(|def| {
                             // if the name differs from the definitions name it has to be an alias
                             if def
-                                .name(sema.db)
-                                .map_or(false, |it| it.to_smol_str() != name_ref.text().as_str())
+                                .name(sema.db).is_some_and(|it| it.as_str() != name_ref.text().trim_start_matches("r#"))
                             {
                                 Err(format_err!("Renaming aliases is currently unsupported"))
                             } else {
@@ -277,7 +295,7 @@ fn find_definitions(
                 ast::NameLike::Lifetime(lifetime) => {
                     NameRefClass::classify_lifetime(sema, lifetime)
                         .and_then(|class| match class {
-                            NameRefClass::Definition(def) => Some(def),
+                            NameRefClass::Definition(def, _) => Some(def),
                             _ => None,
                         })
                         .or_else(|| {
@@ -289,21 +307,109 @@ fn find_definitions(
                         .ok_or_else(|| format_err!("No references found at position"))
                 }
             };
-            res.map(|def| (range, kind, def))
+            res.map(|def| {
+                let n = def.name(sema.db)?;
+                if n == original_ident {
+                    Some((range, kind, def, new_name.clone(), RenameDefinition::Yes))
+                } else if let Some(suffix) =  n.as_str().strip_prefix(original_ident.as_str()) {
+                    Some((range, kind, def, Name::new_root(&format!("{}{suffix}", new_name.as_str())), RenameDefinition::No))
+                } else {
+                     n.as_str().strip_suffix(original_ident.as_str().trim_start_matches('\''))
+                        .map(|prefix| (range, kind, def, Name::new_root(&format!("{prefix}{}", new_name.as_str())), RenameDefinition::No))
+                }
+            })
         });
 
-    let res: RenameResult<Vec<_>> = symbols.collect();
+    let res: RenameResult<Vec<_>> = symbols.filter_map(Result::transpose).collect();
     match res {
         Ok(v) => {
-            if v.is_empty() {
-                // FIXME: some semantic duplication between "empty vec" and "Err()"
-                Err(format_err!("No references found at position"))
-            } else {
-                // remove duplicates, comparing `Definition`s
-                Ok(v.into_iter().unique_by(|&(.., def)| def).collect::<Vec<_>>().into_iter())
-            }
+            // remove duplicates, comparing `Definition`s
+            Ok(v.into_iter()
+                .unique_by(|&(.., def, _, _)| def)
+                .map(|(a, b, c, d, e)| (a.into_file_id(sema.db), b, c, d, e))
+                .collect::<Vec<_>>()
+                .into_iter())
         }
         Err(e) => Err(e),
+    }
+}
+
+fn transform_assoc_fn_into_method_call(
+    sema: &Semantics<'_, RootDatabase>,
+    source_change: &mut SourceChange,
+    f: hir::Function,
+) {
+    let calls = Definition::Function(f).usages(sema).all();
+    for (file_id, calls) in calls {
+        for call in calls {
+            let Some(fn_name) = call.name.as_name_ref() else { continue };
+            let Some(path) = fn_name.syntax().parent().and_then(ast::PathSegment::cast) else {
+                continue;
+            };
+            let path = path.parent_path();
+            // The `PathExpr` is the direct parent, above it is the `CallExpr`.
+            let Some(call) =
+                path.syntax().parent().and_then(|it| ast::CallExpr::cast(it.parent()?))
+            else {
+                continue;
+            };
+
+            let Some(arg_list) = call.arg_list() else { continue };
+            let mut args = arg_list.args();
+            let Some(mut self_arg) = args.next() else { continue };
+            let second_arg = args.next();
+
+            // Strip (de)references, as they will be taken automatically by auto(de)ref.
+            loop {
+                let self_ = match &self_arg {
+                    ast::Expr::RefExpr(self_) => self_.expr(),
+                    ast::Expr::ParenExpr(self_) => self_.expr(),
+                    ast::Expr::PrefixExpr(self_)
+                        if self_.op_kind() == Some(ast::UnaryOp::Deref) =>
+                    {
+                        self_.expr()
+                    }
+                    _ => break,
+                };
+                self_arg = match self_ {
+                    Some(it) => it,
+                    None => break,
+                };
+            }
+
+            let self_needs_parens =
+                self_arg.precedence().needs_parentheses_in(ExprPrecedence::Postfix);
+
+            let replace_start = path.syntax().text_range().start();
+            let replace_end = match second_arg {
+                Some(second_arg) => second_arg.syntax().text_range().start(),
+                None => arg_list
+                    .r_paren_token()
+                    .map(|it| it.text_range().start())
+                    .unwrap_or_else(|| arg_list.syntax().text_range().end()),
+            };
+            let replace_range = TextRange::new(replace_start, replace_end);
+
+            let Some(macro_mapped_self) = sema.original_range_opt(self_arg.syntax()) else {
+                continue;
+            };
+            let mut replacement = String::new();
+            if self_needs_parens {
+                replacement.push('(');
+            }
+            replacement.push_str(macro_mapped_self.text(sema.db));
+            if self_needs_parens {
+                replacement.push(')');
+            }
+            replacement.push('.');
+            format_to!(replacement, "{fn_name}");
+            replacement.push('(');
+
+            source_change.insert_source_edit(
+                file_id.file_id(sema.db),
+                TextEdit::replace(replace_range, replacement),
+            );
+        }
     }
 }
 
@@ -368,13 +474,23 @@ fn rename_to_self(
     let def = Definition::Local(local);
     let usages = def.usages(sema).all();
     let mut source_change = SourceChange::default();
-    source_change.extend(usages.iter().map(|(&file_id, references)| {
-        (file_id, source_edit_from_references(references, def, "self"))
+    source_change.extend(usages.iter().map(|(file_id, references)| {
+        (
+            file_id.file_id(sema.db),
+            source_edit_from_references(
+                sema.db,
+                references,
+                def,
+                &Name::new_symbol_root(sym::self_),
+                file_id.edition(sema.db),
+            ),
+        )
     }));
     source_change.insert_source_edit(
-        file_id.original_file(sema.db),
+        file_id.original_file(sema.db).file_id(sema.db),
         TextEdit::replace(param_source.syntax().text_range(), String::from(self_param)),
     );
+    transform_assoc_fn_into_method_call(sema, &mut source_change, fn_def);
     Ok(source_change)
 }
 
@@ -382,77 +498,89 @@ fn rename_self_to_param(
     sema: &Semantics<'_, RootDatabase>,
     local: hir::Local,
     self_param: hir::SelfParam,
-    new_name: &str,
+    new_name: &Name,
+    identifier_kind: IdentifierKind,
 ) -> RenameResult<SourceChange> {
-    if new_name == "self" {
+    if identifier_kind == IdentifierKind::LowercaseSelf {
         // Let's do nothing rather than complain.
         cov_mark::hit!(rename_self_to_self);
         return Ok(SourceChange::default());
     }
-
-    let identifier_kind = IdentifierKind::classify(new_name)?;
 
     let InFile { file_id, value: self_param } =
         sema.source(self_param).ok_or_else(|| format_err!("cannot find function source"))?;
 
     let def = Definition::Local(local);
     let usages = def.usages(sema).all();
-    let edit = text_edit_from_self_param(&self_param, new_name)
-        .ok_or_else(|| format_err!("No target type found"))?;
+    let edit = text_edit_from_self_param(
+        &self_param,
+        new_name.display(sema.db, file_id.edition(sema.db)).to_string(),
+    )
+    .ok_or_else(|| format_err!("No target type found"))?;
     if usages.len() > 1 && identifier_kind == IdentifierKind::Underscore {
         bail!("Cannot rename reference to `_` as it is being referenced multiple times");
     }
     let mut source_change = SourceChange::default();
-    source_change.insert_source_edit(file_id.original_file(sema.db), edit);
-    source_change.extend(usages.iter().map(|(&file_id, references)| {
-        (file_id, source_edit_from_references(references, def, new_name))
+    source_change.insert_source_edit(file_id.original_file(sema.db).file_id(sema.db), edit);
+    source_change.extend(usages.iter().map(|(file_id, references)| {
+        (
+            file_id.file_id(sema.db),
+            source_edit_from_references(
+                sema.db,
+                references,
+                def,
+                new_name,
+                file_id.edition(sema.db),
+            ),
+        )
     }));
     Ok(source_change)
 }
 
-fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: &str) -> Option<TextEdit> {
-    fn target_type_name(impl_def: &ast::Impl) -> Option<String> {
-        if let Some(ast::Type::PathType(p)) = impl_def.self_ty() {
-            return Some(p.path()?.segment()?.name_ref()?.text().to_string());
-        }
-        None
+fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: String) -> Option<TextEdit> {
+    let mut replacement_text = new_name;
+    replacement_text.push_str(": ");
+
+    if self_param.amp_token().is_some() {
+        replacement_text.push('&');
+    }
+    if let Some(lifetime) = self_param.lifetime() {
+        write!(replacement_text, "{lifetime} ").unwrap();
+    }
+    if self_param.amp_token().and(self_param.mut_token()).is_some() {
+        replacement_text.push_str("mut ");
     }
 
-    let impl_def = self_param.syntax().ancestors().find_map(ast::Impl::cast)?;
-    let type_name = target_type_name(&impl_def)?;
-
-    let mut replacement_text = String::from(new_name);
-    replacement_text.push_str(": ");
-    match (self_param.amp_token(), self_param.mut_token()) {
-        (Some(_), None) => replacement_text.push('&'),
-        (Some(_), Some(_)) => replacement_text.push_str("&mut "),
-        (_, _) => (),
-    };
-    replacement_text.push_str(type_name.as_str());
+    replacement_text.push_str("Self");
 
     Some(TextEdit::replace(self_param.syntax().text_range(), replacement_text))
 }
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{expect, Expect};
+    use expect_test::{Expect, expect};
     use ide_db::source_change::SourceChange;
+    use ide_db::text_edit::TextEdit;
+    use itertools::Itertools;
     use stdx::trim_indent;
     use test_utils::assert_eq_text;
-    use text_edit::TextEdit;
 
     use crate::fixture;
 
     use super::{RangeInfo, RenameError};
 
     #[track_caller]
-    fn check(new_name: &str, ra_fixture_before: &str, ra_fixture_after: &str) {
+    fn check(
+        new_name: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_before: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture_after: &str,
+    ) {
         let ra_fixture_after = &trim_indent(ra_fixture_after);
         let (analysis, position) = fixture::position(ra_fixture_before);
-        if !ra_fixture_after.starts_with("error: ") {
-            if let Err(err) = analysis.prepare_rename(position).unwrap() {
-                panic!("Prepare rename to '{new_name}' was failed: {err}")
-            }
+        if !ra_fixture_after.starts_with("error: ")
+            && let Err(err) = analysis.prepare_rename(position).unwrap()
+        {
+            panic!("Prepare rename to '{new_name}' was failed: {err}")
         }
         let rename_result = analysis
             .rename(position, new_name)
@@ -484,14 +612,46 @@ mod tests {
         };
     }
 
-    fn check_expect(new_name: &str, ra_fixture: &str, expect: Expect) {
+    #[track_caller]
+    fn check_conflicts(new_name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str) {
+        let (analysis, position, conflicts) = fixture::annotations(ra_fixture);
+        let source_change = analysis.rename(position, new_name).unwrap().unwrap();
+        let expected_conflicts = conflicts
+            .into_iter()
+            .map(|(file_range, _)| (file_range.file_id, file_range.range))
+            .sorted_unstable_by_key(|(file_id, range)| (*file_id, range.start()))
+            .collect_vec();
+        let found_conflicts = source_change
+            .source_file_edits
+            .iter()
+            .filter(|(_, (edit, _))| edit.change_annotation().is_some())
+            .flat_map(|(file_id, (edit, _))| {
+                edit.into_iter().map(move |edit| (*file_id, edit.delete))
+            })
+            .sorted_unstable_by_key(|(file_id, range)| (*file_id, range.start()))
+            .collect_vec();
+        assert_eq!(
+            expected_conflicts, found_conflicts,
+            "rename conflicts mismatch: {source_change:#?}"
+        );
+    }
+
+    fn check_expect(
+        new_name: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+        expect: Expect,
+    ) {
         let (analysis, position) = fixture::position(ra_fixture);
         let source_change =
             analysis.rename(position, new_name).unwrap().expect("Expect returned a RenameError");
         expect.assert_eq(&filter_expect(source_change))
     }
 
-    fn check_expect_will_rename_file(new_name: &str, ra_fixture: &str, expect: Expect) {
+    fn check_expect_will_rename_file(
+        new_name: &str,
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+        expect: Expect,
+    ) {
         let (analysis, position) = fixture::position(ra_fixture);
         let source_change = analysis
             .will_rename_file(position.file_id, new_name)
@@ -500,7 +660,7 @@ mod tests {
         expect.assert_eq(&filter_expect(source_change))
     }
 
-    fn check_prepare(ra_fixture: &str, expect: Expect) {
+    fn check_prepare(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
         let (analysis, position) = fixture::position(ra_fixture);
         let result = analysis
             .prepare_rename(position)
@@ -525,6 +685,37 @@ mod tests {
             "source_file_edits: {:#?}\nfile_system_edits: {:#?}\n",
             source_file_edits, source_change.file_system_edits
         )
+    }
+
+    #[test]
+    fn rename_will_shadow() {
+        check_conflicts(
+            "new_name",
+            r#"
+fn foo() {
+    let mut new_name = 123;
+    let old_name$0 = 456;
+     // ^^^^^^^^
+    new_name = 789 + new_name;
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn rename_will_be_shadowed() {
+        check_conflicts(
+            "new_name",
+            r#"
+fn foo() {
+    let mut old_name$0 = 456;
+         // ^^^^^^^^
+    let new_name = 123;
+    old_name = 789 + old_name;
+ // ^^^^^^^^         ^^^^^^^^
+}
+        "#,
+        );
     }
 
     #[test]
@@ -626,9 +817,9 @@ impl Foo {
     #[test]
     fn test_rename_to_invalid_identifier3() {
         check(
-            "let",
+            "super",
             r#"fn main() { let i$0 = 1; }"#,
-            "error: Invalid name `let`: not an identifier",
+            "error: Invalid name `super`: cannot rename to a keyword",
         );
     }
 
@@ -680,7 +871,7 @@ impl Foo {
         check(
             "r#self",
             r#"mod foo$0 {}"#,
-            "error: Invalid name: `self` cannot be a raw identifier",
+            "error: Invalid name `self`: cannot rename module to self",
         );
     }
 
@@ -1536,6 +1727,228 @@ pub fn baz() {}
     }
 
     #[test]
+    fn test_rename_each_usage_gets_appropriate_rawness() {
+        check_expect(
+            "dyn",
+            r#"
+//- /a.rs crate:a edition:2015
+pub fn foo() {}
+
+//- /b.rs crate:b edition:2018 deps:a new_source_root:local
+fn bar() {
+    a::foo$0();
+}
+    "#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(
+                            0,
+                        ),
+                        [
+                            Indel {
+                                insert: "dyn",
+                                delete: 7..10,
+                            },
+                        ],
+                    ),
+                    (
+                        FileId(
+                            1,
+                        ),
+                        [
+                            Indel {
+                                insert: "r#dyn",
+                                delete: 18..21,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+
+        check_expect(
+            "dyn",
+            r#"
+//- /a.rs crate:a edition:2018
+pub fn foo() {}
+
+//- /b.rs crate:b edition:2015 deps:a new_source_root:local
+fn bar() {
+    a::foo$0();
+}
+    "#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(
+                            0,
+                        ),
+                        [
+                            Indel {
+                                insert: "r#dyn",
+                                delete: 7..10,
+                            },
+                        ],
+                    ),
+                    (
+                        FileId(
+                            1,
+                        ),
+                        [
+                            Indel {
+                                insert: "dyn",
+                                delete: 18..21,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+
+        check_expect(
+            "r#dyn",
+            r#"
+//- /a.rs crate:a edition:2018
+pub fn foo$0() {}
+
+//- /b.rs crate:b edition:2015 deps:a new_source_root:local
+fn bar() {
+    a::foo();
+}
+    "#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(
+                            0,
+                        ),
+                        [
+                            Indel {
+                                insert: "r#dyn",
+                                delete: 7..10,
+                            },
+                        ],
+                    ),
+                    (
+                        FileId(
+                            1,
+                        ),
+                        [
+                            Indel {
+                                insert: "dyn",
+                                delete: 18..21,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn rename_raw_identifier() {
+        check_expect(
+            "abc",
+            r#"
+//- /a.rs crate:a edition:2015
+pub fn dyn() {}
+
+fn foo() {
+    dyn$0();
+}
+
+//- /b.rs crate:b edition:2018 deps:a new_source_root:local
+fn bar() {
+    a::r#dyn();
+}
+    "#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(
+                            0,
+                        ),
+                        [
+                            Indel {
+                                insert: "abc",
+                                delete: 7..10,
+                            },
+                            Indel {
+                                insert: "abc",
+                                delete: 32..35,
+                            },
+                        ],
+                    ),
+                    (
+                        FileId(
+                            1,
+                        ),
+                        [
+                            Indel {
+                                insert: "abc",
+                                delete: 18..23,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+
+        check_expect(
+            "abc",
+            r#"
+//- /a.rs crate:a edition:2018
+pub fn r#dyn() {}
+
+fn foo() {
+    r#dyn$0();
+}
+
+//- /b.rs crate:b edition:2015 deps:a new_source_root:local
+fn bar() {
+    a::dyn();
+}
+    "#,
+            expect![[r#"
+                source_file_edits: [
+                    (
+                        FileId(
+                            0,
+                        ),
+                        [
+                            Indel {
+                                insert: "abc",
+                                delete: 7..12,
+                            },
+                            Indel {
+                                insert: "abc",
+                                delete: 34..39,
+                            },
+                        ],
+                    ),
+                    (
+                        FileId(
+                            1,
+                        ),
+                        [
+                            Indel {
+                                insert: "abc",
+                                delete: 18..21,
+                            },
+                        ],
+                    ),
+                ]
+                file_system_edits: []
+            "#]],
+        );
+    }
+
+    #[test]
     fn test_enum_variant_from_module_1() {
         cov_mark::check!(rename_non_local);
         check(
@@ -1722,7 +2135,7 @@ impl Foo {
 struct Foo { i: i32 }
 
 impl Foo {
-    fn f(foo: &mut Foo) -> i32 {
+    fn f(foo: &mut Self) -> i32 {
         foo.i
     }
 }
@@ -1748,9 +2161,72 @@ impl Foo {
 struct Foo { i: i32 }
 
 impl Foo {
-    fn f(foo: Foo) -> i32 {
+    fn f(foo: Self) -> i32 {
         foo.i
     }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_owned_self_to_parameter_with_lifetime() {
+        cov_mark::check!(rename_self_to_param);
+        check(
+            "foo",
+            r#"
+struct Foo<'a> { i: &'a i32 }
+
+impl<'a> Foo<'a> {
+    fn f(&'a $0self) -> i32 {
+        self.i
+    }
+}
+"#,
+            r#"
+struct Foo<'a> { i: &'a i32 }
+
+impl<'a> Foo<'a> {
+    fn f(foo: &'a Self) -> i32 {
+        foo.i
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_self_outside_of_methods() {
+        check(
+            "foo",
+            r#"
+fn f($0self) -> i32 {
+    self.i
+}
+"#,
+            r#"
+fn f(foo: Self) -> i32 {
+    foo.i
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn no_type_value_ns_confuse() {
+        // Test that we don't rename items from different namespaces.
+        check(
+            "bar",
+            r#"
+struct foo {}
+fn f(foo$0: i32) -> i32 {
+    use foo as _;
+}
+"#,
+            r#"
+struct foo {}
+fn f(bar: i32) -> i32 {
+    use foo as _;
 }
 "#,
         );
@@ -1774,7 +2250,7 @@ impl Foo {
 struct Foo { i: i32 }
 
 impl Foo {
-    fn f(foo: &Foo) -> i32 {
+    fn f(foo: &Self) -> i32 {
         let self_var = 1;
         foo.i
     }
@@ -2021,7 +2497,6 @@ fn foo(foo: Foo) {
 
     #[test]
     fn test_rename_lifetimes() {
-        cov_mark::check!(rename_lifetime);
         check(
             "'yeeee",
             r#"
@@ -2198,7 +2673,7 @@ fn baz() {
     x.0$0 = 5;
 }
 "#,
-            "error: No identifier available to rename",
+            "error: No references found at position",
         );
     }
 
@@ -2228,7 +2703,7 @@ impl Foo {
     }
 }
 "#,
-            "error: Cannot rename `Self`",
+            "error: No references found at position",
         );
     }
 
@@ -2755,6 +3230,62 @@ fn test() {
     }
 
     #[test]
+    fn asm_operand() {
+        check(
+            "bose",
+            r#"
+//- minicore: asm
+fn test() {
+    core::arch::asm!(
+        "push {base}",
+        base$0 = const 0
+    );
+}
+"#,
+            r#"
+fn test() {
+    core::arch::asm!(
+        "push {bose}",
+        bose = const 0
+    );
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn asm_operand2() {
+        check(
+            "bose",
+            r#"
+//- minicore: asm
+fn test() {
+    core::arch::asm!(
+        "push {base$0}",
+        "push {base}",
+        boo = const 0,
+        virtual_free = sym VIRTUAL_FREE,
+        base = const 0,
+        boo = const 0,
+    );
+}
+"#,
+            r#"
+fn test() {
+    core::arch::asm!(
+        "push {bose}",
+        "push {bose}",
+        boo = const 0,
+        virtual_free = sym VIRTUAL_FREE,
+        bose = const 0,
+        boo = const 0,
+    );
+}
+"#,
+        );
+    }
+
+    #[test]
     fn rename_path_inside_use_tree() {
         check(
             "Baz",
@@ -2797,6 +3328,245 @@ fn main() { let _: S; }
 use lib::S as Baz;
 fn main() { let _: Baz; }
 "#,
+        );
+    }
+
+    #[test]
+    fn rename_type_param_ref_in_use_bound() {
+        check(
+            "U",
+            r#"
+fn foo<T>() -> impl use<T$0> Trait {}
+"#,
+            r#"
+fn foo<U>() -> impl use<U> Trait {}
+"#,
+        );
+    }
+
+    #[test]
+    fn rename_type_param_in_use_bound() {
+        check(
+            "U",
+            r#"
+fn foo<T$0>() -> impl use<T> Trait {}
+"#,
+            r#"
+fn foo<U>() -> impl use<U> Trait {}
+"#,
+        );
+    }
+
+    #[test]
+    fn rename_lifetime_param_ref_in_use_bound() {
+        check(
+            "u",
+            r#"
+fn foo<'t>() -> impl use<'t$0> Trait {}
+"#,
+            r#"
+fn foo<'u>() -> impl use<'u> Trait {}
+"#,
+        );
+    }
+
+    #[test]
+    fn rename_lifetime_param_in_use_bound() {
+        check(
+            "u",
+            r#"
+fn foo<'t$0>() -> impl use<'t> Trait {}
+"#,
+            r#"
+fn foo<'u>() -> impl use<'u> Trait {}
+"#,
+        );
+    }
+
+    #[test]
+    fn rename_parent_type_param_in_use_bound() {
+        check(
+            "U",
+            r#"
+trait Trait<T> {
+    fn foo() -> impl use<T$0> Trait {}
+}
+"#,
+            r#"
+trait Trait<U> {
+    fn foo() -> impl use<U> Trait {}
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn rename_macro_generated_type_from_type_with_a_suffix() {
+        check(
+            "Bar",
+            r#"
+//- proc_macros: generate_suffixed_type
+#[proc_macros::generate_suffixed_type]
+struct Foo$0;
+fn usage(_: FooSuffix) {}
+usage(FooSuffix);
+"#,
+            r#"
+#[proc_macros::generate_suffixed_type]
+struct Bar;
+fn usage(_: BarSuffix) {}
+usage(BarSuffix);
+"#,
+        );
+    }
+
+    #[test]
+    // FIXME
+    #[should_panic]
+    fn rename_macro_generated_type_from_type_usage_with_a_suffix() {
+        check(
+            "Bar",
+            r#"
+//- proc_macros: generate_suffixed_type
+#[proc_macros::generate_suffixed_type]
+struct Foo;
+fn usage(_: FooSuffix) {}
+usage(FooSuffix);
+fn other_place() { Foo$0; }
+"#,
+            r#"
+#[proc_macros::generate_suffixed_type]
+struct Bar;
+fn usage(_: BarSuffix) {}
+usage(BarSuffix);
+fn other_place() { Bar; }
+"#,
+        );
+    }
+
+    #[test]
+    fn rename_macro_generated_type_from_variant_with_a_suffix() {
+        check(
+            "Bar",
+            r#"
+//- proc_macros: generate_suffixed_type
+#[proc_macros::generate_suffixed_type]
+enum Quux {
+    Foo$0,
+}
+fn usage(_: FooSuffix) {}
+usage(FooSuffix);
+"#,
+            r#"
+#[proc_macros::generate_suffixed_type]
+enum Quux {
+    Bar,
+}
+fn usage(_: BarSuffix) {}
+usage(BarSuffix);
+"#,
+        );
+    }
+
+    #[test]
+    // FIXME
+    #[should_panic]
+    fn rename_macro_generated_type_from_variant_usage_with_a_suffix() {
+        check(
+            "Bar",
+            r#"
+//- proc_macros: generate_suffixed_type
+#[proc_macros::generate_suffixed_type]
+enum Quux {
+    Foo,
+}
+fn usage(_: FooSuffix) {}
+usage(FooSuffix);
+fn other_place() { Quux::Foo$0; }
+"#,
+            r#"
+#[proc_macros::generate_suffixed_type]
+enum Quux {
+    Bar,
+}
+fn usage(_: BarSuffix) {}
+usage(BartSuffix);
+fn other_place() { Quux::Bar$0; }
+"#,
+        );
+    }
+
+    #[test]
+    fn rename_to_self_callers() {
+        check(
+            "self",
+            r#"
+//- minicore: add
+struct Foo;
+impl core::ops::Add for Foo {
+    type Target = Foo;
+    fn add(self, _: Self) -> Foo { Foo }
+}
+
+impl Foo {
+    fn foo(th$0is: &Self) {}
+}
+
+fn bar(v: &Foo) {
+    Foo::foo(v);
+}
+
+fn baz() {
+    Foo::foo(&Foo);
+    Foo::foo(Foo + Foo);
+}
+        "#,
+            r#"
+struct Foo;
+impl core::ops::Add for Foo {
+    type Target = Foo;
+    fn add(self, _: Self) -> Foo { Foo }
+}
+
+impl Foo {
+    fn foo(&self) {}
+}
+
+fn bar(v: &Foo) {
+    v.foo();
+}
+
+fn baz() {
+    Foo.foo();
+    (Foo + Foo).foo();
+}
+        "#,
+        );
+        // Multiple arguments:
+        check(
+            "self",
+            r#"
+struct Foo;
+
+impl Foo {
+    fn foo(th$0is: &Self, v: i32) {}
+}
+
+fn bar(v: Foo) {
+    Foo::foo(&v, 123);
+}
+        "#,
+            r#"
+struct Foo;
+
+impl Foo {
+    fn foo(&self, v: i32) {}
+}
+
+fn bar(v: Foo) {
+    v.foo(123);
+}
+        "#,
         );
     }
 }

@@ -16,7 +16,8 @@
 #![allow(
     clippy::collapsible_else_if,
     clippy::needless_borrows_for_generic_args,
-    clippy::module_name_repetitions
+    clippy::module_name_repetitions,
+    clippy::literal_string_with_formatting_args
 )]
 
 mod config;
@@ -38,12 +39,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{env, fs};
 
 use cargo_metadata::Message;
-use input::{read_crates, CrateSource};
+use input::read_crates;
 use output::{ClippyCheckOutput, ClippyWarning, RustcIce};
 use rayon::prelude::*;
 
-const LINTCHECK_DOWNLOADS: &str = "target/lintcheck/downloads";
-const LINTCHECK_SOURCES: &str = "target/lintcheck/sources";
+#[must_use]
+pub fn target_dir() -> String {
+    env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_owned())
+}
+
+fn lintcheck_sources() -> String {
+    format!("{}/lintcheck/sources", target_dir())
+}
 
 /// Represents the actual source code of a crate that we ran "cargo clippy" on
 #[derive(Debug)]
@@ -53,6 +60,7 @@ struct Crate {
     // path to the extracted sources that clippy can check
     path: PathBuf,
     options: Option<Vec<String>>,
+    base_url: String,
 }
 
 impl Crate {
@@ -66,7 +74,7 @@ impl Crate {
         total_crates_to_lint: usize,
         config: &LintcheckConfig,
         lint_levels_args: &[String],
-        server: &Option<LintcheckServer>,
+        server: Option<&LintcheckServer>,
     ) -> Vec<ClippyCheckOutput> {
         // advance the atomic index by one
         let index = target_dir_index.fetch_add(1, Ordering::SeqCst);
@@ -85,8 +93,6 @@ impl Crate {
                 &self.name, &self.version
             );
         }
-
-        let shared_target_dir = clippy_project_root().join("target/lintcheck/shared_target_dir");
 
         let cargo_home = env!("CARGO_HOME");
 
@@ -115,11 +121,33 @@ impl Crate {
 
         clippy_args.extend(lint_levels_args.iter().map(String::as_str));
 
-        let mut cmd = Command::new("cargo");
+        let mut cmd;
+
+        if config.perf {
+            cmd = Command::new("perf");
+            let perf_data_filename = get_perf_data_filename(&self.path);
+            cmd.args(&[
+                "record",
+                "-e",
+                "instructions", // Only count instructions
+                "-g",           // Enable call-graph, useful for flamegraphs and produces richer reports
+                "--quiet",      // Do not tamper with lintcheck's normal output
+                "--compression-level=22",
+                "--freq=3000", // Slow down program to capture all events
+                "-o",
+                &perf_data_filename,
+                "--",
+                "cargo",
+            ]);
+        } else {
+            cmd = Command::new("cargo");
+        }
+
         cmd.arg(if config.fix { "fix" } else { "check" })
             .arg("--quiet")
             .current_dir(&self.path)
-            .env("CLIPPY_ARGS", clippy_args.join("__CLIPPY_HACKERY__"));
+            .env("CLIPPY_ARGS", clippy_args.join("__CLIPPY_HACKERY__"))
+            .env("CLIPPY_DISABLE_DOCS_LINKS", "1");
 
         if let Some(server) = server {
             // `cargo clippy` is a wrapper around `cargo check` that mainly sets `RUSTC_WORKSPACE_WRAPPER` to
@@ -131,7 +159,7 @@ impl Crate {
             // The wrapper is set to `lintcheck` itself so we can force enable linting and ignore certain crates
             // (see `crate::driver`)
             let status = cmd
-                .env("CARGO_TARGET_DIR", shared_target_dir.join("recursive"))
+                .env("CARGO_TARGET_DIR", shared_target_dir("recursive"))
                 .env("RUSTC_WRAPPER", env::current_exe().unwrap())
                 // Pass the absolute path so `crate::driver` can find `clippy-driver`, as it's executed in various
                 // different working directories
@@ -143,15 +171,16 @@ impl Crate {
             assert_eq!(status.code(), Some(0));
 
             return Vec::new();
-        };
+        }
 
-        if !config.fix {
+        if !config.fix && !config.perf {
             cmd.arg("--message-format=json");
         }
 
+        let shared_target_dir = shared_target_dir(&format!("_{thread_index:?}"));
         let all_output = cmd
             // use the looping index to create individual target dirs
-            .env("CARGO_TARGET_DIR", shared_target_dir.join(format!("_{thread_index:?}")))
+            .env("CARGO_TARGET_DIR", shared_target_dir.as_os_str())
             // Roughly equivalent to `cargo clippy`/`cargo clippy --fix`
             .env("RUSTC_WORKSPACE_WRAPPER", clippy_driver_path)
             .output()
@@ -182,10 +211,19 @@ impl Crate {
             return Vec::new();
         }
 
+        // We don't want to keep target directories if benchmarking
+        if config.perf {
+            let _ = fs::remove_dir_all(&shared_target_dir);
+        }
+
         // get all clippy warnings and ICEs
         let mut entries: Vec<ClippyCheckOutput> = Message::parse_stream(stdout.as_bytes())
             .filter_map(|msg| match msg {
-                Ok(Message::CompilerMessage(message)) => ClippyWarning::new(message.message),
+                Ok(Message::CompilerMessage(message)) => ClippyWarning::new(
+                    normalize_diag(message.message, shared_target_dir.to_str().unwrap()),
+                    &self.base_url,
+                    &self.name,
+                ),
                 _ => None,
             })
             .map(ClippyCheckOutput::ClippyWarning)
@@ -201,13 +239,48 @@ impl Crate {
     }
 }
 
+/// The target directory can sometimes be stored in the file name of spans.
+/// This is problematic since the directory in constructed from the thread
+/// ID and also used in our CI to determine if two lint emissions are the
+/// same or not. This function simply normalizes the `_<thread_id>` to `_*`.
+fn normalize_diag(
+    mut message: cargo_metadata::diagnostic::Diagnostic,
+    thread_target_dir: &str,
+) -> cargo_metadata::diagnostic::Diagnostic {
+    let mut dir_found = false;
+    message
+        .spans
+        .iter_mut()
+        .filter(|span| span.file_name.starts_with(thread_target_dir))
+        .for_each(|span| {
+            dir_found = true;
+            span.file_name
+                .replace_range(0..thread_target_dir.len(), shared_target_dir("_*").to_str().unwrap());
+        });
+
+    if dir_found && let Some(rendered) = &mut message.rendered {
+        *rendered = rendered.replace(thread_target_dir, shared_target_dir("_*").to_str().unwrap());
+    }
+    message
+}
+
 /// Builds clippy inside the repo to make sure we have a clippy executable we can use.
-fn build_clippy() -> String {
-    let output = Command::new("cargo")
-        .args(["run", "--bin=clippy-driver", "--", "--version"])
-        .stderr(Stdio::inherit())
-        .output()
-        .unwrap();
+fn build_clippy(release_build: bool) -> String {
+    let mut build_cmd = Command::new("cargo");
+    build_cmd.args([
+        "run",
+        "--bin=clippy-driver",
+        if release_build { "-r" } else { "" },
+        "--",
+        "--version",
+    ]);
+
+    if release_build {
+        build_cmd.env("CARGO_PROFILE_RELEASE_DEBUG", "true");
+    }
+
+    let output = build_cmd.stderr(Stdio::inherit()).output().unwrap();
+
     if !output.status.success() {
         eprintln!("Error: Failed to compile Clippy!");
         std::process::exit(1);
@@ -230,7 +303,12 @@ fn main() {
     let config = LintcheckConfig::new();
 
     match config.subcommand {
-        Some(Commands::Diff { old, new }) => json::diff(&old, &new),
+        Some(Commands::Diff {
+            old,
+            new,
+            truncate,
+            write_summary,
+        }) => json::diff(&old, &new, truncate, write_summary),
         Some(Commands::Popular { output, number }) => popular_crates::fetch(output, number).unwrap(),
         None => lintcheck(config),
     }
@@ -238,13 +316,20 @@ fn main() {
 
 #[allow(clippy::too_many_lines)]
 fn lintcheck(config: LintcheckConfig) {
-    let clippy_ver = build_clippy();
-    let clippy_driver_path = fs::canonicalize(format!("target/debug/clippy-driver{EXE_SUFFIX}")).unwrap();
+    let clippy_ver = build_clippy(config.perf);
+    let clippy_driver_path = fs::canonicalize(format!(
+        "{}/{}/clippy-driver{EXE_SUFFIX}",
+        target_dir(),
+        if config.perf { "release" } else { "debug" }
+    ))
+    .unwrap();
 
     // assert that clippy is found
     assert!(
         clippy_driver_path.is_file(),
-        "target/debug/clippy-driver binary not found! {}",
+        "{}/{}/clippy-driver binary not found! {}",
+        target_dir(),
+        if config.perf { "release" } else { "debug" },
         clippy_driver_path.display()
     );
 
@@ -254,29 +339,24 @@ fn lintcheck(config: LintcheckConfig) {
     let (crates, recursive_options) = read_crates(&config.sources_toml_path);
 
     let counter = AtomicUsize::new(1);
-    let mut lint_level_args: Vec<String> = vec![];
+    let mut lint_level_args: Vec<String> = vec!["--cap-lints=allow".into()];
     if config.lint_filter.is_empty() {
-        lint_level_args.push("--cap-lints=warn".to_string());
-
-        // Set allow-by-default to warn
-        if config.warn_all {
-            [
+        let groups = if config.all_lints {
+            &[
+                "clippy::all",
                 "clippy::cargo",
                 "clippy::nursery",
                 "clippy::pedantic",
                 "clippy::restriction",
-            ]
-            .iter()
-            .map(|group| format!("--warn={group}"))
-            .collect_into(&mut lint_level_args);
+            ][..]
         } else {
-            ["clippy::cargo", "clippy::pedantic"]
-                .iter()
-                .map(|group| format!("--warn={group}"))
-                .collect_into(&mut lint_level_args);
-        }
+            &["clippy::all", "clippy::pedantic"]
+        };
+        groups
+            .iter()
+            .map(|group| format!("--force-warn={group}"))
+            .collect_into(&mut lint_level_args);
     } else {
-        lint_level_args.push("--cap-lints=allow".to_string());
         config
             .lint_filter
             .iter()
@@ -286,24 +366,18 @@ fn lintcheck(config: LintcheckConfig) {
                 filter
             })
             .collect_into(&mut lint_level_args);
-    };
+    }
 
     let crates: Vec<Crate> = crates
         .into_iter()
         .filter(|krate| {
             if let Some(only_one_crate) = &config.only {
-                let name = match krate {
-                    CrateSource::CratesIo { name, .. }
-                    | CrateSource::Git { name, .. }
-                    | CrateSource::Path { name, .. } => name,
-                };
-
-                name == only_one_crate
+                krate.name == *only_one_crate
             } else {
                 true
             }
         })
-        .map(|krate| krate.download_and_extract())
+        .map(|krate| krate.download_and_prepare())
         .collect();
 
     if crates.is_empty() {
@@ -325,7 +399,7 @@ fn lintcheck(config: LintcheckConfig) {
         .unwrap();
 
     let server = config.recursive.then(|| {
-        let _: io::Result<()> = fs::remove_dir_all("target/lintcheck/shared_target_dir/recursive");
+        let _: io::Result<()> = fs::remove_dir_all(format!("{}/lintcheck/shared_target_dir/recursive", target_dir()));
 
         LintcheckServer::spawn(recursive_options)
     });
@@ -339,7 +413,7 @@ fn lintcheck(config: LintcheckConfig) {
                 crates.len(),
                 &config,
                 &lint_level_args,
-                &server,
+                server.as_ref(),
             )
         })
         .collect();
@@ -387,10 +461,48 @@ fn lintcheck(config: LintcheckConfig) {
     fs::write(&config.lintcheck_results_path, text).unwrap();
 }
 
+/// Traverse a directory looking for `perf.data.<number>` files, and adds one
+/// to the most recent of those files, returning the new most recent `perf.data`
+/// file name.
+fn get_perf_data_filename(source_path: &Path) -> String {
+    if source_path.join("perf.data").exists() {
+        let mut max_number = 0;
+        fs::read_dir(source_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|path| {
+                path.file_name()
+                    .as_os_str()
+                    .to_string_lossy() // We don't care about data loss, as we're checking for equality
+                    .starts_with("perf.data")
+            })
+            .for_each(|path| {
+                let file_name = path.file_name();
+                let file_name = file_name.as_os_str().to_str().unwrap().split('.').next_back().unwrap();
+                if let Ok(parsed_file_name) = file_name.parse::<usize>()
+                    && parsed_file_name >= max_number
+                {
+                    max_number = parsed_file_name + 1;
+                }
+            });
+        return format!("perf.data.{max_number}");
+    }
+    String::from("perf.data")
+}
+
 /// Returns the path to the Clippy project directory
 #[must_use]
 fn clippy_project_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()
+}
+
+/// The qualifier can be used to separate different threads from another. By
+/// default it should be set to `_<thread_id>`
+#[must_use]
+fn shared_target_dir(qualifier: &str) -> PathBuf {
+    clippy_project_root()
+        .join(format!("{}/lintcheck/shared_target_dir", target_dir()))
+        .join(qualifier)
 }
 
 #[test]

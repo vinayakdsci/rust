@@ -2,7 +2,7 @@
 
 use hir::{AsAssocItem, HirDisplay};
 use ide_db::SymbolKind;
-use syntax::SmolStr;
+use syntax::{SmolStr, ToSmolStr};
 
 use crate::{item::CompletionItem, render::RenderContext};
 
@@ -32,24 +32,29 @@ fn render(
     let name = type_alias.name(db);
     let (name, escaped_name) = if with_eq {
         (
-            SmolStr::from_iter([&name.unescaped().to_smol_str(), " = "]),
-            SmolStr::from_iter([&name.to_smol_str(), " = "]),
+            SmolStr::from_iter([&name.as_str().to_smolstr(), " = "]),
+            SmolStr::from_iter([&name.display_no_db(ctx.completion.edition).to_smolstr(), " = "]),
         )
     } else {
-        (name.unescaped().to_smol_str(), name.to_smol_str())
+        (name.as_str().to_smolstr(), name.display_no_db(ctx.completion.edition).to_smolstr())
     };
-    let detail = type_alias.display(db).to_string();
+    let detail = type_alias.display(db, ctx.completion.display_target).to_string();
 
-    let mut item = CompletionItem::new(SymbolKind::TypeAlias, ctx.source_range(), name);
+    let mut item = CompletionItem::new(
+        SymbolKind::TypeAlias,
+        ctx.source_range(),
+        name,
+        ctx.completion.edition,
+    );
     item.set_documentation(ctx.docs(type_alias))
         .set_deprecated(ctx.is_deprecated(type_alias) || ctx.is_deprecated_assoc_item(type_alias))
         .detail(detail)
         .set_relevance(ctx.completion_relevance());
 
-    if let Some(actm) = type_alias.as_assoc_item(db) {
-        if let Some(trt) = actm.container_or_implemented_trait(db) {
-            item.trait_name(trt.name(db).to_smol_str());
-        }
+    if let Some(actm) = type_alias.as_assoc_item(db)
+        && let Some(trt) = actm.container_or_implemented_trait(db)
+    {
+        item.trait_name(trt.name(db).display_no_db(ctx.completion.edition).to_smolstr());
     }
     item.insert_text(escaped_name);
 

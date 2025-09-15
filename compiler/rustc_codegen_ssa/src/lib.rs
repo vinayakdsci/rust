@@ -4,41 +4,48 @@
 #![allow(rustc::untranslatable_diagnostic)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
+#![feature(assert_matches)]
 #![feature(box_patterns)]
+#![feature(file_buffered)]
 #![feature(if_let_guard)]
-#![feature(let_chains)]
 #![feature(negative_impls)]
 #![feature(rustdoc_internals)]
-#![feature(strict_provenance)]
+#![feature(string_from_utf8_lossy_owned)]
+#![feature(trait_alias)]
 #![feature(try_blocks)]
+#![recursion_limit = "256"]
 // tidy-alphabetical-end
 
 //! This crate contains codegen code that is used by all codegen backends (LLVM and others).
 //! The backend-agnostic functions of this crate use functions defined in various traits that
 //! have to be implemented by each backend.
 
-use rustc_ast as ast;
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::sync::Lrc;
-use rustc_data_structures::unord::UnordMap;
-use rustc_hir::def_id::CrateNum;
-use rustc_macros::{Decodable, Encodable, HashStable};
-use rustc_middle::dep_graph::WorkProduct;
-use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
-use rustc_middle::middle::dependency_format::Dependencies;
-use rustc_middle::middle::exported_symbols::SymbolExportKind;
-use rustc_middle::util::Providers;
-use rustc_serialize::opaque::{FileEncoder, MemDecoder};
-use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
-use rustc_session::config::{CrateType, OutputFilenames, OutputType, RUST_CGU_EXT};
-use rustc_session::cstore::{self, CrateSource};
-use rustc_session::utils::NativeLibKind;
-use rustc_session::Session;
-use rustc_span::symbol::Symbol;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
+use rustc_data_structures::unord::UnordMap;
+use rustc_hir::CRATE_HIR_ID;
+use rustc_hir::attrs::{CfgEntry, NativeLibKind};
+use rustc_hir::def_id::CrateNum;
+use rustc_macros::{Decodable, Encodable, HashStable};
+use rustc_metadata::EncodedMetadata;
+use rustc_middle::dep_graph::WorkProduct;
+use rustc_middle::lint::LevelAndSource;
+use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
+use rustc_middle::middle::dependency_format::Dependencies;
+use rustc_middle::middle::exported_symbols::SymbolExportKind;
+use rustc_middle::ty::TyCtxt;
+use rustc_middle::util::Providers;
+use rustc_serialize::opaque::{FileEncoder, MemDecoder};
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+use rustc_session::Session;
+use rustc_session::config::{CrateType, OutputFilenames, OutputType, RUST_CGU_EXT};
+use rustc_session::cstore::{self, CrateSource};
+use rustc_session::lint::builtin::LINKER_MESSAGES;
+use rustc_span::Symbol;
 
 pub mod assert_module_sources;
 pub mod back;
@@ -66,9 +73,29 @@ pub struct ModuleCodegen<M> {
     pub name: String,
     pub module_llvm: M,
     pub kind: ModuleKind,
+    /// Saving the ThinLTO buffer for embedding in the object file.
+    pub thin_lto_buffer: Option<Vec<u8>>,
 }
 
 impl<M> ModuleCodegen<M> {
+    pub fn new_regular(name: impl Into<String>, module: M) -> Self {
+        Self {
+            name: name.into(),
+            module_llvm: module,
+            kind: ModuleKind::Regular,
+            thin_lto_buffer: None,
+        }
+    }
+
+    pub fn new_allocator(name: impl Into<String>, module: M) -> Self {
+        Self {
+            name: name.into(),
+            module_llvm: module,
+            kind: ModuleKind::Allocator,
+            thin_lto_buffer: None,
+        }
+    }
+
     pub fn into_compiled_module(
         self,
         emit_obj: bool,
@@ -77,22 +104,29 @@ impl<M> ModuleCodegen<M> {
         emit_asm: bool,
         emit_ir: bool,
         outputs: &OutputFilenames,
+        invocation_temp: Option<&str>,
     ) -> CompiledModule {
-        let object = emit_obj.then(|| outputs.temp_path(OutputType::Object, Some(&self.name)));
-        let dwarf_object = emit_dwarf_obj.then(|| outputs.temp_path_dwo(Some(&self.name)));
-        let bytecode = emit_bc.then(|| outputs.temp_path(OutputType::Bitcode, Some(&self.name)));
-        let assembly = emit_asm.then(|| outputs.temp_path(OutputType::Assembly, Some(&self.name)));
-        let llvm_ir =
-            emit_ir.then(|| outputs.temp_path(OutputType::LlvmAssembly, Some(&self.name)));
+        let object = emit_obj
+            .then(|| outputs.temp_path_for_cgu(OutputType::Object, &self.name, invocation_temp));
+        let dwarf_object =
+            emit_dwarf_obj.then(|| outputs.temp_path_dwo_for_cgu(&self.name, invocation_temp));
+        let bytecode = emit_bc
+            .then(|| outputs.temp_path_for_cgu(OutputType::Bitcode, &self.name, invocation_temp));
+        let assembly = emit_asm
+            .then(|| outputs.temp_path_for_cgu(OutputType::Assembly, &self.name, invocation_temp));
+        let llvm_ir = emit_ir.then(|| {
+            outputs.temp_path_for_cgu(OutputType::LlvmAssembly, &self.name, invocation_temp)
+        });
 
         CompiledModule {
-            name: self.name.clone(),
+            name: self.name,
             kind: self.kind,
             object,
             dwarf_object,
             bytecode,
             assembly,
             llvm_ir,
+            links_from_incr_cache: Vec::new(),
         }
     }
 }
@@ -106,6 +140,7 @@ pub struct CompiledModule {
     pub bytecode: Option<PathBuf>,
     pub assembly: Option<PathBuf>, // --emit=asm
     pub llvm_ir: Option<PathBuf>,  // --emit=llvm-ir, llvm-bc is in bytecode
+    pub links_from_incr_cache: Vec<PathBuf>,
 }
 
 impl CompiledModule {
@@ -126,7 +161,7 @@ impl CompiledModule {
     }
 }
 
-pub struct CachedModuleCodegen {
+pub(crate) struct CachedModuleCodegen {
     pub name: String,
     pub source: WorkProduct,
 }
@@ -134,7 +169,6 @@ pub struct CachedModuleCodegen {
 #[derive(Copy, Clone, Debug, PartialEq, Encodable, Decodable)]
 pub enum ModuleKind {
     Regular,
-    Metadata,
     Allocator,
 }
 
@@ -152,7 +186,7 @@ pub struct NativeLib {
     pub kind: NativeLibKind,
     pub name: Symbol,
     pub filename: Option<Symbol>,
-    pub cfg: Option<ast::MetaItem>,
+    pub cfg: Option<CfgEntry>,
     pub verbatim: bool,
     pub dll_imports: Vec<cstore::DllImport>,
 }
@@ -181,8 +215,9 @@ impl From<&cstore::NativeLib> for NativeLib {
 #[derive(Debug, Encodable, Decodable)]
 pub struct CrateInfo {
     pub target_cpu: String,
+    pub target_features: Vec<String>,
     pub crate_types: Vec<CrateType>,
-    pub exported_symbols: UnordMap<CrateType, Vec<String>>,
+    pub exported_symbols: UnordMap<CrateType, Vec<(String, SymbolExportKind)>>,
     pub linked_symbols: FxIndexMap<CrateType, Vec<(String, SymbolExportKind)>>,
     pub local_crate_name: Symbol,
     pub compiler_builtins: Option<CrateNum>,
@@ -191,19 +226,37 @@ pub struct CrateInfo {
     pub native_libraries: FxIndexMap<CrateNum, Vec<NativeLib>>,
     pub crate_name: UnordMap<CrateNum, Symbol>,
     pub used_libraries: Vec<NativeLib>,
-    pub used_crate_source: UnordMap<CrateNum, Lrc<CrateSource>>,
+    pub used_crate_source: UnordMap<CrateNum, Arc<CrateSource>>,
     pub used_crates: Vec<CrateNum>,
-    pub dependency_formats: Lrc<Dependencies>,
+    pub dependency_formats: Arc<Dependencies>,
     pub windows_subsystem: Option<String>,
     pub natvis_debugger_visualizers: BTreeSet<DebuggerVisualizerFile>,
+    pub lint_levels: CodegenLintLevels,
+    pub metadata_symbol: String,
+}
+
+/// Target-specific options that get set in `cfg(...)`.
+///
+/// RUSTC_SPECIFIC_FEATURES should be skipped here, those are handled outside codegen.
+pub struct TargetConfig {
+    /// Options to be set in `cfg(target_features)`.
+    pub target_features: Vec<Symbol>,
+    /// Options to be set in `cfg(target_features)`, but including unstable features.
+    pub unstable_target_features: Vec<Symbol>,
+    /// Option for `cfg(target_has_reliable_f16)`, true if `f16` basic arithmetic works.
+    pub has_reliable_f16: bool,
+    /// Option for `cfg(target_has_reliable_f16_math)`, true if `f16` math calls work.
+    pub has_reliable_f16_math: bool,
+    /// Option for `cfg(target_has_reliable_f128)`, true if `f128` basic arithmetic works.
+    pub has_reliable_f128: bool,
+    /// Option for `cfg(target_has_reliable_f128_math)`, true if `f128` math calls work.
+    pub has_reliable_f128_math: bool,
 }
 
 #[derive(Encodable, Decodable)]
 pub struct CodegenResults {
     pub modules: Vec<CompiledModule>,
     pub allocator_module: Option<CompiledModule>,
-    pub metadata_module: Option<CompiledModule>,
-    pub metadata: rustc_metadata::EncodedMetadata,
     pub crate_info: CrateInfo,
 }
 
@@ -220,6 +273,7 @@ pub fn provide(providers: &mut Providers) {
     crate::base::provide(providers);
     crate::target_features::provide(providers);
     crate::codegen_attrs::provide(providers);
+    providers.queries.global_backend_features = |_tcx: TyCtxt<'_>, ()| vec![];
 }
 
 /// Checks if the given filename ends with the `.rcgu.o` extension that `rustc`
@@ -247,6 +301,7 @@ impl CodegenResults {
         sess: &Session,
         rlink_file: &Path,
         codegen_results: &CodegenResults,
+        metadata: &EncodedMetadata,
         outputs: &OutputFilenames,
     ) -> Result<usize, io::Error> {
         let mut encoder = FileEncoder::new(rlink_file)?;
@@ -256,6 +311,7 @@ impl CodegenResults {
         encoder.emit_raw_bytes(&RLINK_VERSION.to_be_bytes());
         encoder.emit_str(sess.cfg_version);
         Encodable::encode(codegen_results, &mut encoder);
+        Encodable::encode(metadata, &mut encoder);
         Encodable::encode(outputs, &mut encoder);
         encoder.finish().map_err(|(_path, err)| err)
     }
@@ -263,7 +319,7 @@ impl CodegenResults {
     pub fn deserialize_rlink(
         sess: &Session,
         data: Vec<u8>,
-    ) -> Result<(Self, OutputFilenames), CodegenErrors> {
+    ) -> Result<(Self, EncodedMetadata, OutputFilenames), CodegenErrors> {
         // The Decodable machinery is not used here because it panics if the input data is invalid
         // and because its internal representation may change.
         if !data.starts_with(RLINK_MAGIC) {
@@ -294,7 +350,24 @@ impl CodegenResults {
         }
 
         let codegen_results = CodegenResults::decode(&mut decoder);
+        let metadata = EncodedMetadata::decode(&mut decoder);
         let outputs = OutputFilenames::decode(&mut decoder);
-        Ok((codegen_results, outputs))
+        Ok((codegen_results, metadata, outputs))
+    }
+}
+
+/// A list of lint levels used in codegen.
+///
+/// When using `-Z link-only`, we don't have access to the tcx and must work
+/// solely from the `.rlink` file. `Lint`s are defined too early to be encodeable.
+/// Instead, encode exactly the information we need.
+#[derive(Copy, Clone, Debug, Encodable, Decodable)]
+pub struct CodegenLintLevels {
+    linker_messages: LevelAndSource,
+}
+
+impl CodegenLintLevels {
+    pub fn from_tcx(tcx: TyCtxt<'_>) -> Self {
+        Self { linker_messages: tcx.lint_level_at_node(LINKER_MESSAGES, CRATE_HIR_ID) }
     }
 }

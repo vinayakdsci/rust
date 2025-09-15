@@ -12,7 +12,7 @@ use crate::panic::Location;
 #[stable(feature = "panic_hooks", since = "1.10.0")]
 #[derive(Debug)]
 pub struct PanicInfo<'a> {
-    message: fmt::Arguments<'a>,
+    message: &'a fmt::Arguments<'a>,
     location: &'a Location<'a>,
     can_unwind: bool,
     force_no_backtrace: bool,
@@ -24,15 +24,15 @@ pub struct PanicInfo<'a> {
 /// that were given to the `panic!()` macro.
 ///
 /// See [`PanicInfo::message`].
-#[stable(feature = "panic_info_message", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "panic_info_message", since = "1.81.0")]
 pub struct PanicMessage<'a> {
-    message: fmt::Arguments<'a>,
+    message: &'a fmt::Arguments<'a>,
 }
 
 impl<'a> PanicInfo<'a> {
     #[inline]
     pub(crate) fn new(
-        message: fmt::Arguments<'a>,
+        message: &'a fmt::Arguments<'a>,
         location: &'a Location<'a>,
         can_unwind: bool,
         force_no_backtrace: bool,
@@ -57,7 +57,7 @@ impl<'a> PanicInfo<'a> {
     /// }
     /// ```
     #[must_use]
-    #[stable(feature = "panic_info_message", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "panic_info_message", since = "1.81.0")]
     pub fn message(&self) -> PanicMessage<'_> {
         PanicMessage { message: self.message }
     }
@@ -146,13 +146,13 @@ impl Display for PanicInfo<'_> {
         formatter.write_str("panicked at ")?;
         self.location.fmt(formatter)?;
         formatter.write_str(":\n")?;
-        formatter.write_fmt(self.message)?;
+        formatter.write_fmt(*self.message)?;
         Ok(())
     }
 }
 
 impl<'a> PanicMessage<'a> {
-    /// Get the formatted message, if it has no arguments to be formatted at runtime.
+    /// Gets the formatted message, if it has no arguments to be formatted at runtime.
     ///
     /// This can be used to avoid allocations in some cases.
     ///
@@ -164,8 +164,8 @@ impl<'a> PanicMessage<'a> {
     /// For most cases with placeholders, this function will return `None`.
     ///
     /// See [`fmt::Arguments::as_str`] for details.
-    #[stable(feature = "panic_info_message", since = "CURRENT_RUSTC_VERSION")]
-    #[rustc_const_unstable(feature = "const_arguments_as_str", issue = "103900")]
+    #[stable(feature = "panic_info_message", since = "1.81.0")]
+    #[rustc_const_stable(feature = "const_arguments_as_str", since = "1.84.0")]
     #[must_use]
     #[inline]
     pub const fn as_str(&self) -> Option<&'static str> {
@@ -173,18 +173,18 @@ impl<'a> PanicMessage<'a> {
     }
 }
 
-#[stable(feature = "panic_info_message", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "panic_info_message", since = "1.81.0")]
 impl Display for PanicMessage<'_> {
     #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_fmt(self.message)
+        formatter.write_fmt(*self.message)
     }
 }
 
-#[stable(feature = "panic_info_message", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "panic_info_message", since = "1.81.0")]
 impl fmt::Debug for PanicMessage<'_> {
     #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_fmt(self.message)
+        formatter.write_fmt(*self.message)
     }
 }

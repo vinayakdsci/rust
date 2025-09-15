@@ -1,37 +1,31 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::hash::Hash;
-use std::ops::ControlFlow;
 
+use rustc_abi::{Align, Size};
 use rustc_ast::Mutability;
-use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::fx::IndexEntry;
-use rustc_hir::def_id::DefId;
-use rustc_hir::def_id::LocalDefId;
-use rustc_hir::LangItem;
-use rustc_hir::{self as hir, CRATE_HIR_ID};
-use rustc_middle::bug;
-use rustc_middle::mir;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap, IndexEntry};
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::{self as hir, CRATE_HIR_ID, LangItem};
 use rustc_middle::mir::AssertMessage;
+use rustc_middle::mir::interpret::ReportedErrorInfo;
 use rustc_middle::query::TyCtxtAt;
-use rustc_middle::ty::layout::{FnAbiOf, TyAndLayout};
-use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::lint::builtin::WRITES_THROUGH_IMMUTABLE_POINTER;
-use rustc_span::symbol::{sym, Symbol};
-use rustc_span::Span;
-use rustc_target::abi::{Align, Size};
-use rustc_target::spec::abi::Abi as CallAbi;
+use rustc_middle::ty::layout::{HasTypingEnv, TyAndLayout, ValidityRequirement};
+use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::{bug, mir};
+use rustc_span::{Span, Symbol, sym};
+use rustc_target::callconv::FnAbi;
 use tracing::debug;
 
+use super::error::*;
 use crate::errors::{LongRunning, LongRunningWarn};
 use crate::fluent_generated as fluent;
 use crate::interpret::{
-    self, compile_time_machine, err_ub, throw_exhaust, throw_inval, throw_ub_custom, throw_unsup,
-    throw_unsup_format, AllocId, AllocRange, ConstAllocation, CtfeProvenance, FnArg, FnVal, Frame,
-    GlobalAlloc, ImmTy, InterpCx, InterpResult, MPlaceTy, OpTy, Pointer, PointerArithmetic, Scalar,
+    self, AllocId, AllocInit, AllocRange, ConstAllocation, CtfeProvenance, FnArg, Frame,
+    GlobalAlloc, ImmTy, InterpCx, InterpResult, OpTy, PlaceTy, Pointer, RangeSet, Scalar,
+    compile_time_machine, err_inval, interp_ok, throw_exhaust, throw_inval, throw_ub,
+    throw_ub_custom, throw_unsup, throw_unsup_format,
 };
-
-use super::error::*;
 
 /// When hitting this many interpreted terminators we emit a deny by default lint
 /// that notfies the user that their constant takes a long time to evaluate. If that's
@@ -44,7 +38,10 @@ const TINY_LINT_TERMINATOR_LIMIT: usize = 20;
 /// power of two of interpreted terminators.
 const PROGRESS_INDICATOR_START: usize = 4_000_000;
 
-/// Extra machine state for CTFE, and the Machine instance
+/// Extra machine state for CTFE, and the Machine instance.
+//
+// Should be public because out-of-tree rustc consumers need this
+// if they want to interact with constant values.
 pub struct CompileTimeMachine<'tcx> {
     /// The number of terminators that have been evaluated.
     ///
@@ -65,8 +62,11 @@ pub struct CompileTimeMachine<'tcx> {
 
     /// If `Some`, we are evaluating the initializer of the static with the given `LocalDefId`,
     /// storing the result in the given `AllocId`.
-    /// Used to prevent reads from a static's base allocation, as that may allow for self-initialization loops.
+    /// Used to prevent accesses to a static's base allocation, as that may allow for self-initialization loops.
     pub(crate) static_root_ids: Option<(AllocId, LocalDefId)>,
+
+    /// A cache of "data range" computations for unions (i.e., the offsets of non-padding bytes).
+    union_data_ranges: FxHashMap<Ty<'tcx>, RangeSet>,
 }
 
 #[derive(Copy, Clone)]
@@ -101,6 +101,7 @@ impl<'tcx> CompileTimeMachine<'tcx> {
             can_access_mut_global,
             check_alignment,
             static_root_ids: None,
+            union_data_ranges: FxHashMap::default(),
         }
     }
 }
@@ -138,7 +139,7 @@ impl<K: Hash + Eq, V> interpret::AllocMap<K, V> for FxIndexMap<K, V> {
 
     #[inline(always)]
     fn filter_map_collect<T>(&self, mut f: impl FnMut(&K, &V) -> Option<T>) -> Vec<T> {
-        self.iter().filter_map(move |(k, v)| f(k, &*v)).collect()
+        self.iter().filter_map(move |(k, v)| f(k, v)).collect()
     }
 
     #[inline(always)]
@@ -164,17 +165,23 @@ impl<K: Hash + Eq, V> interpret::AllocMap<K, V> for FxIndexMap<K, V> {
     }
 }
 
-pub(crate) type CompileTimeInterpCx<'tcx> = InterpCx<'tcx, CompileTimeMachine<'tcx>>;
+pub type CompileTimeInterpCx<'tcx> = InterpCx<'tcx, CompileTimeMachine<'tcx>>;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum MemoryKind {
-    Heap,
+    Heap {
+        /// Indicates whether `make_global` was called on this allocation.
+        /// If this is `true`, the allocation must be immutable.
+        was_made_global: bool,
+    },
 }
 
 impl fmt::Display for MemoryKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MemoryKind::Heap => write!(f, "heap allocation"),
+            MemoryKind::Heap { was_made_global } => {
+                write!(f, "heap allocation{}", if *was_made_global { " (made global)" } else { "" })
+            }
         }
     }
 }
@@ -183,7 +190,7 @@ impl interpret::MayLeak for MemoryKind {
     #[inline(always)]
     fn may_leak(self) -> bool {
         match self {
-            MemoryKind::Heap => false,
+            MemoryKind::Heap { was_made_global } => was_made_global,
         }
     }
 }
@@ -201,7 +208,8 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
         let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
         let caller = self.tcx.sess.source_map().lookup_char_pos(topmost.lo());
 
-        use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
+        use rustc_session::RemapFileNameExt;
+        use rustc_session::config::RemapPathScopeComponents;
         (
             Symbol::intern(
                 &caller
@@ -216,7 +224,7 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
     }
 
     /// "Intercept" a function call, because we have something special to do for it.
-    /// All `#[rustc_do_not_const_check]` functions should be hooked here.
+    /// All `#[rustc_do_not_const_check]` functions MUST be hooked here.
     /// If this returns `Some` function, which may be `instance` or a different function with
     /// compatible arguments, then evaluation should continue with that function.
     /// If this returns `None`, the function call has been handled and the function has returned.
@@ -224,12 +232,12 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
         &mut self,
         instance: ty::Instance<'tcx>,
         args: &[FnArg<'tcx>],
-        dest: &MPlaceTy<'tcx>,
-        ret: Option<mir::BasicBlock>,
+        _dest: &PlaceTy<'tcx>,
+        _ret: Option<mir::BasicBlock>,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         let def_id = instance.def_id();
 
-        if self.tcx.has_attr(def_id, sym::rustc_const_panic_str)
+        if self.tcx.is_lang_item(def_id, LangItem::PanicDisplay)
             || self.tcx.is_lang_item(def_id, LangItem::BeginPanic)
         {
             let args = self.copy_fn_args(args);
@@ -244,129 +252,138 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
             let msg = Symbol::intern(self.read_str(&msg_place)?);
             let span = self.find_closest_untracked_caller_location();
             let (file, line, col) = self.location_triple_for_span(span);
-            return Err(ConstEvalErrKind::Panic { msg, file, line, col }.into());
+            return Err(ConstEvalErrKind::Panic { msg, file, line, col }).into();
         } else if self.tcx.is_lang_item(def_id, LangItem::PanicFmt) {
             // For panic_fmt, call const_panic_fmt instead.
-            let const_def_id = self.tcx.require_lang_item(LangItem::ConstPanicFmt, None);
+            let const_def_id = self.tcx.require_lang_item(LangItem::ConstPanicFmt, self.tcx.span);
             let new_instance = ty::Instance::expect_resolve(
                 *self.tcx,
-                ty::ParamEnv::reveal_all(),
+                self.typing_env(),
                 const_def_id,
                 instance.args,
                 self.cur_span(),
             );
 
-            return Ok(Some(new_instance));
-        } else if self.tcx.is_lang_item(def_id, LangItem::AlignOffset) {
-            let args = self.copy_fn_args(args);
-            // For align_offset, we replace the function call if the pointer has no address.
-            match self.align_offset(instance, &args, dest, ret)? {
-                ControlFlow::Continue(()) => return Ok(Some(instance)),
-                ControlFlow::Break(()) => return Ok(None),
-            }
+            return interp_ok(Some(new_instance));
         }
-        Ok(Some(instance))
-    }
-
-    /// `align_offset(ptr, target_align)` needs special handling in const eval, because the pointer
-    /// may not have an address.
-    ///
-    /// If `ptr` does have a known address, then we return `Continue(())` and the function call should
-    /// proceed as normal.
-    ///
-    /// If `ptr` doesn't have an address, but its underlying allocation's alignment is at most
-    /// `target_align`, then we call the function again with an dummy address relative to the
-    /// allocation.
-    ///
-    /// If `ptr` doesn't have an address and `target_align` is stricter than the underlying
-    /// allocation's alignment, then we return `usize::MAX` immediately.
-    fn align_offset(
-        &mut self,
-        instance: ty::Instance<'tcx>,
-        args: &[OpTy<'tcx>],
-        dest: &MPlaceTy<'tcx>,
-        ret: Option<mir::BasicBlock>,
-    ) -> InterpResult<'tcx, ControlFlow<()>> {
-        assert_eq!(args.len(), 2);
-
-        let ptr = self.read_pointer(&args[0])?;
-        let target_align = self.read_scalar(&args[1])?.to_target_usize(self)?;
-
-        if !target_align.is_power_of_two() {
-            throw_ub_custom!(
-                fluent::const_eval_align_offset_invalid_align,
-                target_align = target_align,
-            );
-        }
-
-        match self.ptr_try_get_alloc_id(ptr) {
-            Ok((alloc_id, offset, _extra)) => {
-                let (_size, alloc_align, _kind) = self.get_alloc_info(alloc_id);
-
-                if target_align <= alloc_align.bytes() {
-                    // Extract the address relative to the allocation base that is definitely
-                    // sufficiently aligned and call `align_offset` again.
-                    let addr = ImmTy::from_uint(offset.bytes(), args[0].layout).into();
-                    let align = ImmTy::from_uint(target_align, args[1].layout).into();
-                    let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty())?;
-
-                    // We replace the entire function call with a "tail call".
-                    // Note that this happens before the frame of the original function
-                    // is pushed on the stack.
-                    self.eval_fn_call(
-                        FnVal::Instance(instance),
-                        (CallAbi::Rust, fn_abi),
-                        &[FnArg::Copy(addr), FnArg::Copy(align)],
-                        /* with_caller_location = */ false,
-                        dest,
-                        ret,
-                        mir::UnwindAction::Unreachable,
-                    )?;
-                    Ok(ControlFlow::Break(()))
-                } else {
-                    // Not alignable in const, return `usize::MAX`.
-                    let usize_max = Scalar::from_target_usize(self.target_usize_max(), self);
-                    self.write_scalar(usize_max, dest)?;
-                    self.return_to_block(ret)?;
-                    Ok(ControlFlow::Break(()))
-                }
-            }
-            Err(_addr) => {
-                // The pointer has an address, continue with function call.
-                Ok(ControlFlow::Continue(()))
-            }
-        }
+        interp_ok(Some(instance))
     }
 
     /// See documentation on the `ptr_guaranteed_cmp` intrinsic.
+    /// Returns `2` if the result is unknown.
+    /// Returns `1` if the pointers are guaranteed equal.
+    /// Returns `0` if the pointers are guaranteed inequal.
+    ///
+    /// Note that this intrinsic is exposed on stable for comparison with null. In other words, any
+    /// change to this function that affects comparison with null is insta-stable!
     fn guaranteed_cmp(&mut self, a: Scalar, b: Scalar) -> InterpResult<'tcx, u8> {
-        Ok(match (a, b) {
+        interp_ok(match (a, b) {
             // Comparisons between integers are always known.
-            (Scalar::Int { .. }, Scalar::Int { .. }) => {
-                if a == b {
-                    1
-                } else {
+            (Scalar::Int(a), Scalar::Int(b)) => (a == b) as u8,
+            // Comparing a pointer `ptr` with an integer `int` is equivalent to comparing
+            // `ptr-int` with null, so we can reduce this case to a `scalar_may_be_null` test.
+            (Scalar::Int(int), Scalar::Ptr(ptr, _)) | (Scalar::Ptr(ptr, _), Scalar::Int(int)) => {
+                let int = int.to_target_usize(*self.tcx);
+                // The `wrapping_neg` here may produce a value that is not
+                // a valid target usize any more... but `wrapping_offset` handles that correctly.
+                let offset_ptr = ptr.wrapping_offset(Size::from_bytes(int.wrapping_neg()), self);
+                if !self.scalar_may_be_null(Scalar::from_pointer(offset_ptr, self))? {
+                    // `ptr.wrapping_sub(int)` is definitely not equal to `0`, so `ptr != int`
                     0
+                } else {
+                    // `ptr.wrapping_sub(int)` could be equal to `0`, but might not be,
+                    // so we cannot know for sure if `ptr == int` or not
+                    2
                 }
             }
-            // Comparisons of abstract pointers with null pointers are known if the pointer
-            // is in bounds, because if they are in bounds, the pointer can't be null.
-            // Inequality with integers other than null can never be known for sure.
-            (Scalar::Int(int), ptr @ Scalar::Ptr(..))
-            | (ptr @ Scalar::Ptr(..), Scalar::Int(int))
-                if int.is_null() && !self.scalar_may_be_null(ptr)? =>
-            {
-                0
+            (Scalar::Ptr(a, _), Scalar::Ptr(b, _)) => {
+                let (a_prov, a_offset) = a.prov_and_relative_offset();
+                let (b_prov, b_offset) = b.prov_and_relative_offset();
+                let a_allocid = a_prov.alloc_id();
+                let b_allocid = b_prov.alloc_id();
+                let a_info = self.get_alloc_info(a_allocid);
+                let b_info = self.get_alloc_info(b_allocid);
+
+                // Check if the pointers cannot be equal due to alignment
+                if a_info.align > Align::ONE && b_info.align > Align::ONE {
+                    let min_align = Ord::min(a_info.align.bytes(), b_info.align.bytes());
+                    let a_residue = a_offset.bytes() % min_align;
+                    let b_residue = b_offset.bytes() % min_align;
+                    if a_residue != b_residue {
+                        // If the two pointers have a different residue modulo their
+                        // common alignment, they cannot be equal.
+                        return interp_ok(0);
+                    }
+                    // The pointers have the same residue modulo their common alignment,
+                    // so they could be equal. Try the other checks.
+                }
+
+                if let (Some(GlobalAlloc::Static(a_did)), Some(GlobalAlloc::Static(b_did))) = (
+                    self.tcx.try_get_global_alloc(a_allocid),
+                    self.tcx.try_get_global_alloc(b_allocid),
+                ) {
+                    if a_allocid == b_allocid {
+                        debug_assert_eq!(
+                            a_did, b_did,
+                            "different static item DefIds had same AllocId? {a_allocid:?} == {b_allocid:?}, {a_did:?} != {b_did:?}"
+                        );
+                        // Comparing two pointers into the same static. As per
+                        // https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.intro
+                        // a static cannot be duplicated, so if two pointers are into the same
+                        // static, they are equal if and only if their offsets are equal.
+                        (a_offset == b_offset) as u8
+                    } else {
+                        debug_assert_ne!(
+                            a_did, b_did,
+                            "same static item DefId had two different AllocIds? {a_allocid:?} != {b_allocid:?}, {a_did:?} == {b_did:?}"
+                        );
+                        // Comparing two pointers into the different statics.
+                        // We can never determine for sure that two pointers into different statics
+                        // are *equal*, but we can know that they are *inequal* if they are both
+                        // strictly in-bounds (i.e. in-bounds and not one-past-the-end) of
+                        // their respective static, as different non-zero-sized statics cannot
+                        // overlap or be deduplicated as per
+                        // https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.intro
+                        // (non-deduplication), and
+                        // https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.storage-disjointness
+                        // (non-overlapping).
+                        if a_offset < a_info.size && b_offset < b_info.size {
+                            0
+                        } else {
+                            // Otherwise, conservatively say we don't know.
+                            // There are some cases we could still return `0` for, e.g.
+                            // if the pointers being equal would require their statics to overlap
+                            // one or more bytes, but for simplicity we currently only check
+                            // strictly in-bounds pointers.
+                            2
+                        }
+                    }
+                } else {
+                    // All other cases we conservatively say we don't know.
+                    //
+                    // For comparing statics to non-statics, as per https://doc.rust-lang.org/nightly/reference/items/static-items.html#r-items.static.storage-disjointness
+                    // immutable statics can overlap with other kinds of allocations sometimes.
+                    //
+                    // FIXME: We could be more decisive for (non-zero-sized) mutable statics,
+                    // which cannot overlap with other kinds of allocations.
+                    //
+                    // Functions and vtables can be duplicated and deduplicated, so we
+                    // cannot be sure of runtime equality of pointers to the same one, or the
+                    // runtime inequality of pointers to different ones (see e.g. #73722),
+                    // so comparing those should return 2, whether they are the same allocation
+                    // or not.
+                    //
+                    // `GlobalAlloc::TypeId` exists mostly to prevent consteval from comparing
+                    // `TypeId`s, so comparing those should always return 2, whether they are the
+                    // same allocation or not.
+                    //
+                    // FIXME: We could revisit comparing pointers into the same
+                    // `GlobalAlloc::Memory` once https://github.com/rust-lang/rust/issues/128775
+                    // is fixed (but they can be deduplicated, so comparing pointers into different
+                    // ones should return 2).
+                    2
+                }
             }
-            // Equality with integers can never be known for sure.
-            (Scalar::Int { .. }, Scalar::Ptr(..)) | (Scalar::Ptr(..), Scalar::Int { .. }) => 2,
-            // FIXME: return a `1` for when both sides are the same pointer, *except* that
-            // some things (like functions and vtables) do not have stable addresses
-            // so we need to be careful around them (see e.g. #73722).
-            // FIXME: return `0` for at least some comparisons where we can reliably
-            // determine the result of runtime inequality tests at compile-time.
-            // Examples include comparison of addresses in different static items.
-            (Scalar::Ptr(..), Scalar::Ptr(..)) => 2,
         })
     }
 }
@@ -383,8 +400,6 @@ impl<'tcx> CompileTimeMachine<'tcx> {
 impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
     compile_time_machine!(<'tcx>);
 
-    type MemoryKind = MemoryKind;
-
     const PANIC_ON_ALLOC_FAIL: bool = false; // will be raised as a proper error
 
     #[inline(always)]
@@ -394,25 +409,25 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
 
     #[inline(always)]
     fn enforce_validity(ecx: &InterpCx<'tcx, Self>, layout: TyAndLayout<'tcx>) -> bool {
-        ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks || layout.abi.is_uninhabited()
+        ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks || layout.is_uninhabited()
     }
 
     fn load_mir(
         ecx: &InterpCx<'tcx, Self>,
         instance: ty::InstanceKind<'tcx>,
-    ) -> InterpResult<'tcx, &'tcx mir::Body<'tcx>> {
+    ) -> &'tcx mir::Body<'tcx> {
         match instance {
-            ty::InstanceKind::Item(def) => Ok(ecx.tcx.mir_for_ctfe(def)),
-            _ => Ok(ecx.tcx.instance_mir(instance)),
+            ty::InstanceKind::Item(def) => ecx.tcx.mir_for_ctfe(def),
+            _ => ecx.tcx.instance_mir(instance),
         }
     }
 
     fn find_mir_or_eval_fn(
         ecx: &mut InterpCx<'tcx, Self>,
         orig_instance: ty::Instance<'tcx>,
-        _abi: CallAbi,
+        _abi: &FnAbi<'tcx, Ty<'tcx>>,
         args: &[FnArg<'tcx>],
-        dest: &MPlaceTy<'tcx>,
+        dest: &PlaceTy<'tcx>,
         ret: Option<mir::BasicBlock>,
         _unwind: mir::UnwindAction, // unwinding is not supported in consts
     ) -> InterpResult<'tcx, Option<(&'tcx mir::Body<'tcx>, ty::Instance<'tcx>)>> {
@@ -421,19 +436,16 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
         // Replace some functions.
         let Some(instance) = ecx.hook_special_const_fn(orig_instance, args, dest, ret)? else {
             // Call has already been handled.
-            return Ok(None);
+            return interp_ok(None);
         };
 
         // Only check non-glue functions
         if let ty::InstanceKind::Item(def) = instance.def {
             // Execution might have wandered off into other crates, so we cannot do a stability-
             // sensitive check here. But we can at least rule out functions that are not const at
-            // all. That said, we have to allow calling functions inside a trait marked with
-            // #[const_trait]. These *are* const-checked!
-            // FIXME: why does `is_const_fn_raw` not classify them as const?
-            if (!ecx.tcx.is_const_fn_raw(def) && !ecx.tcx.is_const_default_method(def))
-                || ecx.tcx.has_attr(def, sym::rustc_do_not_const_check)
-            {
+            // all. That said, we have to allow calling functions inside a `const trait`. These
+            // *are* const-checked!
+            if !ecx.tcx.is_const_fn(def) || ecx.tcx.has_attr(def, sym::rustc_do_not_const_check) {
                 // We certainly do *not* want to actually call the fn
                 // though, so be sure we return here.
                 throw_unsup_format!("calling non-const function `{}`", instance)
@@ -443,27 +455,27 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
         // This is a const fn. Call it.
         // In case of replacement, we return the *original* instance to make backtraces work out
         // (and we hope this does not confuse the FnAbi checks too much).
-        Ok(Some((ecx.load_mir(instance.def, None)?, orig_instance)))
+        interp_ok(Some((ecx.load_mir(instance.def, None)?, orig_instance)))
     }
 
     fn panic_nounwind(ecx: &mut InterpCx<'tcx, Self>, msg: &str) -> InterpResult<'tcx> {
         let msg = Symbol::intern(msg);
         let span = ecx.find_closest_untracked_caller_location();
         let (file, line, col) = ecx.location_triple_for_span(span);
-        Err(ConstEvalErrKind::Panic { msg, file, line, col }.into())
+        Err(ConstEvalErrKind::Panic { msg, file, line, col }).into()
     }
 
     fn call_intrinsic(
         ecx: &mut InterpCx<'tcx, Self>,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx>],
-        dest: &MPlaceTy<'tcx, Self::Provenance>,
+        dest: &PlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
         _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         // Shared intrinsics.
-        if ecx.emulate_intrinsic(instance, args, dest, target)? {
-            return Ok(None);
+        if ecx.eval_intrinsic(instance, args, dest, target)? {
+            return interp_ok(None);
         }
         let intrinsic_name = ecx.tcx.item_name(instance.def_id());
 
@@ -492,7 +504,8 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                 let ptr = ecx.allocate_ptr(
                     Size::from_bytes(size),
                     align,
-                    interpret::MemoryKind::Machine(MemoryKind::Heap),
+                    interpret::MemoryKind::Machine(MemoryKind::Heap { was_made_global: false }),
+                    AllocInit::Uninit,
                 )?;
                 ecx.write_pointer(ptr, dest)?;
             }
@@ -514,7 +527,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
 
                 // If an allocation is created in an another const,
                 // we don't deallocate it.
-                let (alloc_id, _, _) = ecx.ptr_get_alloc_id(ptr)?;
+                let (alloc_id, _, _) = ecx.ptr_get_alloc_id(ptr, 0)?;
                 let is_allocated_in_another_const = matches!(
                     ecx.tcx.try_get_global_alloc(alloc_id),
                     Some(interpret::GlobalAlloc::Memory(_))
@@ -524,15 +537,60 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                     ecx.deallocate_ptr(
                         ptr,
                         Some((size, align)),
-                        interpret::MemoryKind::Machine(MemoryKind::Heap),
+                        interpret::MemoryKind::Machine(MemoryKind::Heap { was_made_global: false }),
                     )?;
                 }
             }
+
+            sym::const_make_global => {
+                let ptr = ecx.read_pointer(&args[0])?;
+                ecx.make_const_heap_ptr_global(ptr)?;
+                ecx.write_pointer(ptr, dest)?;
+            }
+
             // The intrinsic represents whether the value is known to the optimizer (LLVM).
             // We're not doing any optimizations here, so there is no optimizer that could know the value.
             // (We know the value here in the machine of course, but this is the runtime of that code,
             // not the optimization stage.)
             sym::is_val_statically_known => ecx.write_scalar(Scalar::from_bool(false), dest)?,
+
+            // We handle these here since Miri does not want to have them.
+            sym::assert_inhabited
+            | sym::assert_zero_valid
+            | sym::assert_mem_uninitialized_valid => {
+                let ty = instance.args.type_at(0);
+                let requirement = ValidityRequirement::from_intrinsic(intrinsic_name).unwrap();
+
+                let should_panic = !ecx
+                    .tcx
+                    .check_validity_requirement((requirement, ecx.typing_env().as_query_input(ty)))
+                    .map_err(|_| err_inval!(TooGeneric))?;
+
+                if should_panic {
+                    let layout = ecx.layout_of(ty)?;
+
+                    let msg = match requirement {
+                        // For *all* intrinsics we first check `is_uninhabited` to give a more specific
+                        // error message.
+                        _ if layout.is_uninhabited() => format!(
+                            "aborted execution: attempted to instantiate uninhabited type `{ty}`"
+                        ),
+                        ValidityRequirement::Inhabited => bug!("handled earlier"),
+                        ValidityRequirement::Zero => format!(
+                            "aborted execution: attempted to zero-initialize type `{ty}`, which is invalid"
+                        ),
+                        ValidityRequirement::UninitMitigated0x01Fill => format!(
+                            "aborted execution: attempted to leave type `{ty}` uninitialized, which is invalid"
+                        ),
+                        ValidityRequirement::Uninit => bug!("assert_uninit_valid doesn't exist"),
+                    };
+
+                    Self::panic_nounwind(ecx, &msg)?;
+                    // Skip the `return_to_block` at the end (we panicked, we do not return).
+                    return interp_ok(None);
+                }
+            }
+
             _ => {
                 // We haven't handled the intrinsic, let's see if we can use a fallback body.
                 if ecx.tcx.intrinsic(instance.def_id()).unwrap().must_be_overridden {
@@ -540,7 +598,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                         "intrinsic `{intrinsic_name}` is not supported at compile-time"
                     );
                 }
-                return Ok(Some(ty::Instance {
+                return interp_ok(Some(ty::Instance {
                     def: ty::InstanceKind::Item(instance.def_id()),
                     args: instance.args,
                 }));
@@ -549,7 +607,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
 
         // Intrinsic is done, jump to next block.
         ecx.return_to_block(target)?;
-        Ok(None)
+        interp_ok(None)
     }
 
     fn assert_panic(
@@ -573,14 +631,15 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
             RemainderByZero(op) => RemainderByZero(eval_to_int(op)?),
             ResumedAfterReturn(coroutine_kind) => ResumedAfterReturn(*coroutine_kind),
             ResumedAfterPanic(coroutine_kind) => ResumedAfterPanic(*coroutine_kind),
-            MisalignedPointerDereference { ref required, ref found } => {
-                MisalignedPointerDereference {
-                    required: eval_to_int(required)?,
-                    found: eval_to_int(found)?,
-                }
-            }
+            ResumedAfterDrop(coroutine_kind) => ResumedAfterDrop(*coroutine_kind),
+            MisalignedPointerDereference { required, found } => MisalignedPointerDereference {
+                required: eval_to_int(required)?,
+                found: eval_to_int(found)?,
+            },
+            NullPointerDereference => NullPointerDereference,
+            InvalidEnumConstruction(source) => InvalidEnumConstruction(eval_to_int(source)?),
         };
-        Err(ConstEvalErrKind::AssertFailure(err).into())
+        Err(ConstEvalErrKind::AssertFailure(err)).into()
     }
 
     fn binary_ptr_op(
@@ -618,7 +677,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                         rustc_session::lint::builtin::LONG_RUNNING_CONST_EVAL,
                         hir_id,
                     )
-                    .0
+                    .level
                     .is_error();
                 let span = ecx.cur_span();
                 ecx.tcx.emit_node_span_lint(
@@ -633,22 +692,32 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                         .tcx
                         .dcx()
                         .span_delayed_bug(span, "The deny lint should have already errored");
-                    throw_inval!(AlreadyReported(guard.into()));
+                    throw_inval!(AlreadyReported(ReportedErrorInfo::allowed_in_infallible(guard)));
                 }
             } else if new_steps > start && new_steps.is_power_of_two() {
                 // Only report after a certain number of terminators have been evaluated and the
                 // current number of evaluated terminators is a power of 2. The latter gives us a cheap
                 // way to implement exponential backoff.
                 let span = ecx.cur_span();
-                ecx.tcx.dcx().emit_warn(LongRunningWarn { span, item_span: ecx.tcx.span });
+                // We store a unique number in `force_duplicate` to evade `-Z deduplicate-diagnostics`.
+                // `new_steps` is guaranteed to be unique because `ecx.machine.num_evaluated_steps` is
+                // always increasing.
+                ecx.tcx.dcx().emit_warn(LongRunningWarn {
+                    span,
+                    item_span: ecx.tcx.span,
+                    force_duplicate: new_steps,
+                });
             }
         }
 
-        Ok(())
+        interp_ok(())
     }
 
     #[inline(always)]
-    fn expose_ptr(_ecx: &mut InterpCx<'tcx, Self>, _ptr: Pointer) -> InterpResult<'tcx> {
+    fn expose_provenance(
+        _ecx: &InterpCx<'tcx, Self>,
+        _provenance: Self::Provenance,
+    ) -> InterpResult<'tcx> {
         // This is only reachable with -Zunleash-the-miri-inside-of-you.
         throw_unsup_format!("exposing pointers is not possible at compile-time")
     }
@@ -662,7 +731,7 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
         if !ecx.recursion_limit.value_within_limit(ecx.stack().len() + 1) {
             throw_exhaust!(StackFrameLimitReached)
         } else {
-            Ok(frame)
+            interp_ok(frame)
         }
     }
 
@@ -692,22 +761,22 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
         if is_write {
             // Write access. These are never allowed, but we give a targeted error message.
             match alloc.mutability {
-                Mutability::Not => Err(err_ub!(WriteToReadOnly(alloc_id)).into()),
-                Mutability::Mut => Err(ConstEvalErrKind::ModifiedGlobal.into()),
+                Mutability::Not => throw_ub!(WriteToReadOnly(alloc_id)),
+                Mutability::Mut => Err(ConstEvalErrKind::ModifiedGlobal).into(),
             }
         } else {
             // Read access. These are usually allowed, with some exceptions.
             if machine.can_access_mut_global == CanAccessMutGlobal::Yes {
                 // Machine configuration allows us read from anything (e.g., `static` initializer).
-                Ok(())
+                interp_ok(())
             } else if alloc.mutability == Mutability::Mut {
                 // Machine configuration does not allow us to read statics (e.g., `const`
                 // initializer).
-                Err(ConstEvalErrKind::ConstAccessesMutGlobal.into())
+                Err(ConstEvalErrKind::ConstAccessesMutGlobal).into()
             } else {
                 // Immutable global, this read is fine.
                 assert_eq!(alloc.mutability, Mutability::Not);
-                Ok(())
+                interp_ok(())
             }
         }
     }
@@ -717,59 +786,95 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
         _kind: mir::RetagKind,
         val: &ImmTy<'tcx, CtfeProvenance>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, CtfeProvenance>> {
-        // If it's a frozen shared reference that's not already immutable, make it immutable.
+        // If it's a frozen shared reference that's not already immutable, potentially make it immutable.
         // (Do nothing on `None` provenance, that cannot store immutability anyway.)
         if let ty::Ref(_, ty, mutbl) = val.layout.ty.kind()
             && *mutbl == Mutability::Not
-            && val.to_scalar_and_meta().0.to_pointer(ecx)?.provenance.is_some_and(|p| !p.immutable())
-            // That next check is expensive, that's why we have all the guards above.
-            && ty.is_freeze(*ecx.tcx, ecx.param_env)
+            && val
+                .to_scalar_and_meta()
+                .0
+                .to_pointer(ecx)?
+                .provenance
+                .is_some_and(|p| !p.immutable())
         {
+            // That next check is expensive, that's why we have all the guards above.
+            let is_immutable = ty.is_freeze(*ecx.tcx, ecx.typing_env());
             let place = ecx.ref_to_mplace(val)?;
-            let new_place = place.map_provenance(CtfeProvenance::as_immutable);
-            Ok(ImmTy::from_immediate(new_place.to_ref(ecx), val.layout))
+            let new_place = if is_immutable {
+                place.map_provenance(CtfeProvenance::as_immutable)
+            } else {
+                // Even if it is not immutable, remember that it is a shared reference.
+                // This allows it to become part of the final value of the constant.
+                // (See <https://github.com/rust-lang/rust/pull/128543> for why we allow this
+                // even when there is interior mutability.)
+                place.map_provenance(CtfeProvenance::as_shared_ref)
+            };
+            interp_ok(ImmTy::from_immediate(new_place.to_ref(ecx), val.layout))
         } else {
-            Ok(val.clone())
+            interp_ok(val.clone())
         }
     }
 
     fn before_memory_write(
-        tcx: TyCtxtAt<'tcx>,
-        machine: &mut Self,
+        _tcx: TyCtxtAt<'tcx>,
+        _machine: &mut Self,
         _alloc_extra: &mut Self::AllocExtra,
+        _ptr: Pointer<Option<Self::Provenance>>,
         (_alloc_id, immutable): (AllocId, bool),
         range: AllocRange,
     ) -> InterpResult<'tcx> {
         if range.size == Size::ZERO {
             // Nothing to check.
-            return Ok(());
+            return interp_ok(());
         }
         // Reject writes through immutable pointers.
         if immutable {
-            super::lint(tcx, machine, WRITES_THROUGH_IMMUTABLE_POINTER, |frames| {
-                crate::errors::WriteThroughImmutablePointer { frames }
-            });
+            return Err(ConstEvalErrKind::WriteThroughImmutablePointer).into();
         }
         // Everything else is fine.
-        Ok(())
+        interp_ok(())
     }
 
-    fn before_alloc_read(ecx: &InterpCx<'tcx, Self>, alloc_id: AllocId) -> InterpResult<'tcx> {
+    fn before_alloc_access(
+        tcx: TyCtxtAt<'tcx>,
+        machine: &Self,
+        alloc_id: AllocId,
+    ) -> InterpResult<'tcx> {
+        if machine.stack.is_empty() {
+            // Get out of the way for the final copy.
+            return interp_ok(());
+        }
         // Check if this is the currently evaluated static.
-        if Some(alloc_id) == ecx.machine.static_root_ids.map(|(id, _)| id) {
-            return Err(ConstEvalErrKind::RecursiveStatic.into());
+        if Some(alloc_id) == machine.static_root_ids.map(|(id, _)| id) {
+            return Err(ConstEvalErrKind::RecursiveStatic).into();
         }
         // If this is another static, make sure we fire off the query to detect cycles.
         // But only do that when checks for static recursion are enabled.
-        if ecx.machine.static_root_ids.is_some() {
-            if let Some(GlobalAlloc::Static(def_id)) = ecx.tcx.try_get_global_alloc(alloc_id) {
-                if ecx.tcx.is_foreign_item(def_id) {
+        if machine.static_root_ids.is_some() {
+            if let Some(GlobalAlloc::Static(def_id)) = tcx.try_get_global_alloc(alloc_id) {
+                if tcx.is_foreign_item(def_id) {
                     throw_unsup!(ExternStatic(def_id));
                 }
-                ecx.ctfe_query(|tcx| tcx.eval_static_initializer(def_id))?;
+                tcx.eval_static_initializer(def_id)?;
             }
         }
-        Ok(())
+        interp_ok(())
+    }
+
+    fn cached_union_data_range<'e>(
+        ecx: &'e mut InterpCx<'tcx, Self>,
+        ty: Ty<'tcx>,
+        compute_range: impl FnOnce() -> RangeSet,
+    ) -> Cow<'e, RangeSet> {
+        if ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks {
+            Cow::Borrowed(ecx.machine.union_data_ranges.entry(ty).or_insert_with(compute_range))
+        } else {
+            // Don't bother caching, we're only doing one validation at the end anyway.
+            Cow::Owned(compute_range())
+        }
+    }
+
+    fn get_default_alloc_params(&self) -> <Self::Bytes as mir::interpret::AllocBytes>::AllocParams {
     }
 }
 

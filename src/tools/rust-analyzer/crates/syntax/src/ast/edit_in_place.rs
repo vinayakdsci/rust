@@ -5,15 +5,15 @@ use std::iter::{empty, once, successors};
 use parser::{SyntaxKind, T};
 
 use crate::{
-    algo::{self, neighbor},
-    ast::{self, edit::IndentLevel, make, HasGenericArgs, HasGenericParams},
-    ted::{self, Position},
     AstNode, AstToken, Direction, SyntaxElement,
     SyntaxKind::{ATTR, COMMENT, WHITESPACE},
     SyntaxNode, SyntaxToken,
+    algo::{self, neighbor},
+    ast::{self, HasGenericParams, edit::IndentLevel, make},
+    ted::{self, Position},
 };
 
-use super::{GenericParam, HasArgList, HasName};
+use super::{GenericParam, HasName};
 
 pub trait GenericParamsOwnerEdit: ast::HasGenericParams {
     fn get_or_create_generic_param_list(&self) -> ast::GenericParamList;
@@ -102,6 +102,67 @@ impl GenericParamsOwnerEdit for ast::Trait {
             let position = match self.assoc_item_list() {
                 Some(items) => Position::before(items.syntax()),
                 None => Position::last_child_of(self.syntax()),
+            };
+            create_where_clause(position);
+        }
+        self.where_clause().unwrap()
+    }
+}
+
+impl GenericParamsOwnerEdit for ast::TraitAlias {
+    fn get_or_create_generic_param_list(&self) -> ast::GenericParamList {
+        match self.generic_param_list() {
+            Some(it) => it,
+            None => {
+                let position = if let Some(name) = self.name() {
+                    Position::after(name.syntax)
+                } else if let Some(trait_token) = self.trait_token() {
+                    Position::after(trait_token)
+                } else {
+                    Position::last_child_of(self.syntax())
+                };
+                create_generic_param_list(position)
+            }
+        }
+    }
+
+    fn get_or_create_where_clause(&self) -> ast::WhereClause {
+        if self.where_clause().is_none() {
+            let position = match self.semicolon_token() {
+                Some(tok) => Position::before(tok),
+                None => Position::last_child_of(self.syntax()),
+            };
+            create_where_clause(position);
+        }
+        self.where_clause().unwrap()
+    }
+}
+
+impl GenericParamsOwnerEdit for ast::TypeAlias {
+    fn get_or_create_generic_param_list(&self) -> ast::GenericParamList {
+        match self.generic_param_list() {
+            Some(it) => it,
+            None => {
+                let position = if let Some(name) = self.name() {
+                    Position::after(name.syntax)
+                } else if let Some(trait_token) = self.type_token() {
+                    Position::after(trait_token)
+                } else {
+                    Position::last_child_of(self.syntax())
+                };
+                create_generic_param_list(position)
+            }
+        }
+    }
+
+    fn get_or_create_where_clause(&self) -> ast::WhereClause {
+        if self.where_clause().is_none() {
+            let position = match self.eq_token() {
+                Some(tok) => Position::before(tok),
+                None => match self.semicolon_token() {
+                    Some(tok) => Position::before(tok),
+                    None => Position::last_child_of(self.syntax()),
+                },
             };
             create_where_clause(position);
         }
@@ -322,10 +383,10 @@ impl ast::GenericParamList {
 
 impl ast::WhereClause {
     pub fn add_predicate(&self, predicate: ast::WherePred) {
-        if let Some(pred) = self.predicates().last() {
-            if !pred.syntax().siblings_with_tokens(Direction::Next).any(|it| it.kind() == T![,]) {
-                ted::append_child_raw(self.syntax(), make::token(T![,]));
-            }
+        if let Some(pred) = self.predicates().last()
+            && !pred.syntax().siblings_with_tokens(Direction::Next).any(|it| it.kind() == T![,])
+        {
+            ted::append_child_raw(self.syntax(), make::token(T![,]));
         }
         ted::append_child(self.syntax(), predicate.syntax());
     }
@@ -345,42 +406,6 @@ impl ast::WhereClause {
     }
 }
 
-impl ast::TypeParam {
-    pub fn remove_default(&self) {
-        if let Some((eq, last)) = self
-            .syntax()
-            .children_with_tokens()
-            .find(|it| it.kind() == T![=])
-            .zip(self.syntax().last_child_or_token())
-        {
-            ted::remove_all(eq..=last);
-
-            // remove any trailing ws
-            if let Some(last) = self.syntax().last_token().filter(|it| it.kind() == WHITESPACE) {
-                last.detach();
-            }
-        }
-    }
-}
-
-impl ast::ConstParam {
-    pub fn remove_default(&self) {
-        if let Some((eq, last)) = self
-            .syntax()
-            .children_with_tokens()
-            .find(|it| it.kind() == T![=])
-            .zip(self.syntax().last_child_or_token())
-        {
-            ted::remove_all(eq..=last);
-
-            // remove any trailing ws
-            if let Some(last) = self.syntax().last_token().filter(|it| it.kind() == WHITESPACE) {
-                last.detach();
-            }
-        }
-    }
-}
-
 pub trait Removable: AstNode {
     fn remove(&self);
 }
@@ -391,34 +416,6 @@ impl Removable for ast::TypeBoundList {
             Some(colon) => ted::remove_all(colon..=self.syntax().clone().into()),
             None => ted::remove(self.syntax()),
         }
-    }
-}
-
-impl ast::PathSegment {
-    pub fn get_or_create_generic_arg_list(&self) -> ast::GenericArgList {
-        if self.generic_arg_list().is_none() {
-            let arg_list = make::generic_arg_list(empty()).clone_for_update();
-            ted::append_child(self.syntax(), arg_list.syntax());
-        }
-        self.generic_arg_list().unwrap()
-    }
-}
-
-impl ast::MethodCallExpr {
-    pub fn get_or_create_generic_arg_list(&self) -> ast::GenericArgList {
-        if self.generic_arg_list().is_none() {
-            let generic_arg_list = make::turbofish_generic_arg_list(empty()).clone_for_update();
-
-            if let Some(arg_list) = self.arg_list() {
-                ted::insert_raw(
-                    ted::Position::before(arg_list.syntax()),
-                    generic_arg_list.syntax(),
-                );
-            } else {
-                ted::append_child(self.syntax(), generic_arg_list.syntax());
-            }
-        }
-        self.generic_arg_list().unwrap()
     }
 }
 
@@ -619,7 +616,7 @@ impl Removable for ast::Use {
 impl ast::Impl {
     pub fn get_or_create_assoc_item_list(&self) -> ast::AssocItemList {
         if self.assoc_item_list().is_none() {
-            let assoc_item_list = make::assoc_item_list().clone_for_update();
+            let assoc_item_list = make::assoc_item_list(None).clone_for_update();
             ted::append_child(self.syntax(), assoc_item_list.syntax());
         }
         self.assoc_item_list().unwrap()
@@ -651,152 +648,6 @@ impl ast::AssocItemList {
             item.syntax().clone().into(),
         ];
         ted::insert_all(position, elements);
-    }
-
-    /// Adds a new associated item at the start of the associated item list.
-    ///
-    /// Attention! This function does align the first line of `item` with respect to `self`,
-    /// but it does _not_ change indentation of other lines (if any).
-    pub fn add_item_at_start(&self, item: ast::AssocItem) {
-        match self.assoc_items().next() {
-            Some(first_item) => {
-                let indent = IndentLevel::from_node(first_item.syntax());
-                let before = Position::before(first_item.syntax());
-
-                ted::insert_all(
-                    before,
-                    vec![
-                        item.syntax().clone().into(),
-                        make::tokens::whitespace(&format!("\n\n{indent}")).into(),
-                    ],
-                )
-            }
-            None => {
-                let (indent, position, whitespace) = match self.l_curly_token() {
-                    Some(l_curly) => {
-                        normalize_ws_between_braces(self.syntax());
-                        (IndentLevel::from_token(&l_curly) + 1, Position::after(&l_curly), "\n")
-                    }
-                    None => (IndentLevel::single(), Position::first_child_of(self.syntax()), ""),
-                };
-
-                let mut elements = vec![];
-
-                // Avoid pushing an empty whitespace token
-                if !indent.is_zero() || !whitespace.is_empty() {
-                    elements.push(make::tokens::whitespace(&format!("{whitespace}{indent}")).into())
-                }
-                elements.push(item.syntax().clone().into());
-
-                ted::insert_all(position, elements)
-            }
-        };
-    }
-}
-
-impl ast::Fn {
-    pub fn get_or_create_body(&self) -> ast::BlockExpr {
-        if self.body().is_none() {
-            let body = make::ext::empty_block_expr().clone_for_update();
-            match self.semicolon_token() {
-                Some(semi) => {
-                    ted::replace(semi, body.syntax());
-                    ted::insert(Position::before(body.syntax), make::tokens::single_space());
-                }
-                None => ted::append_child(self.syntax(), body.syntax()),
-            }
-        }
-        self.body().unwrap()
-    }
-}
-
-impl Removable for ast::MatchArm {
-    fn remove(&self) {
-        if let Some(sibling) = self.syntax().prev_sibling_or_token() {
-            if sibling.kind() == SyntaxKind::WHITESPACE {
-                ted::remove(sibling);
-            }
-        }
-        if let Some(sibling) = self.syntax().next_sibling_or_token() {
-            if sibling.kind() == T![,] {
-                ted::remove(sibling);
-            }
-        }
-        ted::remove(self.syntax());
-    }
-}
-
-impl ast::MatchArmList {
-    pub fn add_arm(&self, arm: ast::MatchArm) {
-        normalize_ws_between_braces(self.syntax());
-        let mut elements = Vec::new();
-        let position = match self.arms().last() {
-            Some(last_arm) => {
-                if needs_comma(&last_arm) {
-                    ted::append_child(last_arm.syntax(), make::token(SyntaxKind::COMMA));
-                }
-                Position::after(last_arm.syntax().clone())
-            }
-            None => match self.l_curly_token() {
-                Some(it) => Position::after(it),
-                None => Position::last_child_of(self.syntax()),
-            },
-        };
-        let indent = IndentLevel::from_node(self.syntax()) + 1;
-        elements.push(make::tokens::whitespace(&format!("\n{indent}")).into());
-        elements.push(arm.syntax().clone().into());
-        if needs_comma(&arm) {
-            ted::append_child(arm.syntax(), make::token(SyntaxKind::COMMA));
-        }
-        ted::insert_all(position, elements);
-
-        fn needs_comma(arm: &ast::MatchArm) -> bool {
-            arm.expr().map_or(false, |e| !e.is_block_like()) && arm.comma_token().is_none()
-        }
-    }
-}
-
-impl ast::LetStmt {
-    pub fn set_ty(&self, ty: Option<ast::Type>) {
-        match ty {
-            None => {
-                if let Some(colon_token) = self.colon_token() {
-                    ted::remove(colon_token);
-                }
-
-                if let Some(existing_ty) = self.ty() {
-                    if let Some(sibling) = existing_ty.syntax().prev_sibling_or_token() {
-                        if sibling.kind() == SyntaxKind::WHITESPACE {
-                            ted::remove(sibling);
-                        }
-                    }
-
-                    ted::remove(existing_ty.syntax());
-                }
-
-                // Remove any trailing ws
-                if let Some(last) = self.syntax().last_token().filter(|it| it.kind() == WHITESPACE)
-                {
-                    last.detach();
-                }
-            }
-            Some(new_ty) => {
-                if self.colon_token().is_none() {
-                    ted::insert_raw(
-                        Position::after(
-                            self.pat().expect("let stmt should have a pattern").syntax(),
-                        ),
-                        make::token(T![:]),
-                    );
-                }
-
-                if let Some(old_ty) = self.ty() {
-                    ted::replace(old_ty.syntax(), new_ty.syntax());
-                } else {
-                    ted::insert(Position::after(self.colon_token().unwrap()), new_ty.syntax());
-                }
-            }
-        }
     }
 }
 
@@ -844,19 +695,18 @@ impl ast::RecordExprField {
             return;
         }
         // this is a shorthand
-        if let Some(ast::Expr::PathExpr(path_expr)) = self.expr() {
-            if let Some(path) = path_expr.path() {
-                if let Some(name_ref) = path.as_single_name_ref() {
-                    path_expr.syntax().detach();
-                    let children = vec![
-                        name_ref.syntax().clone().into(),
-                        ast::make::token(T![:]).into(),
-                        ast::make::tokens::single_space().into(),
-                        expr.syntax().clone().into(),
-                    ];
-                    ted::insert_all_raw(Position::last_child_of(self.syntax()), children);
-                }
-            }
+        if let Some(ast::Expr::PathExpr(path_expr)) = self.expr()
+            && let Some(path) = path_expr.path()
+            && let Some(name_ref) = path.as_single_name_ref()
+        {
+            path_expr.syntax().detach();
+            let children = vec![
+                name_ref.syntax().clone().into(),
+                ast::make::token(T![:]).into(),
+                ast::make::tokens::single_space().into(),
+                expr.syntax().clone().into(),
+            ];
+            ted::insert_all_raw(Position::last_child_of(self.syntax()), children);
         }
     }
 }
@@ -906,30 +756,6 @@ fn get_or_insert_comma_after(syntax: &SyntaxNode) -> SyntaxToken {
             ted::insert(Position::after(syntax), &comma);
             comma
         }
-    }
-}
-
-impl ast::VariantList {
-    pub fn add_variant(&self, variant: ast::Variant) {
-        let (indent, position) = match self.variants().last() {
-            Some(last_item) => (
-                IndentLevel::from_node(last_item.syntax()),
-                Position::after(get_or_insert_comma_after(last_item.syntax())),
-            ),
-            None => match self.l_curly_token() {
-                Some(l_curly) => {
-                    normalize_ws_between_braces(self.syntax());
-                    (IndentLevel::from_token(&l_curly) + 1, Position::after(&l_curly))
-                }
-                None => (IndentLevel::single(), Position::last_child_of(self.syntax())),
-            },
-        };
-        let elements: Vec<SyntaxElement> = vec![
-            make::tokens::whitespace(&format!("{}{indent}", "\n")).into(),
-            variant.syntax().clone().into(),
-            ast::make::token(T![,]).into(),
-        ];
-        ted::insert_all(position, elements);
     }
 }
 
@@ -1055,8 +881,6 @@ mod tests {
     use std::fmt;
 
     use parser::Edition;
-    use stdx::trim_indent;
-    use test_utils::assert_eq_text;
 
     use crate::SourceFile;
 
@@ -1138,134 +962,5 @@ mod tests {
         // removing
         check("let a @ ()", "let a", None);
         check("let a @ ", "let a", None);
-    }
-
-    #[test]
-    fn test_let_stmt_set_ty() {
-        #[track_caller]
-        fn check(before: &str, expected: &str, ty: Option<ast::Type>) {
-            let ty = ty.map(|it| it.clone_for_update());
-
-            let let_stmt = ast_mut_from_text::<ast::LetStmt>(&format!("fn f() {{ {before} }}"));
-            let_stmt.set_ty(ty);
-
-            let after = ast_mut_from_text::<ast::LetStmt>(&format!("fn f() {{ {expected} }}"));
-            assert_eq!(let_stmt.to_string(), after.to_string(), "{let_stmt:#?}\n!=\n{after:#?}");
-        }
-
-        // adding
-        check("let a;", "let a: ();", Some(make::ty_tuple([])));
-        // no semicolon due to it being eaten during error recovery
-        check("let a:", "let a: ()", Some(make::ty_tuple([])));
-
-        // replacing
-        check("let a: u8;", "let a: ();", Some(make::ty_tuple([])));
-        check("let a: u8 = 3;", "let a: () = 3;", Some(make::ty_tuple([])));
-        check("let a: = 3;", "let a: () = 3;", Some(make::ty_tuple([])));
-
-        // removing
-        check("let a: u8;", "let a;", None);
-        check("let a:;", "let a;", None);
-
-        check("let a: u8 = 3;", "let a = 3;", None);
-        check("let a: = 3;", "let a = 3;", None);
-    }
-
-    #[test]
-    fn add_variant_to_empty_enum() {
-        let variant = make::variant(make::name("Bar"), None).clone_for_update();
-
-        check_add_variant(
-            r#"
-enum Foo {}
-"#,
-            r#"
-enum Foo {
-    Bar,
-}
-"#,
-            variant,
-        );
-    }
-
-    #[test]
-    fn add_variant_to_non_empty_enum() {
-        let variant = make::variant(make::name("Baz"), None).clone_for_update();
-
-        check_add_variant(
-            r#"
-enum Foo {
-    Bar,
-}
-"#,
-            r#"
-enum Foo {
-    Bar,
-    Baz,
-}
-"#,
-            variant,
-        );
-    }
-
-    #[test]
-    fn add_variant_with_tuple_field_list() {
-        let variant = make::variant(
-            make::name("Baz"),
-            Some(ast::FieldList::TupleFieldList(make::tuple_field_list(std::iter::once(
-                make::tuple_field(None, make::ty("bool")),
-            )))),
-        )
-        .clone_for_update();
-
-        check_add_variant(
-            r#"
-enum Foo {
-    Bar,
-}
-"#,
-            r#"
-enum Foo {
-    Bar,
-    Baz(bool),
-}
-"#,
-            variant,
-        );
-    }
-
-    #[test]
-    fn add_variant_with_record_field_list() {
-        let variant = make::variant(
-            make::name("Baz"),
-            Some(ast::FieldList::RecordFieldList(make::record_field_list(std::iter::once(
-                make::record_field(None, make::name("x"), make::ty("bool")),
-            )))),
-        )
-        .clone_for_update();
-
-        check_add_variant(
-            r#"
-enum Foo {
-    Bar,
-}
-"#,
-            r#"
-enum Foo {
-    Bar,
-    Baz { x: bool },
-}
-"#,
-            variant,
-        );
-    }
-
-    fn check_add_variant(before: &str, expected: &str, variant: ast::Variant) {
-        let enum_ = ast_mut_from_text::<ast::Enum>(before);
-        if let Some(it) = enum_.variant_list() {
-            it.add_variant(variant)
-        }
-        let after = enum_.to_string();
-        assert_eq_text!(&trim_indent(expected.trim()), &trim_indent(after.trim()));
     }
 }

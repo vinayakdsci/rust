@@ -24,25 +24,43 @@
 //!
 //! ## Memory model for atomic accesses
 //!
-//! Rust atomics currently follow the same rules as [C++20 atomics][cpp], specifically `atomic_ref`.
-//! Basically, creating a *shared reference* to one of the Rust atomic types corresponds to creating
-//! an `atomic_ref` in C++; the `atomic_ref` is destroyed when the lifetime of the shared reference
-//! ends. A Rust atomic type that is exclusively owned or behind a mutable reference does *not*
-//! correspond to an “atomic object” in C++, since the underlying primitive can be mutably accessed,
-//! for example with `get_mut`, to perform non-atomic operations.
+//! Rust atomics currently follow the same rules as [C++20 atomics][cpp], specifically the rules
+//! from the [`intro.races`][cpp-intro.races] section, without the "consume" memory ordering. Since
+//! C++ uses an object-based memory model whereas Rust is access-based, a bit of translation work
+//! has to be done to apply the C++ rules to Rust: whenever C++ talks about "the value of an
+//! object", we understand that to mean the resulting bytes obtained when doing a read. When the C++
+//! standard talks about "the value of an atomic object", this refers to the result of doing an
+//! atomic load (via the operations provided in this module). A "modification of an atomic object"
+//! refers to an atomic store.
+//!
+//! The end result is *almost* equivalent to saying that creating a *shared reference* to one of the
+//! Rust atomic types corresponds to creating an `atomic_ref` in C++, with the `atomic_ref` being
+//! destroyed when the lifetime of the shared reference ends. The main difference is that Rust
+//! permits concurrent atomic and non-atomic reads to the same memory as those cause no issue in the
+//! C++ memory model, they are just forbidden in C++ because memory is partitioned into "atomic
+//! objects" and "non-atomic objects" (with `atomic_ref` temporarily converting a non-atomic object
+//! into an atomic object).
+//!
+//! The most important aspect of this model is that *data races* are undefined behavior. A data race
+//! is defined as conflicting non-synchronized accesses where at least one of the accesses is
+//! non-atomic. Here, accesses are *conflicting* if they affect overlapping regions of memory and at
+//! least one of them is a write. (A `compare_exchange` or `compare_exchange_weak` that does not
+//! succeed is not considered a write.) They are *non-synchronized* if neither of them
+//! *happens-before* the other, according to the happens-before order of the memory model.
+//!
+//! The other possible cause of undefined behavior in the memory model are mixed-size accesses: Rust
+//! inherits the C++ limitation that non-synchronized conflicting atomic accesses may not partially
+//! overlap. In other words, every pair of non-synchronized atomic accesses must be either disjoint,
+//! access the exact same memory (including using the same access size), or both be reads.
+//!
+//! Each atomic access takes an [`Ordering`] which defines how the operation interacts with the
+//! happens-before order. These orderings behave the same as the corresponding [C++20 atomic
+//! orderings][cpp_memory_order]. For more information, see the [nomicon].
 //!
 //! [cpp]: https://en.cppreference.com/w/cpp/atomic
-//!
-//! Each method takes an [`Ordering`] which represents the strength of
-//! the memory barrier for that operation. These orderings are the
-//! same as the [C++20 atomic orderings][1]. For more information see the [nomicon][2].
-//!
-//! [1]: https://en.cppreference.com/w/cpp/atomic/memory_order
-//! [2]: ../../../nomicon/atomics.html
-//!
-//! Since C++ does not support mixing atomic and non-atomic accesses, or non-synchronized
-//! different-sized accesses to the same data, Rust does not support those operations either.
-//! Note that both of those restrictions only apply if the accesses are non-synchronized.
+//! [cpp-intro.races]: https://timsong-cpp.github.io/cppwp/n4868/intro.multithread#intro.races
+//! [cpp_memory_order]: https://en.cppreference.com/w/cpp/atomic/memory_order
+//! [nomicon]: ../../../nomicon/atomics.html
 //!
 //! ```rust,no_run undefined_behavior
 //! use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
@@ -52,27 +70,29 @@
 //! let atomic = AtomicU16::new(0);
 //!
 //! thread::scope(|s| {
-//!     // This is UB: mixing atomic and non-atomic accesses
-//!     s.spawn(|| atomic.store(1, Ordering::Relaxed));
-//!     s.spawn(|| unsafe { atomic.as_ptr().write(2) });
+//!     // This is UB: conflicting non-synchronized accesses, at least one of which is non-atomic.
+//!     s.spawn(|| atomic.store(1, Ordering::Relaxed)); // atomic store
+//!     s.spawn(|| unsafe { atomic.as_ptr().write(2) }); // non-atomic write
 //! });
 //!
 //! thread::scope(|s| {
-//!     // This is UB: even reads are not allowed to be mixed
-//!     s.spawn(|| atomic.load(Ordering::Relaxed));
-//!     s.spawn(|| unsafe { atomic.as_ptr().read() });
+//!     // This is fine: the accesses do not conflict (as none of them performs any modification).
+//!     // In C++ this would be disallowed since creating an `atomic_ref` precludes
+//!     // further non-atomic accesses, but Rust does not have that limitation.
+//!     s.spawn(|| atomic.load(Ordering::Relaxed)); // atomic load
+//!     s.spawn(|| unsafe { atomic.as_ptr().read() }); // non-atomic read
 //! });
 //!
 //! thread::scope(|s| {
-//!     // This is fine, `join` synchronizes the code in a way such that atomic
-//!     // and non-atomic accesses can't happen "at the same time"
-//!     let handle = s.spawn(|| atomic.store(1, Ordering::Relaxed));
-//!     handle.join().unwrap();
-//!     s.spawn(|| unsafe { atomic.as_ptr().write(2) });
+//!     // This is fine: `join` synchronizes the code in a way such that the atomic
+//!     // store happens-before the non-atomic write.
+//!     let handle = s.spawn(|| atomic.store(1, Ordering::Relaxed)); // atomic store
+//!     handle.join().expect("thread won't panic"); // synchronize
+//!     s.spawn(|| unsafe { atomic.as_ptr().write(2) }); // non-atomic write
 //! });
 //!
 //! thread::scope(|s| {
-//!     // This is UB: using different-sized atomic accesses to the same data
+//!     // This is UB: non-synchronized conflicting differently-sized atomic accesses.
 //!     s.spawn(|| atomic.store(1, Ordering::Relaxed));
 //!     s.spawn(|| unsafe {
 //!         let differently_sized = transmute::<&AtomicU16, &AtomicU8>(&atomic);
@@ -81,10 +101,10 @@
 //! });
 //!
 //! thread::scope(|s| {
-//!     // This is fine, `join` synchronizes the code in a way such that
-//!     // differently-sized accesses can't happen "at the same time"
+//!     // This is fine: `join` synchronizes the code in a way such that
+//!     // the 1-byte store happens-before the 2-byte store.
 //!     let handle = s.spawn(|| atomic.store(1, Ordering::Relaxed));
-//!     handle.join().unwrap();
+//!     handle.join().expect("thread won't panic");
 //!     s.spawn(|| unsafe {
 //!         let differently_sized = transmute::<&AtomicU16, &AtomicU8>(&atomic);
 //!         differently_sized.store(2, Ordering::Relaxed);
@@ -137,7 +157,7 @@
 //!
 //! # Atomic accesses to read-only memory
 //!
-//! In general, *all* atomic accesses on read-only memory are Undefined Behavior. For instance, attempting
+//! In general, *all* atomic accesses on read-only memory are undefined behavior. For instance, attempting
 //! to do a `compare_exchange` that will definitely fail (making it conceptually a read-only
 //! operation) can still cause a segmentation fault if the underlying memory page is mapped read-only. Since
 //! atomic `load`s might be implemented using compare-exchange operations, even a `load` can fault
@@ -153,12 +173,12 @@
 //!
 //! As an exception from the general rule stated above, "sufficiently small" atomic loads with
 //! `Ordering::Relaxed` are implemented in a way that works on read-only memory, and are hence not
-//! Undefined Behavior. The exact size limit for what makes a load "sufficiently small" varies
+//! undefined behavior. The exact size limit for what makes a load "sufficiently small" varies
 //! depending on the target:
 //!
 //! | `target_arch` | Size limit |
 //! |---------------|---------|
-//! | `x86`, `arm`, `mips`, `mips32r6`, `powerpc`, `riscv32`, `sparc`, `hexagon` | 4 bytes |
+//! | `x86`, `arm`, `loongarch32`, `mips`, `mips32r6`, `powerpc`, `riscv32`, `sparc`, `hexagon` | 4 bytes |
 //! | `x86_64`, `aarch64`, `loongarch64`, `mips64`, `mips64r6`, `powerpc64`, `riscv64`, `sparc64`, `s390x` | 8 bytes |
 //!
 //! Atomics loads that are larger than this limit as well as atomic loads with ordering other
@@ -173,7 +193,7 @@
 //!
 //! A simple spinlock:
 //!
-//! ```
+//! ```ignore-wasm
 //! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicUsize, Ordering};
 //! use std::{hint, thread};
@@ -223,12 +243,104 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use self::Ordering::*;
-
 use crate::cell::UnsafeCell;
-use crate::fmt;
-use crate::intrinsics;
-
 use crate::hint::spin_loop;
+use crate::intrinsics::AtomicOrdering as AO;
+use crate::{fmt, intrinsics};
+
+trait Sealed {}
+
+/// A marker trait for primitive types which can be modified atomically.
+///
+/// This is an implementation detail for <code>[Atomic]\<T></code> which may disappear or be replaced at any time.
+///
+/// # Safety
+///
+/// Types implementing this trait must be primitives that can be modified atomically.
+///
+/// The associated `Self::AtomicInner` type must have the same size and bit validity as `Self`,
+/// but may have a higher alignment requirement, so the following `transmute`s are sound:
+///
+/// - `&mut Self::AtomicInner` as `&mut Self`
+/// - `Self` as `Self::AtomicInner` or the reverse
+#[unstable(
+    feature = "atomic_internals",
+    reason = "implementation detail which may disappear or be replaced at any time",
+    issue = "none"
+)]
+#[expect(private_bounds)]
+pub unsafe trait AtomicPrimitive: Sized + Copy + Sealed {
+    /// Temporary implementation detail.
+    type AtomicInner: Sized;
+}
+
+macro impl_atomic_primitive(
+    $Atom:ident $(<$T:ident>)? ($Primitive:ty),
+    size($size:literal),
+    align($align:literal) $(,)?
+) {
+    impl $(<$T>)? Sealed for $Primitive {}
+
+    #[unstable(
+        feature = "atomic_internals",
+        reason = "implementation detail which may disappear or be replaced at any time",
+        issue = "none"
+    )]
+    #[cfg(target_has_atomic_load_store = $size)]
+    unsafe impl $(<$T>)? AtomicPrimitive for $Primitive {
+        type AtomicInner = $Atom $(<$T>)?;
+    }
+}
+
+impl_atomic_primitive!(AtomicBool(bool), size("8"), align(1));
+impl_atomic_primitive!(AtomicI8(i8), size("8"), align(1));
+impl_atomic_primitive!(AtomicU8(u8), size("8"), align(1));
+impl_atomic_primitive!(AtomicI16(i16), size("16"), align(2));
+impl_atomic_primitive!(AtomicU16(u16), size("16"), align(2));
+impl_atomic_primitive!(AtomicI32(i32), size("32"), align(4));
+impl_atomic_primitive!(AtomicU32(u32), size("32"), align(4));
+impl_atomic_primitive!(AtomicI64(i64), size("64"), align(8));
+impl_atomic_primitive!(AtomicU64(u64), size("64"), align(8));
+impl_atomic_primitive!(AtomicI128(i128), size("128"), align(16));
+impl_atomic_primitive!(AtomicU128(u128), size("128"), align(16));
+
+#[cfg(target_pointer_width = "16")]
+impl_atomic_primitive!(AtomicIsize(isize), size("ptr"), align(2));
+#[cfg(target_pointer_width = "32")]
+impl_atomic_primitive!(AtomicIsize(isize), size("ptr"), align(4));
+#[cfg(target_pointer_width = "64")]
+impl_atomic_primitive!(AtomicIsize(isize), size("ptr"), align(8));
+
+#[cfg(target_pointer_width = "16")]
+impl_atomic_primitive!(AtomicUsize(usize), size("ptr"), align(2));
+#[cfg(target_pointer_width = "32")]
+impl_atomic_primitive!(AtomicUsize(usize), size("ptr"), align(4));
+#[cfg(target_pointer_width = "64")]
+impl_atomic_primitive!(AtomicUsize(usize), size("ptr"), align(8));
+
+#[cfg(target_pointer_width = "16")]
+impl_atomic_primitive!(AtomicPtr<T>(*mut T), size("ptr"), align(2));
+#[cfg(target_pointer_width = "32")]
+impl_atomic_primitive!(AtomicPtr<T>(*mut T), size("ptr"), align(4));
+#[cfg(target_pointer_width = "64")]
+impl_atomic_primitive!(AtomicPtr<T>(*mut T), size("ptr"), align(8));
+
+/// A memory location which can be safely modified from multiple threads.
+///
+/// This has the same size and bit validity as the underlying type `T`. However,
+/// the alignment of this type is always equal to its size, even on targets where
+/// `T` has alignment less than its size.
+///
+/// For more about the differences between atomic types and non-atomic types as
+/// well as information about the portability of this type, please see the
+/// [module-level documentation].
+///
+/// **Note:** This type is only available on platforms that support atomic loads
+/// and stores of `T`.
+///
+/// [module-level documentation]: crate::sync::atomic
+#[unstable(feature = "generic_atomic", issue = "130539")]
+pub type Atomic<T> = <T as AtomicPrimitive>::AtomicInner;
 
 // Some architectures don't have byte-sized atomics, which results in LLVM
 // emulating them using a LL/SC loop. However for AtomicBool we can take
@@ -238,8 +350,12 @@ use crate::hint::spin_loop;
 // This list should only contain architectures which have word-sized atomic-or/
 // atomic-and instructions but don't natively support byte-sized atomics.
 #[cfg(target_has_atomic = "8")]
-const EMULATE_ATOMIC_BOOL: bool =
-    cfg!(any(target_arch = "riscv32", target_arch = "riscv64", target_arch = "loongarch64"));
+const EMULATE_ATOMIC_BOOL: bool = cfg!(any(
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch32",
+    target_arch = "loongarch64"
+));
 
 /// A boolean type which can be safely shared between threads.
 ///
@@ -278,7 +394,7 @@ unsafe impl Sync for AtomicBool {}
 /// loads and stores of pointers. Its size depends on the target pointer's size.
 #[cfg(target_has_atomic_load_store = "ptr")]
 #[stable(feature = "rust1", since = "1.0.0")]
-#[cfg_attr(not(test), rustc_diagnostic_item = "AtomicPtr")]
+#[rustc_diagnostic_item = "AtomicPtr"]
 #[cfg_attr(target_pointer_width = "16", repr(C, align(2)))]
 #[cfg_attr(target_pointer_width = "32", repr(C, align(4)))]
 #[cfg_attr(target_pointer_width = "64", repr(C, align(8)))]
@@ -447,13 +563,14 @@ impl AtomicBool {
     ///   `align_of::<AtomicBool>() == 1`).
     /// * `ptr` must be [valid] for both reads and writes for the whole lifetime `'a`.
     /// * You must adhere to the [Memory model for atomic accesses]. In particular, it is not
-    ///   allowed to mix atomic and non-atomic accesses, or atomic accesses of different sizes,
-    ///   without synchronization.
+    ///   allowed to mix conflicting atomic and non-atomic accesses, or atomic accesses of different
+    ///   sizes, without synchronization.
     ///
     /// [valid]: crate::ptr#safety
     /// [Memory model for atomic accesses]: self#memory-model-for-atomic-accesses
+    #[inline]
     #[stable(feature = "atomic_from_ptr", since = "1.75.0")]
-    #[rustc_const_unstable(feature = "const_atomic_from_ptr", issue = "108652")]
+    #[rustc_const_stable(feature = "const_atomic_from_ptr", since = "1.84.0")]
     pub const unsafe fn from_ptr<'a>(ptr: *mut bool) -> &'a AtomicBool {
         // SAFETY: guaranteed by the caller
         unsafe { &*ptr.cast() }
@@ -481,7 +598,7 @@ impl AtomicBool {
         unsafe { &mut *(self.v.get() as *mut bool) }
     }
 
-    /// Get atomic access to a `&mut bool`.
+    /// Gets atomic access to a `&mut bool`.
     ///
     /// # Examples
     ///
@@ -503,14 +620,14 @@ impl AtomicBool {
         unsafe { &mut *(v as *mut bool as *mut Self) }
     }
 
-    /// Get non-atomic access to a `&mut [AtomicBool]` slice.
+    /// Gets non-atomic access to a `&mut [AtomicBool]` slice.
     ///
     /// This is safe because the mutable reference guarantees that no other threads are
     /// concurrently accessing the atomic data.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore-wasm
     /// #![feature(atomic_from_mut)]
     /// use std::sync::atomic::{AtomicBool, Ordering};
     ///
@@ -537,11 +654,11 @@ impl AtomicBool {
         unsafe { &mut *(this as *mut [Self] as *mut [bool]) }
     }
 
-    /// Get atomic access to a `&mut [bool]` slice.
+    /// Gets atomic access to a `&mut [bool]` slice.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```rust,ignore-wasm
     /// #![feature(atomic_from_mut)]
     /// use std::sync::atomic::{AtomicBool, Ordering};
     ///
@@ -580,7 +697,7 @@ impl AtomicBool {
     #[stable(feature = "atomic_access", since = "1.15.0")]
     #[rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0")]
     pub const fn into_inner(self) -> bool {
-        self.v.primitive_into_inner() != 0
+        self.v.into_inner() != 0
     }
 
     /// Loads a value from the bool.
@@ -700,6 +817,12 @@ impl AtomicBool {
     /// AcqRel   | AcqRel  | Acquire
     /// SeqCst   | SeqCst  | SeqCst
     ///
+    /// `compare_and_swap` and `compare_exchange` also differ in their return type. You can use
+    /// `compare_exchange(...).unwrap_or_else(|x| x)` to recover the behavior of `compare_and_swap`,
+    /// but in most cases it is more idiomatic to check whether the return value is `Ok` or `Err`
+    /// rather than to infer success vs failure based on the value that was read.
+    ///
+    /// During migration, consider whether it makes sense to use `compare_exchange_weak` instead.
     /// `compare_exchange_weak` is allowed to fail spuriously even when the comparison succeeds,
     /// which allows the compiler to generate better assembly code when the compare and swap
     /// is used in a loop.
@@ -768,6 +891,19 @@ impl AtomicBool {
     ///            Err(false));
     /// assert_eq!(some_bool.load(Ordering::Relaxed), false);
     /// ```
+    ///
+    /// # Considerations
+    ///
+    /// `compare_exchange` is a [compare-and-swap operation] and thus exhibits the usual downsides
+    /// of CAS operations. In particular, a load of the value followed by a successful
+    /// `compare_exchange` with the previous load *does not ensure* that other threads have not
+    /// changed the value in the interim. This is usually important when the *equality* check in
+    /// the `compare_exchange` is being used to check the *identity* of a value, but equality
+    /// does not necessarily imply identity. In this case, `compare_exchange` can lead to the
+    /// [ABA problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
     #[inline]
     #[stable(feature = "extended_compare_and_swap", since = "1.10.0")]
     #[doc(alias = "compare_and_swap")]
@@ -850,6 +986,19 @@ impl AtomicBool {
     ///     }
     /// }
     /// ```
+    ///
+    /// # Considerations
+    ///
+    /// `compare_exchange` is a [compare-and-swap operation] and thus exhibits the usual downsides
+    /// of CAS operations. In particular, a load of the value followed by a successful
+    /// `compare_exchange` with the previous load *does not ensure* that other threads have not
+    /// changed the value in the interim. This is usually important when the *equality* check in
+    /// the `compare_exchange` is being used to check the *identity* of a value, but equality
+    /// does not necessarily imply identity. In this case, `compare_exchange` can lead to the
+    /// [ABA problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
     #[inline]
     #[stable(feature = "extended_compare_and_swap", since = "1.10.0")]
     #[doc(alias = "compare_and_swap")]
@@ -1080,7 +1229,7 @@ impl AtomicBool {
     /// assert_eq!(foo.load(Ordering::SeqCst), true);
     /// ```
     #[inline]
-    #[stable(feature = "atomic_bool_fetch_not", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "atomic_bool_fetch_not", since = "1.81.0")]
     #[cfg(target_has_atomic = "8")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_not(&self, order: Ordering) -> bool {
@@ -1096,8 +1245,8 @@ impl AtomicBool {
     /// Returning an `*mut` pointer from a shared reference to this atomic is safe because the
     /// atomic types work with interior mutability. All modifications of an atomic change the value
     /// through a shared reference, and can do so safely as long as they use atomic operations. Any
-    /// use of the returned raw pointer requires an `unsafe` block and still has to uphold the same
-    /// restriction: operations on it must be atomic.
+    /// use of the returned raw pointer requires an `unsafe` block and still has to uphold the
+    /// requirements of the [memory model].
     ///
     /// # Examples
     ///
@@ -1115,6 +1264,8 @@ impl AtomicBool {
     /// }
     /// # }
     /// ```
+    ///
+    /// [memory model]: self#memory-model-for-atomic-accesses
     #[inline]
     #[stable(feature = "atomic_as_ptr", since = "1.70.0")]
     #[rustc_const_stable(feature = "atomic_as_ptr", since = "1.70.0")]
@@ -1148,11 +1299,14 @@ impl AtomicBool {
     ///
     /// # Considerations
     ///
-    /// This method is not magic;  it is not provided by the hardware.
-    /// It is implemented in terms of [`AtomicBool::compare_exchange_weak`], and suffers from the same drawbacks.
-    /// In particular, this method will not circumvent the [ABA Problem].
+    /// This method is not magic; it is not provided by the hardware, and does not act like a
+    /// critical section or mutex.
+    ///
+    /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+    /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem].
     ///
     /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
     ///
     /// # Examples
     ///
@@ -1186,6 +1340,131 @@ impl AtomicBool {
             }
         }
         Err(prev)
+    }
+
+    /// Fetches the value, and applies a function to it that returns an optional
+    /// new value. Returns a `Result` of `Ok(previous_value)` if the function
+    /// returned `Some(_)`, else `Err(previous_value)`.
+    ///
+    /// See also: [`update`](`AtomicBool::update`).
+    ///
+    /// Note: This may call the function multiple times if the value has been
+    /// changed from other threads in the meantime, as long as the function
+    /// returns `Some(_)`, but the function will have been applied only once to
+    /// the stored value.
+    ///
+    /// `try_update` takes two [`Ordering`] arguments to describe the memory
+    /// ordering of this operation. The first describes the required ordering for
+    /// when the operation finally succeeds while the second describes the
+    /// required ordering for loads. These correspond to the success and failure
+    /// orderings of [`AtomicBool::compare_exchange`] respectively.
+    ///
+    /// Using [`Acquire`] as success ordering makes the store part of this
+    /// operation [`Relaxed`], and using [`Release`] makes the final successful
+    /// load [`Relaxed`]. The (failed) load ordering can only be [`SeqCst`],
+    /// [`Acquire`] or [`Relaxed`].
+    ///
+    /// **Note:** This method is only available on platforms that support atomic
+    /// operations on `u8`.
+    ///
+    /// # Considerations
+    ///
+    /// This method is not magic; it is not provided by the hardware, and does not act like a
+    /// critical section or mutex.
+    ///
+    /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+    /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(atomic_try_update)]
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    ///
+    /// let x = AtomicBool::new(false);
+    /// assert_eq!(x.try_update(Ordering::SeqCst, Ordering::SeqCst, |_| None), Err(false));
+    /// assert_eq!(x.try_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(!x)), Ok(false));
+    /// assert_eq!(x.try_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(!x)), Ok(true));
+    /// assert_eq!(x.load(Ordering::SeqCst), false);
+    /// ```
+    #[inline]
+    #[unstable(feature = "atomic_try_update", issue = "135894")]
+    #[cfg(target_has_atomic = "8")]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    pub fn try_update(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: impl FnMut(bool) -> Option<bool>,
+    ) -> Result<bool, bool> {
+        // FIXME(atomic_try_update): this is currently an unstable alias to `fetch_update`;
+        //      when stabilizing, turn `fetch_update` into a deprecated alias to `try_update`.
+        self.fetch_update(set_order, fetch_order, f)
+    }
+
+    /// Fetches the value, applies a function to it that it return a new value.
+    /// The new value is stored and the old value is returned.
+    ///
+    /// See also: [`try_update`](`AtomicBool::try_update`).
+    ///
+    /// Note: This may call the function multiple times if the value has been changed from other threads in
+    /// the meantime, but the function will have been applied only once to the stored value.
+    ///
+    /// `update` takes two [`Ordering`] arguments to describe the memory
+    /// ordering of this operation. The first describes the required ordering for
+    /// when the operation finally succeeds while the second describes the
+    /// required ordering for loads. These correspond to the success and failure
+    /// orderings of [`AtomicBool::compare_exchange`] respectively.
+    ///
+    /// Using [`Acquire`] as success ordering makes the store part
+    /// of this operation [`Relaxed`], and using [`Release`] makes the final successful load
+    /// [`Relaxed`]. The (failed) load ordering can only be [`SeqCst`], [`Acquire`] or [`Relaxed`].
+    ///
+    /// **Note:** This method is only available on platforms that support atomic operations on `u8`.
+    ///
+    /// # Considerations
+    ///
+    /// This method is not magic; it is not provided by the hardware, and does not act like a
+    /// critical section or mutex.
+    ///
+    /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+    /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(atomic_try_update)]
+    ///
+    /// use std::sync::atomic::{AtomicBool, Ordering};
+    ///
+    /// let x = AtomicBool::new(false);
+    /// assert_eq!(x.update(Ordering::SeqCst, Ordering::SeqCst, |x| !x), false);
+    /// assert_eq!(x.update(Ordering::SeqCst, Ordering::SeqCst, |x| !x), true);
+    /// assert_eq!(x.load(Ordering::SeqCst), false);
+    /// ```
+    #[inline]
+    #[unstable(feature = "atomic_try_update", issue = "135894")]
+    #[cfg(target_has_atomic = "8")]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    pub fn update(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        mut f: impl FnMut(bool) -> bool,
+    ) -> bool {
+        let mut prev = self.load(fetch_order);
+        loop {
+            match self.compare_exchange_weak(prev, f(prev), set_order, fetch_order) {
+                Ok(x) => break x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
     }
 }
 
@@ -1242,13 +1521,14 @@ impl<T> AtomicPtr<T> {
     ///   can be bigger than `align_of::<*mut T>()`).
     /// * `ptr` must be [valid] for both reads and writes for the whole lifetime `'a`.
     /// * You must adhere to the [Memory model for atomic accesses]. In particular, it is not
-    ///   allowed to mix atomic and non-atomic accesses, or atomic accesses of different sizes,
-    ///   without synchronization.
+    ///   allowed to mix conflicting atomic and non-atomic accesses, or atomic accesses of different
+    ///   sizes, without synchronization.
     ///
     /// [valid]: crate::ptr#safety
     /// [Memory model for atomic accesses]: self#memory-model-for-atomic-accesses
+    #[inline]
     #[stable(feature = "atomic_from_ptr", since = "1.75.0")]
-    #[rustc_const_unstable(feature = "const_atomic_from_ptr", issue = "108652")]
+    #[rustc_const_stable(feature = "const_atomic_from_ptr", since = "1.84.0")]
     pub const unsafe fn from_ptr<'a>(ptr: *mut *mut T) -> &'a AtomicPtr<T> {
         // SAFETY: guaranteed by the caller
         unsafe { &*ptr.cast() }
@@ -1276,7 +1556,7 @@ impl<T> AtomicPtr<T> {
         self.p.get_mut()
     }
 
-    /// Get atomic access to a pointer.
+    /// Gets atomic access to a pointer.
     ///
     /// # Examples
     ///
@@ -1303,14 +1583,14 @@ impl<T> AtomicPtr<T> {
         unsafe { &mut *(v as *mut *mut T as *mut Self) }
     }
 
-    /// Get non-atomic access to a `&mut [AtomicPtr]` slice.
+    /// Gets non-atomic access to a `&mut [AtomicPtr]` slice.
     ///
     /// This is safe because the mutable reference guarantees that no other threads are
     /// concurrently accessing the atomic data.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore-wasm
     /// #![feature(atomic_from_mut)]
     /// use std::ptr::null_mut;
     /// use std::sync::atomic::{AtomicPtr, Ordering};
@@ -1343,11 +1623,11 @@ impl<T> AtomicPtr<T> {
         unsafe { &mut *(this as *mut [Self] as *mut [*mut T]) }
     }
 
-    /// Get atomic access to a slice of pointers.
+    /// Gets atomic access to a slice of pointers.
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore-wasm
     /// #![feature(atomic_from_mut)]
     /// use std::ptr::null_mut;
     /// use std::sync::atomic::{AtomicPtr, Ordering};
@@ -1397,7 +1677,7 @@ impl<T> AtomicPtr<T> {
     #[stable(feature = "atomic_access", since = "1.15.0")]
     #[rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0")]
     pub const fn into_inner(self) -> *mut T {
-        self.p.primitive_into_inner()
+        self.p.into_inner()
     }
 
     /// Loads a value from the pointer.
@@ -1516,6 +1796,12 @@ impl<T> AtomicPtr<T> {
     /// AcqRel   | AcqRel  | Acquire
     /// SeqCst   | SeqCst  | SeqCst
     ///
+    /// `compare_and_swap` and `compare_exchange` also differ in their return type. You can use
+    /// `compare_exchange(...).unwrap_or_else(|x| x)` to recover the behavior of `compare_and_swap`,
+    /// but in most cases it is more idiomatic to check whether the return value is `Ok` or `Err`
+    /// rather than to infer success vs failure based on the value that was read.
+    ///
+    /// During migration, consider whether it makes sense to use `compare_exchange_weak` instead.
     /// `compare_exchange_weak` is allowed to fail spuriously even when the comparison succeeds,
     /// which allows the compiler to generate better assembly code when the compare and swap
     /// is used in a loop.
@@ -1576,6 +1862,20 @@ impl<T> AtomicPtr<T> {
     /// let value = some_ptr.compare_exchange(ptr, other_ptr,
     ///                                       Ordering::SeqCst, Ordering::Relaxed);
     /// ```
+    ///
+    /// # Considerations
+    ///
+    /// `compare_exchange` is a [compare-and-swap operation] and thus exhibits the usual downsides
+    /// of CAS operations. In particular, a load of the value followed by a successful
+    /// `compare_exchange` with the previous load *does not ensure* that other threads have not
+    /// changed the value in the interim. This is usually important when the *equality* check in
+    /// the `compare_exchange` is being used to check the *identity* of a value, but equality
+    /// does not necessarily imply identity. This is a particularly common case for pointers, as
+    /// a pointer holding the same address does not imply that the same object exists at that
+    /// address! In this case, `compare_exchange` can lead to the [ABA problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
     #[inline]
     #[stable(feature = "extended_compare_and_swap", since = "1.10.0")]
     #[cfg(target_has_atomic = "ptr")]
@@ -1625,6 +1925,20 @@ impl<T> AtomicPtr<T> {
     ///     }
     /// }
     /// ```
+    ///
+    /// # Considerations
+    ///
+    /// `compare_exchange` is a [compare-and-swap operation] and thus exhibits the usual downsides
+    /// of CAS operations. In particular, a load of the value followed by a successful
+    /// `compare_exchange` with the previous load *does not ensure* that other threads have not
+    /// changed the value in the interim. This is usually important when the *equality* check in
+    /// the `compare_exchange` is being used to check the *identity* of a value, but equality
+    /// does not necessarily imply identity. This is a particularly common case for pointers, as
+    /// a pointer holding the same address does not imply that the same object exists at that
+    /// address! In this case, `compare_exchange` can lead to the [ABA problem].
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
     #[inline]
     #[stable(feature = "extended_compare_and_swap", since = "1.10.0")]
     #[cfg(target_has_atomic = "ptr")]
@@ -1668,11 +1982,15 @@ impl<T> AtomicPtr<T> {
     ///
     /// # Considerations
     ///
-    /// This method is not magic;  it is not provided by the hardware.
-    /// It is implemented in terms of [`AtomicPtr::compare_exchange_weak`], and suffers from the same drawbacks.
-    /// In particular, this method will not circumvent the [ABA Problem].
+    /// This method is not magic; it is not provided by the hardware, and does not act like a
+    /// critical section or mutex.
+    ///
+    /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+    /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem],
+    /// which is a particularly common pitfall for pointers!
     ///
     /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
     ///
     /// # Examples
     ///
@@ -1716,6 +2034,145 @@ impl<T> AtomicPtr<T> {
         }
         Err(prev)
     }
+    /// Fetches the value, and applies a function to it that returns an optional
+    /// new value. Returns a `Result` of `Ok(previous_value)` if the function
+    /// returned `Some(_)`, else `Err(previous_value)`.
+    ///
+    /// See also: [`update`](`AtomicPtr::update`).
+    ///
+    /// Note: This may call the function multiple times if the value has been
+    /// changed from other threads in the meantime, as long as the function
+    /// returns `Some(_)`, but the function will have been applied only once to
+    /// the stored value.
+    ///
+    /// `try_update` takes two [`Ordering`] arguments to describe the memory
+    /// ordering of this operation. The first describes the required ordering for
+    /// when the operation finally succeeds while the second describes the
+    /// required ordering for loads. These correspond to the success and failure
+    /// orderings of [`AtomicPtr::compare_exchange`] respectively.
+    ///
+    /// Using [`Acquire`] as success ordering makes the store part of this
+    /// operation [`Relaxed`], and using [`Release`] makes the final successful
+    /// load [`Relaxed`]. The (failed) load ordering can only be [`SeqCst`],
+    /// [`Acquire`] or [`Relaxed`].
+    ///
+    /// **Note:** This method is only available on platforms that support atomic
+    /// operations on pointers.
+    ///
+    /// # Considerations
+    ///
+    /// This method is not magic; it is not provided by the hardware, and does not act like a
+    /// critical section or mutex.
+    ///
+    /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+    /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem],
+    /// which is a particularly common pitfall for pointers!
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(atomic_try_update)]
+    /// use std::sync::atomic::{AtomicPtr, Ordering};
+    ///
+    /// let ptr: *mut _ = &mut 5;
+    /// let some_ptr = AtomicPtr::new(ptr);
+    ///
+    /// let new: *mut _ = &mut 10;
+    /// assert_eq!(some_ptr.try_update(Ordering::SeqCst, Ordering::SeqCst, |_| None), Err(ptr));
+    /// let result = some_ptr.try_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+    ///     if x == ptr {
+    ///         Some(new)
+    ///     } else {
+    ///         None
+    ///     }
+    /// });
+    /// assert_eq!(result, Ok(ptr));
+    /// assert_eq!(some_ptr.load(Ordering::SeqCst), new);
+    /// ```
+    #[inline]
+    #[unstable(feature = "atomic_try_update", issue = "135894")]
+    #[cfg(target_has_atomic = "ptr")]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    pub fn try_update(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        f: impl FnMut(*mut T) -> Option<*mut T>,
+    ) -> Result<*mut T, *mut T> {
+        // FIXME(atomic_try_update): this is currently an unstable alias to `fetch_update`;
+        //      when stabilizing, turn `fetch_update` into a deprecated alias to `try_update`.
+        self.fetch_update(set_order, fetch_order, f)
+    }
+
+    /// Fetches the value, applies a function to it that it return a new value.
+    /// The new value is stored and the old value is returned.
+    ///
+    /// See also: [`try_update`](`AtomicPtr::try_update`).
+    ///
+    /// Note: This may call the function multiple times if the value has been changed from other threads in
+    /// the meantime, but the function will have been applied only once to the stored value.
+    ///
+    /// `update` takes two [`Ordering`] arguments to describe the memory
+    /// ordering of this operation. The first describes the required ordering for
+    /// when the operation finally succeeds while the second describes the
+    /// required ordering for loads. These correspond to the success and failure
+    /// orderings of [`AtomicPtr::compare_exchange`] respectively.
+    ///
+    /// Using [`Acquire`] as success ordering makes the store part
+    /// of this operation [`Relaxed`], and using [`Release`] makes the final successful load
+    /// [`Relaxed`]. The (failed) load ordering can only be [`SeqCst`], [`Acquire`] or [`Relaxed`].
+    ///
+    /// **Note:** This method is only available on platforms that support atomic
+    /// operations on pointers.
+    ///
+    /// # Considerations
+    ///
+    /// This method is not magic; it is not provided by the hardware, and does not act like a
+    /// critical section or mutex.
+    ///
+    /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+    /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem],
+    /// which is a particularly common pitfall for pointers!
+    ///
+    /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+    /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(atomic_try_update)]
+    ///
+    /// use std::sync::atomic::{AtomicPtr, Ordering};
+    ///
+    /// let ptr: *mut _ = &mut 5;
+    /// let some_ptr = AtomicPtr::new(ptr);
+    ///
+    /// let new: *mut _ = &mut 10;
+    /// let result = some_ptr.update(Ordering::SeqCst, Ordering::SeqCst, |_| new);
+    /// assert_eq!(result, ptr);
+    /// assert_eq!(some_ptr.load(Ordering::SeqCst), new);
+    /// ```
+    #[inline]
+    #[unstable(feature = "atomic_try_update", issue = "135894")]
+    #[cfg(target_has_atomic = "8")]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    pub fn update(
+        &self,
+        set_order: Ordering,
+        fetch_order: Ordering,
+        mut f: impl FnMut(*mut T) -> *mut T,
+    ) -> *mut T {
+        let mut prev = self.load(fetch_order);
+        loop {
+            match self.compare_exchange_weak(prev, f(prev), set_order, fetch_order) {
+                Ok(x) => break x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
+    }
 
     /// Offsets the pointer's address by adding `val` (in units of `T`),
     /// returning the previous pointer.
@@ -1742,7 +2199,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strict_provenance_atomic_ptr, strict_provenance)]
     /// use core::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let atom = AtomicPtr::<i64>::new(core::ptr::null_mut());
@@ -1752,10 +2208,10 @@ impl<T> AtomicPtr<T> {
     /// ```
     #[inline]
     #[cfg(target_has_atomic = "ptr")]
-    #[unstable(feature = "strict_provenance_atomic_ptr", issue = "99108")]
+    #[stable(feature = "strict_provenance_atomic_ptr", since = "CURRENT_RUSTC_VERSION")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_ptr_add(&self, val: usize, order: Ordering) -> *mut T {
-        self.fetch_byte_add(val.wrapping_mul(core::mem::size_of::<T>()), order)
+        self.fetch_byte_add(val.wrapping_mul(size_of::<T>()), order)
     }
 
     /// Offsets the pointer's address by subtracting `val` (in units of `T`),
@@ -1783,7 +2239,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strict_provenance_atomic_ptr)]
     /// use core::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let array = [1i32, 2i32];
@@ -1797,10 +2252,10 @@ impl<T> AtomicPtr<T> {
     /// ```
     #[inline]
     #[cfg(target_has_atomic = "ptr")]
-    #[unstable(feature = "strict_provenance_atomic_ptr", issue = "99108")]
+    #[stable(feature = "strict_provenance_atomic_ptr", since = "CURRENT_RUSTC_VERSION")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_ptr_sub(&self, val: usize, order: Ordering) -> *mut T {
-        self.fetch_byte_sub(val.wrapping_mul(core::mem::size_of::<T>()), order)
+        self.fetch_byte_sub(val.wrapping_mul(size_of::<T>()), order)
     }
 
     /// Offsets the pointer's address by adding `val` *bytes*, returning the
@@ -1822,7 +2277,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strict_provenance_atomic_ptr, strict_provenance)]
     /// use core::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let atom = AtomicPtr::<i64>::new(core::ptr::null_mut());
@@ -1832,11 +2286,11 @@ impl<T> AtomicPtr<T> {
     /// ```
     #[inline]
     #[cfg(target_has_atomic = "ptr")]
-    #[unstable(feature = "strict_provenance_atomic_ptr", issue = "99108")]
+    #[stable(feature = "strict_provenance_atomic_ptr", since = "CURRENT_RUSTC_VERSION")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_byte_add(&self, val: usize, order: Ordering) -> *mut T {
         // SAFETY: data races are prevented by atomic intrinsics.
-        unsafe { atomic_add(self.p.get(), core::ptr::without_provenance_mut(val), order).cast() }
+        unsafe { atomic_add(self.p.get(), val, order).cast() }
     }
 
     /// Offsets the pointer's address by subtracting `val` *bytes*, returning the
@@ -1858,20 +2312,20 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strict_provenance_atomic_ptr, strict_provenance)]
     /// use core::sync::atomic::{AtomicPtr, Ordering};
     ///
-    /// let atom = AtomicPtr::<i64>::new(core::ptr::without_provenance_mut(1));
-    /// assert_eq!(atom.fetch_byte_sub(1, Ordering::Relaxed).addr(), 1);
-    /// assert_eq!(atom.load(Ordering::Relaxed).addr(), 0);
+    /// let mut arr = [0i64, 1];
+    /// let atom = AtomicPtr::<i64>::new(&raw mut arr[1]);
+    /// assert_eq!(atom.fetch_byte_sub(8, Ordering::Relaxed).addr(), (&raw const arr[1]).addr());
+    /// assert_eq!(atom.load(Ordering::Relaxed).addr(), (&raw const arr[0]).addr());
     /// ```
     #[inline]
     #[cfg(target_has_atomic = "ptr")]
-    #[unstable(feature = "strict_provenance_atomic_ptr", issue = "99108")]
+    #[stable(feature = "strict_provenance_atomic_ptr", since = "CURRENT_RUSTC_VERSION")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_byte_sub(&self, val: usize, order: Ordering) -> *mut T {
         // SAFETY: data races are prevented by atomic intrinsics.
-        unsafe { atomic_sub(self.p.get(), core::ptr::without_provenance_mut(val), order).cast() }
+        unsafe { atomic_sub(self.p.get(), val, order).cast() }
     }
 
     /// Performs a bitwise "or" operation on the address of the current pointer,
@@ -1903,7 +2357,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strict_provenance_atomic_ptr, strict_provenance)]
     /// use core::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let pointer = &mut 3i64 as *mut i64;
@@ -1918,11 +2371,11 @@ impl<T> AtomicPtr<T> {
     /// ```
     #[inline]
     #[cfg(target_has_atomic = "ptr")]
-    #[unstable(feature = "strict_provenance_atomic_ptr", issue = "99108")]
+    #[stable(feature = "strict_provenance_atomic_ptr", since = "CURRENT_RUSTC_VERSION")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_or(&self, val: usize, order: Ordering) -> *mut T {
         // SAFETY: data races are prevented by atomic intrinsics.
-        unsafe { atomic_or(self.p.get(), core::ptr::without_provenance_mut(val), order).cast() }
+        unsafe { atomic_or(self.p.get(), val, order).cast() }
     }
 
     /// Performs a bitwise "and" operation on the address of the current
@@ -1954,7 +2407,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strict_provenance_atomic_ptr, strict_provenance)]
     /// use core::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let pointer = &mut 3i64 as *mut i64;
@@ -1968,11 +2420,11 @@ impl<T> AtomicPtr<T> {
     /// ```
     #[inline]
     #[cfg(target_has_atomic = "ptr")]
-    #[unstable(feature = "strict_provenance_atomic_ptr", issue = "99108")]
+    #[stable(feature = "strict_provenance_atomic_ptr", since = "CURRENT_RUSTC_VERSION")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_and(&self, val: usize, order: Ordering) -> *mut T {
         // SAFETY: data races are prevented by atomic intrinsics.
-        unsafe { atomic_and(self.p.get(), core::ptr::without_provenance_mut(val), order).cast() }
+        unsafe { atomic_and(self.p.get(), val, order).cast() }
     }
 
     /// Performs a bitwise "xor" operation on the address of the current
@@ -2004,7 +2456,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strict_provenance_atomic_ptr, strict_provenance)]
     /// use core::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let pointer = &mut 3i64 as *mut i64;
@@ -2016,11 +2467,11 @@ impl<T> AtomicPtr<T> {
     /// ```
     #[inline]
     #[cfg(target_has_atomic = "ptr")]
-    #[unstable(feature = "strict_provenance_atomic_ptr", issue = "99108")]
+    #[stable(feature = "strict_provenance_atomic_ptr", since = "CURRENT_RUSTC_VERSION")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn fetch_xor(&self, val: usize, order: Ordering) -> *mut T {
         // SAFETY: data races are prevented by atomic intrinsics.
-        unsafe { atomic_xor(self.p.get(), core::ptr::without_provenance_mut(val), order).cast() }
+        unsafe { atomic_xor(self.p.get(), val, order).cast() }
     }
 
     /// Returns a mutable pointer to the underlying pointer.
@@ -2032,8 +2483,8 @@ impl<T> AtomicPtr<T> {
     /// Returning an `*mut` pointer from a shared reference to this atomic is safe because the
     /// atomic types work with interior mutability. All modifications of an atomic change the value
     /// through a shared reference, and can do so safely as long as they use atomic operations. Any
-    /// use of the returned raw pointer requires an `unsafe` block and still has to uphold the same
-    /// restriction: operations on it must be atomic.
+    /// use of the returned raw pointer requires an `unsafe` block and still has to uphold the
+    /// requirements of the [memory model].
     ///
     /// # Examples
     ///
@@ -2052,6 +2503,8 @@ impl<T> AtomicPtr<T> {
     ///     my_atomic_op(atomic.as_ptr());
     /// }
     /// ```
+    ///
+    /// [memory model]: self#memory-model-for-atomic-accesses
     #[inline]
     #[stable(feature = "atomic_as_ptr", since = "1.70.0")]
     #[rustc_const_stable(feature = "atomic_as_ptr", since = "1.70.0")]
@@ -2063,7 +2516,8 @@ impl<T> AtomicPtr<T> {
 
 #[cfg(target_has_atomic_load_store = "8")]
 #[stable(feature = "atomic_bool_from", since = "1.24.0")]
-impl From<bool> for AtomicBool {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl const From<bool> for AtomicBool {
     /// Converts a `bool` into an `AtomicBool`.
     ///
     /// # Examples
@@ -2081,7 +2535,8 @@ impl From<bool> for AtomicBool {
 
 #[cfg(target_has_atomic_load_store = "ptr")]
 #[stable(feature = "atomic_from", since = "1.23.0")]
-impl<T> From<*mut T> for AtomicPtr<T> {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+impl<T> const From<*mut T> for AtomicPtr<T> {
     /// Converts a `*mut T` into an `AtomicPtr<T>`.
     #[inline]
     fn from(p: *mut T) -> Self {
@@ -2106,7 +2561,8 @@ macro_rules! atomic_int {
      $stable_access:meta,
      $stable_from:meta,
      $stable_nand:meta,
-     $const_stable:meta,
+     $const_stable_new:meta,
+     $const_stable_into_inner:meta,
      $diagnostic_item:meta,
      $s_int_type:literal,
      $extra_feature:expr,
@@ -2159,7 +2615,8 @@ macro_rules! atomic_int {
         }
 
         #[$stable_from]
-        impl From<$int_type> for $atomic_type {
+        #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+        impl const From<$int_type> for $atomic_type {
             #[doc = concat!("Converts an `", stringify!($int_type), "` into an `", stringify!($atomic_type), "`.")]
             #[inline]
             fn from(v: $int_type) -> Self { Self::new(v) }
@@ -2188,7 +2645,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable]
-            #[$const_stable]
+            #[$const_stable_new]
             #[must_use]
             pub const fn new(v: $int_type) -> Self {
                 Self {v: UnsafeCell::new(v)}
@@ -2240,13 +2697,14 @@ macro_rules! atomic_int {
             }]
             /// * `ptr` must be [valid] for both reads and writes for the whole lifetime `'a`.
             /// * You must adhere to the [Memory model for atomic accesses]. In particular, it is not
-            ///   allowed to mix atomic and non-atomic accesses, or atomic accesses of different sizes,
-            ///   without synchronization.
+            ///   allowed to mix conflicting atomic and non-atomic accesses, or atomic accesses of different
+            ///   sizes, without synchronization.
             ///
             /// [valid]: crate::ptr#safety
             /// [Memory model for atomic accesses]: self#memory-model-for-atomic-accesses
+            #[inline]
             #[stable(feature = "atomic_from_ptr", since = "1.75.0")]
-            #[rustc_const_unstable(feature = "const_atomic_from_ptr", issue = "108652")]
+            #[rustc_const_stable(feature = "const_atomic_from_ptr", since = "1.84.0")]
             pub const unsafe fn from_ptr<'a>(ptr: *mut $int_type) -> &'a $atomic_type {
                 // SAFETY: guaranteed by the caller
                 unsafe { &*ptr.cast() }
@@ -2280,7 +2738,7 @@ macro_rules! atomic_int {
                 $int_type,
                 no = [
                     "**Note:** This function is only available on targets where `",
-                    stringify!($int_type), "` has an alignment of ", $align, " bytes."
+                    stringify!($atomic_type), "` has the same alignment as `", stringify!($int_type), "`."
                 ],
             }]
             ///
@@ -2315,7 +2773,7 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            /// ```ignore-wasm
             /// #![feature(atomic_from_mut)]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
@@ -2348,7 +2806,7 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            /// ```ignore-wasm
             /// #![feature(atomic_from_mut)]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
@@ -2390,9 +2848,9 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable_access]
-            #[rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0")]
+            #[$const_stable_into_inner]
             pub const fn into_inner(self) -> $int_type {
-                self.v.primitive_into_inner()
+                self.v.into_inner()
             }
 
             /// Loads a value from the atomic integer.
@@ -2504,6 +2962,12 @@ macro_rules! atomic_int {
             /// AcqRel   | AcqRel  | Acquire
             /// SeqCst   | SeqCst  | SeqCst
             ///
+            /// `compare_and_swap` and `compare_exchange` also differ in their return type. You can use
+            /// `compare_exchange(...).unwrap_or_else(|x| x)` to recover the behavior of `compare_and_swap`,
+            /// but in most cases it is more idiomatic to check whether the return value is `Ok` or `Err`
+            /// rather than to infer success vs failure based on the value that was read.
+            ///
+            /// During migration, consider whether it makes sense to use `compare_exchange_weak` instead.
             /// `compare_exchange_weak` is allowed to fail spuriously even when the comparison succeeds,
             /// which allows the compiler to generate better assembly code when the compare and swap
             /// is used in a loop.
@@ -2579,6 +3043,20 @@ macro_rules! atomic_int {
             ///            Err(10));
             /// assert_eq!(some_var.load(Ordering::Relaxed), 10);
             /// ```
+            ///
+            /// # Considerations
+            ///
+            /// `compare_exchange` is a [compare-and-swap operation] and thus exhibits the usual downsides
+            /// of CAS operations. In particular, a load of the value followed by a successful
+            /// `compare_exchange` with the previous load *does not ensure* that other threads have not
+            /// changed the value in the interim! This is usually important when the *equality* check in
+            /// the `compare_exchange` is being used to check the *identity* of a value, but equality
+            /// does not necessarily imply identity. This is a particularly common case for pointers, as
+            /// a pointer holding the same address does not imply that the same object exists at that
+            /// address! In this case, `compare_exchange` can lead to the [ABA problem].
+            ///
+            /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+            /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
             #[inline]
             #[$stable_cxchg]
             #[$cfg_cas]
@@ -2628,6 +3106,20 @@ macro_rules! atomic_int {
             ///     }
             /// }
             /// ```
+            ///
+            /// # Considerations
+            ///
+            /// `compare_exchange` is a [compare-and-swap operation] and thus exhibits the usual downsides
+            /// of CAS operations. In particular, a load of the value followed by a successful
+            /// `compare_exchange` with the previous load *does not ensure* that other threads have not
+            /// changed the value in the interim. This is usually important when the *equality* check in
+            /// the `compare_exchange` is being used to check the *identity* of a value, but equality
+            /// does not necessarily imply identity. This is a particularly common case for pointers, as
+            /// a pointer holding the same address does not imply that the same object exists at that
+            /// address! In this case, `compare_exchange` can lead to the [ABA problem].
+            ///
+            /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+            /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
             #[inline]
             #[$stable_cxchg]
             #[$cfg_cas]
@@ -2858,13 +3350,16 @@ macro_rules! atomic_int {
             ///
             /// # Considerations
             ///
-            /// This method is not magic;  it is not provided by the hardware.
-            /// It is implemented in terms of
-            #[doc = concat!("[`", stringify!($atomic_type), "::compare_exchange_weak`],")]
-            /// and suffers from the same drawbacks.
-            /// In particular, this method will not circumvent the [ABA Problem].
+            /// This method is not magic; it is not provided by the hardware, and does not act like a
+            /// critical section or mutex.
+            ///
+            /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+            /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem]
+            /// if this atomic integer is an index or more generally if knowledge of only the *bitwise value*
+            /// of the atomic is not in and of itself sufficient to ensure any required preconditions.
             ///
             /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+            /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
             ///
             /// # Examples
             ///
@@ -2894,6 +3389,134 @@ macro_rules! atomic_int {
                     }
                 }
                 Err(prev)
+            }
+
+            /// Fetches the value, and applies a function to it that returns an optional
+            /// new value. Returns a `Result` of `Ok(previous_value)` if the function returned `Some(_)`, else
+            /// `Err(previous_value)`.
+            ///
+            #[doc = concat!("See also: [`update`](`", stringify!($atomic_type), "::update`).")]
+            ///
+            /// Note: This may call the function multiple times if the value has been changed from other threads in
+            /// the meantime, as long as the function returns `Some(_)`, but the function will have been applied
+            /// only once to the stored value.
+            ///
+            /// `try_update` takes two [`Ordering`] arguments to describe the memory ordering of this operation.
+            /// The first describes the required ordering for when the operation finally succeeds while the second
+            /// describes the required ordering for loads. These correspond to the success and failure orderings of
+            #[doc = concat!("[`", stringify!($atomic_type), "::compare_exchange`]")]
+            /// respectively.
+            ///
+            /// Using [`Acquire`] as success ordering makes the store part
+            /// of this operation [`Relaxed`], and using [`Release`] makes the final successful load
+            /// [`Relaxed`]. The (failed) load ordering can only be [`SeqCst`], [`Acquire`] or [`Relaxed`].
+            ///
+            /// **Note**: This method is only available on platforms that support atomic operations on
+            #[doc = concat!("[`", $s_int_type, "`].")]
+            ///
+            /// # Considerations
+            ///
+            /// This method is not magic; it is not provided by the hardware, and does not act like a
+            /// critical section or mutex.
+            ///
+            /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+            /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem]
+            /// if this atomic integer is an index or more generally if knowledge of only the *bitwise value*
+            /// of the atomic is not in and of itself sufficient to ensure any required preconditions.
+            ///
+            /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+            /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
+            ///
+            /// # Examples
+            ///
+            /// ```rust
+            /// #![feature(atomic_try_update)]
+            #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
+            ///
+            #[doc = concat!("let x = ", stringify!($atomic_type), "::new(7);")]
+            /// assert_eq!(x.try_update(Ordering::SeqCst, Ordering::SeqCst, |_| None), Err(7));
+            /// assert_eq!(x.try_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x + 1)), Ok(7));
+            /// assert_eq!(x.try_update(Ordering::SeqCst, Ordering::SeqCst, |x| Some(x + 1)), Ok(8));
+            /// assert_eq!(x.load(Ordering::SeqCst), 9);
+            /// ```
+            #[inline]
+            #[unstable(feature = "atomic_try_update", issue = "135894")]
+            #[$cfg_cas]
+            #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+            pub fn try_update(
+                &self,
+                set_order: Ordering,
+                fetch_order: Ordering,
+                f: impl FnMut($int_type) -> Option<$int_type>,
+            ) -> Result<$int_type, $int_type> {
+                // FIXME(atomic_try_update): this is currently an unstable alias to `fetch_update`;
+                //      when stabilizing, turn `fetch_update` into a deprecated alias to `try_update`.
+                self.fetch_update(set_order, fetch_order, f)
+            }
+
+            /// Fetches the value, applies a function to it that it return a new value.
+            /// The new value is stored and the old value is returned.
+            ///
+            #[doc = concat!("See also: [`try_update`](`", stringify!($atomic_type), "::try_update`).")]
+            ///
+            /// Note: This may call the function multiple times if the value has been changed from other threads in
+            /// the meantime, but the function will have been applied only once to the stored value.
+            ///
+            /// `update` takes two [`Ordering`] arguments to describe the memory ordering of this operation.
+            /// The first describes the required ordering for when the operation finally succeeds while the second
+            /// describes the required ordering for loads. These correspond to the success and failure orderings of
+            #[doc = concat!("[`", stringify!($atomic_type), "::compare_exchange`]")]
+            /// respectively.
+            ///
+            /// Using [`Acquire`] as success ordering makes the store part
+            /// of this operation [`Relaxed`], and using [`Release`] makes the final successful load
+            /// [`Relaxed`]. The (failed) load ordering can only be [`SeqCst`], [`Acquire`] or [`Relaxed`].
+            ///
+            /// **Note**: This method is only available on platforms that support atomic operations on
+            #[doc = concat!("[`", $s_int_type, "`].")]
+            ///
+            /// # Considerations
+            ///
+            /// [CAS operation]: https://en.wikipedia.org/wiki/Compare-and-swap
+            /// This method is not magic; it is not provided by the hardware, and does not act like a
+            /// critical section or mutex.
+            ///
+            /// It is implemented on top of an atomic [compare-and-swap operation], and thus is subject to
+            /// the usual drawbacks of CAS operations. In particular, be careful of the [ABA problem]
+            /// if this atomic integer is an index or more generally if knowledge of only the *bitwise value*
+            /// of the atomic is not in and of itself sufficient to ensure any required preconditions.
+            ///
+            /// [ABA Problem]: https://en.wikipedia.org/wiki/ABA_problem
+            /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
+            ///
+            /// # Examples
+            ///
+            /// ```rust
+            /// #![feature(atomic_try_update)]
+            #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
+            ///
+            #[doc = concat!("let x = ", stringify!($atomic_type), "::new(7);")]
+            /// assert_eq!(x.update(Ordering::SeqCst, Ordering::SeqCst, |x| x + 1), 7);
+            /// assert_eq!(x.update(Ordering::SeqCst, Ordering::SeqCst, |x| x + 1), 8);
+            /// assert_eq!(x.load(Ordering::SeqCst), 9);
+            /// ```
+            #[inline]
+            #[unstable(feature = "atomic_try_update", issue = "135894")]
+            #[$cfg_cas]
+            #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+            pub fn update(
+                &self,
+                set_order: Ordering,
+                fetch_order: Ordering,
+                mut f: impl FnMut($int_type) -> $int_type,
+            ) -> $int_type {
+                let mut prev = self.load(fetch_order);
+                loop {
+                    match self.compare_exchange_weak(prev, f(prev), set_order, fetch_order) {
+                        Ok(x) => break x,
+                        Err(next_prev) => prev = next_prev,
+                    }
+                }
             }
 
             /// Maximum with the current value.
@@ -2995,8 +3618,8 @@ macro_rules! atomic_int {
             /// Returning an `*mut` pointer from a shared reference to this atomic is safe because the
             /// atomic types work with interior mutability. All modifications of an atomic change the value
             /// through a shared reference, and can do so safely as long as they use atomic operations. Any
-            /// use of the returned raw pointer requires an `unsafe` block and still has to uphold the same
-            /// restriction: operations on it must be atomic.
+            /// use of the returned raw pointer requires an `unsafe` block and still has to uphold the
+            /// requirements of the [memory model].
             ///
             /// # Examples
             ///
@@ -3016,6 +3639,8 @@ macro_rules! atomic_int {
             /// }
             /// # }
             /// ```
+            ///
+            /// [memory model]: self#memory-model-for-atomic-accesses
             #[inline]
             #[stable(feature = "atomic_as_ptr", since = "1.70.0")]
             #[rustc_const_stable(feature = "atomic_as_ptr", since = "1.70.0")]
@@ -3038,7 +3663,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicI8"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicI8",
     "i8",
     "",
     atomic_min, atomic_max,
@@ -3056,7 +3682,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicU8"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicU8",
     "u8",
     "",
     atomic_umin, atomic_umax,
@@ -3074,7 +3701,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicI16"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicI16",
     "i16",
     "",
     atomic_min, atomic_max,
@@ -3092,7 +3720,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicU16"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicU16",
     "u16",
     "",
     atomic_umin, atomic_umax,
@@ -3110,7 +3739,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicI32"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicI32",
     "i32",
     "",
     atomic_min, atomic_max,
@@ -3128,7 +3758,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicU32"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicU32",
     "u32",
     "",
     atomic_umin, atomic_umax,
@@ -3146,7 +3777,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicI64"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicI64",
     "i64",
     "",
     atomic_min, atomic_max,
@@ -3164,7 +3796,8 @@ atomic_int! {
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicU64"),
+    rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+    rustc_diagnostic_item = "AtomicU64",
     "u64",
     "",
     atomic_umin, atomic_umax,
@@ -3181,8 +3814,9 @@ atomic_int! {
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
-    rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicI128"),
+    rustc_const_unstable(feature = "integer_atomics", issue = "99069"),
+    rustc_const_unstable(feature = "integer_atomics", issue = "99069"),
+    rustc_diagnostic_item = "AtomicI128",
     "i128",
     "#![feature(integer_atomics)]\n\n",
     atomic_min, atomic_max,
@@ -3199,8 +3833,9 @@ atomic_int! {
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
-    rustc_const_stable(feature = "const_integer_atomics", since = "1.34.0"),
-    cfg_attr(not(test), rustc_diagnostic_item = "AtomicU128"),
+    rustc_const_unstable(feature = "integer_atomics", issue = "99069"),
+    rustc_const_unstable(feature = "integer_atomics", issue = "99069"),
+    rustc_diagnostic_item = "AtomicU128",
     "u128",
     "#![feature(integer_atomics)]\n\n",
     atomic_umin, atomic_umax,
@@ -3222,7 +3857,8 @@ macro_rules! atomic_int_ptr_sized {
             stable(feature = "atomic_from", since = "1.23.0"),
             stable(feature = "atomic_nand", since = "1.27.0"),
             rustc_const_stable(feature = "const_ptr_sized_atomics", since = "1.24.0"),
-            cfg_attr(not(test), rustc_diagnostic_item = "AtomicIsize"),
+            rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+            rustc_diagnostic_item = "AtomicIsize",
             "isize",
             "",
             atomic_min, atomic_max,
@@ -3240,7 +3876,8 @@ macro_rules! atomic_int_ptr_sized {
             stable(feature = "atomic_from", since = "1.23.0"),
             stable(feature = "atomic_nand", since = "1.27.0"),
             rustc_const_stable(feature = "const_ptr_sized_atomics", since = "1.24.0"),
-            cfg_attr(not(test), rustc_diagnostic_item = "AtomicUsize"),
+            rustc_const_stable(feature = "const_atomic_into_inner", since = "1.79.0"),
+            rustc_diagnostic_item = "AtomicUsize",
             "usize",
             "",
             atomic_umin, atomic_umax,
@@ -3295,9 +3932,9 @@ unsafe fn atomic_store<T: Copy>(dst: *mut T, val: T, order: Ordering) {
     // SAFETY: the caller must uphold the safety contract for `atomic_store`.
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_store_relaxed(dst, val),
-            Release => intrinsics::atomic_store_release(dst, val),
-            SeqCst => intrinsics::atomic_store_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_store::<T, { AO::Relaxed }>(dst, val),
+            Release => intrinsics::atomic_store::<T, { AO::Release }>(dst, val),
+            SeqCst => intrinsics::atomic_store::<T, { AO::SeqCst }>(dst, val),
             Acquire => panic!("there is no such thing as an acquire store"),
             AcqRel => panic!("there is no such thing as an acquire-release store"),
         }
@@ -3310,9 +3947,9 @@ unsafe fn atomic_load<T: Copy>(dst: *const T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_load`.
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_load_relaxed(dst),
-            Acquire => intrinsics::atomic_load_acquire(dst),
-            SeqCst => intrinsics::atomic_load_seqcst(dst),
+            Relaxed => intrinsics::atomic_load::<T, { AO::Relaxed }>(dst),
+            Acquire => intrinsics::atomic_load::<T, { AO::Acquire }>(dst),
+            SeqCst => intrinsics::atomic_load::<T, { AO::SeqCst }>(dst),
             Release => panic!("there is no such thing as a release load"),
             AcqRel => panic!("there is no such thing as an acquire-release load"),
         }
@@ -3326,11 +3963,11 @@ unsafe fn atomic_swap<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_swap`.
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_xchg_relaxed(dst, val),
-            Acquire => intrinsics::atomic_xchg_acquire(dst, val),
-            Release => intrinsics::atomic_xchg_release(dst, val),
-            AcqRel => intrinsics::atomic_xchg_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_xchg_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_xchg::<T, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_xchg::<T, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_xchg::<T, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_xchg::<T, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_xchg::<T, { AO::SeqCst }>(dst, val),
         }
     }
 }
@@ -3339,15 +3976,15 @@ unsafe fn atomic_swap<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-unsafe fn atomic_add<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
+unsafe fn atomic_add<T: Copy, U: Copy>(dst: *mut T, val: U, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_add`.
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_xadd_relaxed(dst, val),
-            Acquire => intrinsics::atomic_xadd_acquire(dst, val),
-            Release => intrinsics::atomic_xadd_release(dst, val),
-            AcqRel => intrinsics::atomic_xadd_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_xadd_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_xadd::<T, U, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_xadd::<T, U, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_xadd::<T, U, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_xadd::<T, U, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_xadd::<T, U, { AO::SeqCst }>(dst, val),
         }
     }
 }
@@ -3356,23 +3993,26 @@ unsafe fn atomic_add<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-unsafe fn atomic_sub<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
+unsafe fn atomic_sub<T: Copy, U: Copy>(dst: *mut T, val: U, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_sub`.
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_xsub_relaxed(dst, val),
-            Acquire => intrinsics::atomic_xsub_acquire(dst, val),
-            Release => intrinsics::atomic_xsub_release(dst, val),
-            AcqRel => intrinsics::atomic_xsub_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_xsub_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_xsub::<T, U, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_xsub::<T, U, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_xsub::<T, U, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_xsub::<T, U, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_xsub::<T, U, { AO::SeqCst }>(dst, val),
         }
     }
 }
 
+/// Publicly exposed for stdarch; nobody else should use this.
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-unsafe fn atomic_compare_exchange<T: Copy>(
+#[unstable(feature = "core_intrinsics", issue = "none")]
+#[doc(hidden)]
+pub unsafe fn atomic_compare_exchange<T: Copy>(
     dst: *mut T,
     old: T,
     new: T,
@@ -3382,21 +4022,51 @@ unsafe fn atomic_compare_exchange<T: Copy>(
     // SAFETY: the caller must uphold the safety contract for `atomic_compare_exchange`.
     let (val, ok) = unsafe {
         match (success, failure) {
-            (Relaxed, Relaxed) => intrinsics::atomic_cxchg_relaxed_relaxed(dst, old, new),
-            (Relaxed, Acquire) => intrinsics::atomic_cxchg_relaxed_acquire(dst, old, new),
-            (Relaxed, SeqCst) => intrinsics::atomic_cxchg_relaxed_seqcst(dst, old, new),
-            (Acquire, Relaxed) => intrinsics::atomic_cxchg_acquire_relaxed(dst, old, new),
-            (Acquire, Acquire) => intrinsics::atomic_cxchg_acquire_acquire(dst, old, new),
-            (Acquire, SeqCst) => intrinsics::atomic_cxchg_acquire_seqcst(dst, old, new),
-            (Release, Relaxed) => intrinsics::atomic_cxchg_release_relaxed(dst, old, new),
-            (Release, Acquire) => intrinsics::atomic_cxchg_release_acquire(dst, old, new),
-            (Release, SeqCst) => intrinsics::atomic_cxchg_release_seqcst(dst, old, new),
-            (AcqRel, Relaxed) => intrinsics::atomic_cxchg_acqrel_relaxed(dst, old, new),
-            (AcqRel, Acquire) => intrinsics::atomic_cxchg_acqrel_acquire(dst, old, new),
-            (AcqRel, SeqCst) => intrinsics::atomic_cxchg_acqrel_seqcst(dst, old, new),
-            (SeqCst, Relaxed) => intrinsics::atomic_cxchg_seqcst_relaxed(dst, old, new),
-            (SeqCst, Acquire) => intrinsics::atomic_cxchg_seqcst_acquire(dst, old, new),
-            (SeqCst, SeqCst) => intrinsics::atomic_cxchg_seqcst_seqcst(dst, old, new),
+            (Relaxed, Relaxed) => {
+                intrinsics::atomic_cxchg::<T, { AO::Relaxed }, { AO::Relaxed }>(dst, old, new)
+            }
+            (Relaxed, Acquire) => {
+                intrinsics::atomic_cxchg::<T, { AO::Relaxed }, { AO::Acquire }>(dst, old, new)
+            }
+            (Relaxed, SeqCst) => {
+                intrinsics::atomic_cxchg::<T, { AO::Relaxed }, { AO::SeqCst }>(dst, old, new)
+            }
+            (Acquire, Relaxed) => {
+                intrinsics::atomic_cxchg::<T, { AO::Acquire }, { AO::Relaxed }>(dst, old, new)
+            }
+            (Acquire, Acquire) => {
+                intrinsics::atomic_cxchg::<T, { AO::Acquire }, { AO::Acquire }>(dst, old, new)
+            }
+            (Acquire, SeqCst) => {
+                intrinsics::atomic_cxchg::<T, { AO::Acquire }, { AO::SeqCst }>(dst, old, new)
+            }
+            (Release, Relaxed) => {
+                intrinsics::atomic_cxchg::<T, { AO::Release }, { AO::Relaxed }>(dst, old, new)
+            }
+            (Release, Acquire) => {
+                intrinsics::atomic_cxchg::<T, { AO::Release }, { AO::Acquire }>(dst, old, new)
+            }
+            (Release, SeqCst) => {
+                intrinsics::atomic_cxchg::<T, { AO::Release }, { AO::SeqCst }>(dst, old, new)
+            }
+            (AcqRel, Relaxed) => {
+                intrinsics::atomic_cxchg::<T, { AO::AcqRel }, { AO::Relaxed }>(dst, old, new)
+            }
+            (AcqRel, Acquire) => {
+                intrinsics::atomic_cxchg::<T, { AO::AcqRel }, { AO::Acquire }>(dst, old, new)
+            }
+            (AcqRel, SeqCst) => {
+                intrinsics::atomic_cxchg::<T, { AO::AcqRel }, { AO::SeqCst }>(dst, old, new)
+            }
+            (SeqCst, Relaxed) => {
+                intrinsics::atomic_cxchg::<T, { AO::SeqCst }, { AO::Relaxed }>(dst, old, new)
+            }
+            (SeqCst, Acquire) => {
+                intrinsics::atomic_cxchg::<T, { AO::SeqCst }, { AO::Acquire }>(dst, old, new)
+            }
+            (SeqCst, SeqCst) => {
+                intrinsics::atomic_cxchg::<T, { AO::SeqCst }, { AO::SeqCst }>(dst, old, new)
+            }
             (_, AcqRel) => panic!("there is no such thing as an acquire-release failure ordering"),
             (_, Release) => panic!("there is no such thing as a release failure ordering"),
         }
@@ -3417,21 +4087,51 @@ unsafe fn atomic_compare_exchange_weak<T: Copy>(
     // SAFETY: the caller must uphold the safety contract for `atomic_compare_exchange_weak`.
     let (val, ok) = unsafe {
         match (success, failure) {
-            (Relaxed, Relaxed) => intrinsics::atomic_cxchgweak_relaxed_relaxed(dst, old, new),
-            (Relaxed, Acquire) => intrinsics::atomic_cxchgweak_relaxed_acquire(dst, old, new),
-            (Relaxed, SeqCst) => intrinsics::atomic_cxchgweak_relaxed_seqcst(dst, old, new),
-            (Acquire, Relaxed) => intrinsics::atomic_cxchgweak_acquire_relaxed(dst, old, new),
-            (Acquire, Acquire) => intrinsics::atomic_cxchgweak_acquire_acquire(dst, old, new),
-            (Acquire, SeqCst) => intrinsics::atomic_cxchgweak_acquire_seqcst(dst, old, new),
-            (Release, Relaxed) => intrinsics::atomic_cxchgweak_release_relaxed(dst, old, new),
-            (Release, Acquire) => intrinsics::atomic_cxchgweak_release_acquire(dst, old, new),
-            (Release, SeqCst) => intrinsics::atomic_cxchgweak_release_seqcst(dst, old, new),
-            (AcqRel, Relaxed) => intrinsics::atomic_cxchgweak_acqrel_relaxed(dst, old, new),
-            (AcqRel, Acquire) => intrinsics::atomic_cxchgweak_acqrel_acquire(dst, old, new),
-            (AcqRel, SeqCst) => intrinsics::atomic_cxchgweak_acqrel_seqcst(dst, old, new),
-            (SeqCst, Relaxed) => intrinsics::atomic_cxchgweak_seqcst_relaxed(dst, old, new),
-            (SeqCst, Acquire) => intrinsics::atomic_cxchgweak_seqcst_acquire(dst, old, new),
-            (SeqCst, SeqCst) => intrinsics::atomic_cxchgweak_seqcst_seqcst(dst, old, new),
+            (Relaxed, Relaxed) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Relaxed }, { AO::Relaxed }>(dst, old, new)
+            }
+            (Relaxed, Acquire) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Relaxed }, { AO::Acquire }>(dst, old, new)
+            }
+            (Relaxed, SeqCst) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Relaxed }, { AO::SeqCst }>(dst, old, new)
+            }
+            (Acquire, Relaxed) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Acquire }, { AO::Relaxed }>(dst, old, new)
+            }
+            (Acquire, Acquire) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Acquire }, { AO::Acquire }>(dst, old, new)
+            }
+            (Acquire, SeqCst) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Acquire }, { AO::SeqCst }>(dst, old, new)
+            }
+            (Release, Relaxed) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Release }, { AO::Relaxed }>(dst, old, new)
+            }
+            (Release, Acquire) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Release }, { AO::Acquire }>(dst, old, new)
+            }
+            (Release, SeqCst) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::Release }, { AO::SeqCst }>(dst, old, new)
+            }
+            (AcqRel, Relaxed) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::AcqRel }, { AO::Relaxed }>(dst, old, new)
+            }
+            (AcqRel, Acquire) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::AcqRel }, { AO::Acquire }>(dst, old, new)
+            }
+            (AcqRel, SeqCst) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::AcqRel }, { AO::SeqCst }>(dst, old, new)
+            }
+            (SeqCst, Relaxed) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::SeqCst }, { AO::Relaxed }>(dst, old, new)
+            }
+            (SeqCst, Acquire) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::SeqCst }, { AO::Acquire }>(dst, old, new)
+            }
+            (SeqCst, SeqCst) => {
+                intrinsics::atomic_cxchgweak::<T, { AO::SeqCst }, { AO::SeqCst }>(dst, old, new)
+            }
             (_, AcqRel) => panic!("there is no such thing as an acquire-release failure ordering"),
             (_, Release) => panic!("there is no such thing as a release failure ordering"),
         }
@@ -3442,15 +4142,15 @@ unsafe fn atomic_compare_exchange_weak<T: Copy>(
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-unsafe fn atomic_and<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
+unsafe fn atomic_and<T: Copy, U: Copy>(dst: *mut T, val: U, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_and`
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_and_relaxed(dst, val),
-            Acquire => intrinsics::atomic_and_acquire(dst, val),
-            Release => intrinsics::atomic_and_release(dst, val),
-            AcqRel => intrinsics::atomic_and_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_and_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_and::<T, U, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_and::<T, U, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_and::<T, U, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_and::<T, U, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_and::<T, U, { AO::SeqCst }>(dst, val),
         }
     }
 }
@@ -3458,15 +4158,15 @@ unsafe fn atomic_and<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-unsafe fn atomic_nand<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
+unsafe fn atomic_nand<T: Copy, U: Copy>(dst: *mut T, val: U, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_nand`
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_nand_relaxed(dst, val),
-            Acquire => intrinsics::atomic_nand_acquire(dst, val),
-            Release => intrinsics::atomic_nand_release(dst, val),
-            AcqRel => intrinsics::atomic_nand_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_nand_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_nand::<T, U, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_nand::<T, U, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_nand::<T, U, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_nand::<T, U, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_nand::<T, U, { AO::SeqCst }>(dst, val),
         }
     }
 }
@@ -3474,15 +4174,15 @@ unsafe fn atomic_nand<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-unsafe fn atomic_or<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
+unsafe fn atomic_or<T: Copy, U: Copy>(dst: *mut T, val: U, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_or`
     unsafe {
         match order {
-            SeqCst => intrinsics::atomic_or_seqcst(dst, val),
-            Acquire => intrinsics::atomic_or_acquire(dst, val),
-            Release => intrinsics::atomic_or_release(dst, val),
-            AcqRel => intrinsics::atomic_or_acqrel(dst, val),
-            Relaxed => intrinsics::atomic_or_relaxed(dst, val),
+            SeqCst => intrinsics::atomic_or::<T, U, { AO::SeqCst }>(dst, val),
+            Acquire => intrinsics::atomic_or::<T, U, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_or::<T, U, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_or::<T, U, { AO::AcqRel }>(dst, val),
+            Relaxed => intrinsics::atomic_or::<T, U, { AO::Relaxed }>(dst, val),
         }
     }
 }
@@ -3490,20 +4190,20 @@ unsafe fn atomic_or<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
-unsafe fn atomic_xor<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
+unsafe fn atomic_xor<T: Copy, U: Copy>(dst: *mut T, val: U, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_xor`
     unsafe {
         match order {
-            SeqCst => intrinsics::atomic_xor_seqcst(dst, val),
-            Acquire => intrinsics::atomic_xor_acquire(dst, val),
-            Release => intrinsics::atomic_xor_release(dst, val),
-            AcqRel => intrinsics::atomic_xor_acqrel(dst, val),
-            Relaxed => intrinsics::atomic_xor_relaxed(dst, val),
+            SeqCst => intrinsics::atomic_xor::<T, U, { AO::SeqCst }>(dst, val),
+            Acquire => intrinsics::atomic_xor::<T, U, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_xor::<T, U, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_xor::<T, U, { AO::AcqRel }>(dst, val),
+            Relaxed => intrinsics::atomic_xor::<T, U, { AO::Relaxed }>(dst, val),
         }
     }
 }
 
-/// returns the max value (signed comparison)
+/// Updates `*dst` to the max value of `val` and the old value (signed comparison)
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
@@ -3511,16 +4211,16 @@ unsafe fn atomic_max<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_max`
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_max_relaxed(dst, val),
-            Acquire => intrinsics::atomic_max_acquire(dst, val),
-            Release => intrinsics::atomic_max_release(dst, val),
-            AcqRel => intrinsics::atomic_max_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_max_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_max::<T, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_max::<T, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_max::<T, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_max::<T, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_max::<T, { AO::SeqCst }>(dst, val),
         }
     }
 }
 
-/// returns the min value (signed comparison)
+/// Updates `*dst` to the min value of `val` and the old value (signed comparison)
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
@@ -3528,16 +4228,16 @@ unsafe fn atomic_min<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_min`
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_min_relaxed(dst, val),
-            Acquire => intrinsics::atomic_min_acquire(dst, val),
-            Release => intrinsics::atomic_min_release(dst, val),
-            AcqRel => intrinsics::atomic_min_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_min_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_min::<T, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_min::<T, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_min::<T, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_min::<T, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_min::<T, { AO::SeqCst }>(dst, val),
         }
     }
 }
 
-/// returns the max value (unsigned comparison)
+/// Updates `*dst` to the max value of `val` and the old value (unsigned comparison)
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
@@ -3545,16 +4245,16 @@ unsafe fn atomic_umax<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_umax`
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_umax_relaxed(dst, val),
-            Acquire => intrinsics::atomic_umax_acquire(dst, val),
-            Release => intrinsics::atomic_umax_release(dst, val),
-            AcqRel => intrinsics::atomic_umax_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_umax_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_umax::<T, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_umax::<T, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_umax::<T, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_umax::<T, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_umax::<T, { AO::SeqCst }>(dst, val),
         }
     }
 }
 
-/// returns the min value (unsigned comparison)
+/// Updates `*dst` to the min value of `val` and the old value (unsigned comparison)
 #[inline]
 #[cfg(target_has_atomic)]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
@@ -3562,40 +4262,45 @@ unsafe fn atomic_umin<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
     // SAFETY: the caller must uphold the safety contract for `atomic_umin`
     unsafe {
         match order {
-            Relaxed => intrinsics::atomic_umin_relaxed(dst, val),
-            Acquire => intrinsics::atomic_umin_acquire(dst, val),
-            Release => intrinsics::atomic_umin_release(dst, val),
-            AcqRel => intrinsics::atomic_umin_acqrel(dst, val),
-            SeqCst => intrinsics::atomic_umin_seqcst(dst, val),
+            Relaxed => intrinsics::atomic_umin::<T, { AO::Relaxed }>(dst, val),
+            Acquire => intrinsics::atomic_umin::<T, { AO::Acquire }>(dst, val),
+            Release => intrinsics::atomic_umin::<T, { AO::Release }>(dst, val),
+            AcqRel => intrinsics::atomic_umin::<T, { AO::AcqRel }>(dst, val),
+            SeqCst => intrinsics::atomic_umin::<T, { AO::SeqCst }>(dst, val),
         }
     }
 }
 
 /// An atomic fence.
 ///
-/// Depending on the specified order, a fence prevents the compiler and CPU from
-/// reordering certain types of memory operations around it.
-/// That creates synchronizes-with relationships between it and atomic operations
-/// or fences in other threads.
+/// Fences create synchronization between themselves and atomic operations or fences in other
+/// threads. To achieve this, a fence prevents the compiler and CPU from reordering certain types of
+/// memory operations around it.
 ///
 /// A fence 'A' which has (at least) [`Release`] ordering semantics, synchronizes
 /// with a fence 'B' with (at least) [`Acquire`] semantics, if and only if there
-/// exist operations X and Y, both operating on some atomic object 'M' such
+/// exist operations X and Y, both operating on some atomic object 'm' such
 /// that A is sequenced before X, Y is sequenced before B and Y observes
-/// the change to M. This provides a happens-before dependence between A and B.
+/// the change to m. This provides a happens-before dependence between A and B.
 ///
 /// ```text
 ///     Thread 1                                          Thread 2
 ///
 /// fence(Release);      A --------------
-/// x.store(3, Relaxed); X ---------    |
+/// m.store(3, Relaxed); X ---------    |
 ///                                |    |
 ///                                |    |
-///                                -------------> Y  if x.load(Relaxed) == 3 {
+///                                -------------> Y  if m.load(Relaxed) == 3 {
 ///                                     |-------> B      fence(Acquire);
 ///                                                      ...
 ///                                                  }
 /// ```
+///
+/// Note that in the example above, it is crucial that the accesses to `m` are atomic. Fences cannot
+/// be used to establish synchronization among non-atomic accesses in different threads. However,
+/// thanks to the happens-before relationship between A and B, any non-atomic accesses that
+/// happen-before A are now also properly synchronized with any non-atomic accesses that
+/// happen-after B.
 ///
 /// Atomic operations with [`Release`] or [`Acquire`] semantics can also synchronize
 /// with a fence.
@@ -3653,42 +4358,39 @@ pub fn fence(order: Ordering) {
     // SAFETY: using an atomic fence is safe.
     unsafe {
         match order {
-            Acquire => intrinsics::atomic_fence_acquire(),
-            Release => intrinsics::atomic_fence_release(),
-            AcqRel => intrinsics::atomic_fence_acqrel(),
-            SeqCst => intrinsics::atomic_fence_seqcst(),
+            Acquire => intrinsics::atomic_fence::<{ AO::Acquire }>(),
+            Release => intrinsics::atomic_fence::<{ AO::Release }>(),
+            AcqRel => intrinsics::atomic_fence::<{ AO::AcqRel }>(),
+            SeqCst => intrinsics::atomic_fence::<{ AO::SeqCst }>(),
             Relaxed => panic!("there is no such thing as a relaxed fence"),
         }
     }
 }
 
-/// A compiler memory fence.
+/// A "compiler-only" atomic fence.
 ///
-/// `compiler_fence` does not emit any machine code, but restricts the kinds
-/// of memory re-ordering the compiler is allowed to do. Specifically, depending on
-/// the given [`Ordering`] semantics, the compiler may be disallowed from moving reads
-/// or writes from before or after the call to the other side of the call to
-/// `compiler_fence`. Note that it does **not** prevent the *hardware*
-/// from doing such re-ordering. This is not a problem in a single-threaded,
-/// execution context, but when other threads may modify memory at the same
-/// time, stronger synchronization primitives such as [`fence`] are required.
+/// Like [`fence`], this function establishes synchronization with other atomic operations and
+/// fences. However, unlike [`fence`], `compiler_fence` only establishes synchronization with
+/// operations *in the same thread*. This may at first sound rather useless, since code within a
+/// thread is typically already totally ordered and does not need any further synchronization.
+/// However, there are cases where code can run on the same thread without being ordered:
+/// - The most common case is that of a *signal handler*: a signal handler runs in the same thread
+///   as the code it interrupted, but it is not ordered with respect to that code. `compiler_fence`
+///   can be used to establish synchronization between a thread and its signal handler, the same way
+///   that `fence` can be used to establish synchronization across threads.
+/// - Similar situations can arise in embedded programming with interrupt handlers, or in custom
+///   implementations of preemptive green threads. In general, `compiler_fence` can establish
+///   synchronization with code that is guaranteed to run on the same hardware CPU.
 ///
-/// The re-ordering prevented by the different ordering semantics are:
+/// See [`fence`] for how a fence can be used to achieve synchronization. Note that just like
+/// [`fence`], synchronization still requires atomic operations to be used in both threads -- it is
+/// not possible to perform synchronization entirely with fences and non-atomic operations.
 ///
-///  - with [`SeqCst`], no re-ordering of reads and writes across this point is allowed.
-///  - with [`Release`], preceding reads and writes cannot be moved past subsequent writes.
-///  - with [`Acquire`], subsequent reads and writes cannot be moved ahead of preceding reads.
-///  - with [`AcqRel`], both of the above rules are enforced.
+/// `compiler_fence` does not emit any machine code, but restricts the kinds of memory re-ordering
+/// the compiler is allowed to do. `compiler_fence` corresponds to [`atomic_signal_fence`] in C and
+/// C++.
 ///
-/// `compiler_fence` is generally only useful for preventing a thread from
-/// racing *with itself*. That is, if a given thread is executing one piece
-/// of code, and is then interrupted, and starts executing code elsewhere
-/// (while still in the same thread, and conceptually still on the same
-/// core). In traditional programs, this can only occur when a signal
-/// handler is registered. In more low-level code, such situations can also
-/// arise when handling interrupts, when implementing green threads with
-/// pre-emption, etc. Curious readers are encouraged to read the Linux kernel's
-/// discussion of [memory barriers].
+/// [`atomic_signal_fence`]: https://en.cppreference.com/w/cpp/atomic/atomic_signal_fence
 ///
 /// # Panics
 ///
@@ -3696,38 +4398,36 @@ pub fn fence(order: Ordering) {
 ///
 /// # Examples
 ///
-/// Without `compiler_fence`, the `assert_eq!` in following code
-/// is *not* guaranteed to succeed, despite everything happening in a single thread.
-/// To see why, remember that the compiler is free to swap the stores to
-/// `IMPORTANT_VARIABLE` and `IS_READY` since they are both
-/// `Ordering::Relaxed`. If it does, and the signal handler is invoked right
-/// after `IS_READY` is updated, then the signal handler will see
-/// `IS_READY=1`, but `IMPORTANT_VARIABLE=0`.
-/// Using a `compiler_fence` remedies this situation.
+/// Without the two `compiler_fence` calls, the read of `IMPORTANT_VARIABLE` in `signal_handler`
+/// is *undefined behavior* due to a data race, despite everything happening in a single thread.
+/// This is because the signal handler is considered to run concurrently with its associated
+/// thread, and explicit synchronization is required to pass data between a thread and its
+/// signal handler. The code below uses two `compiler_fence` calls to establish the usual
+/// release-acquire synchronization pattern (see [`fence`] for an image).
 ///
 /// ```
-/// use std::sync::atomic::{AtomicBool, AtomicUsize};
+/// use std::sync::atomic::AtomicBool;
 /// use std::sync::atomic::Ordering;
 /// use std::sync::atomic::compiler_fence;
 ///
-/// static IMPORTANT_VARIABLE: AtomicUsize = AtomicUsize::new(0);
+/// static mut IMPORTANT_VARIABLE: usize = 0;
 /// static IS_READY: AtomicBool = AtomicBool::new(false);
 ///
 /// fn main() {
-///     IMPORTANT_VARIABLE.store(42, Ordering::Relaxed);
-///     // prevent earlier writes from being moved beyond this point
+///     unsafe { IMPORTANT_VARIABLE = 42 };
+///     // Marks earlier writes as being released with future relaxed stores.
 ///     compiler_fence(Ordering::Release);
 ///     IS_READY.store(true, Ordering::Relaxed);
 /// }
 ///
 /// fn signal_handler() {
 ///     if IS_READY.load(Ordering::Relaxed) {
-///         assert_eq!(IMPORTANT_VARIABLE.load(Ordering::Relaxed), 42);
+///         // Acquires writes that were released with relaxed stores that we read from.
+///         compiler_fence(Ordering::Acquire);
+///         assert_eq!(unsafe { IMPORTANT_VARIABLE }, 42);
 ///     }
 /// }
 /// ```
-///
-/// [memory barriers]: https://www.kernel.org/doc/Documentation/memory-barriers.txt
 #[inline]
 #[stable(feature = "compiler_fences", since = "1.21.0")]
 #[rustc_diagnostic_item = "compiler_fence"]
@@ -3736,11 +4436,11 @@ pub fn compiler_fence(order: Ordering) {
     // SAFETY: using an atomic fence is safe.
     unsafe {
         match order {
-            Acquire => intrinsics::atomic_singlethreadfence_acquire(),
-            Release => intrinsics::atomic_singlethreadfence_release(),
-            AcqRel => intrinsics::atomic_singlethreadfence_acqrel(),
-            SeqCst => intrinsics::atomic_singlethreadfence_seqcst(),
-            Relaxed => panic!("there is no such thing as a relaxed compiler fence"),
+            Acquire => intrinsics::atomic_singlethreadfence::<{ AO::Acquire }>(),
+            Release => intrinsics::atomic_singlethreadfence::<{ AO::Release }>(),
+            AcqRel => intrinsics::atomic_singlethreadfence::<{ AO::AcqRel }>(),
+            SeqCst => intrinsics::atomic_singlethreadfence::<{ AO::SeqCst }>(),
+            Relaxed => panic!("there is no such thing as a relaxed fence"),
         }
     }
 }

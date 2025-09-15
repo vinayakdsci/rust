@@ -1,21 +1,19 @@
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_middle::ty::{self, Region, Ty, TyCtxt};
-use rustc_middle::ty::{GenericArg, GenericArgKind};
+use rustc_middle::ty::outlives::{Component, push_outlives_components};
+use rustc_middle::ty::{self, GenericArg, GenericArgKind, Region, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
 use rustc_span::Span;
-use rustc_type_ir::outlives::{push_outlives_components, Component};
 use smallvec::smallvec;
 
 /// Tracks the `T: 'a` or `'a: 'a` predicates that we have inferred
 /// must be added to the struct header.
-pub(crate) type RequiredPredicates<'tcx> =
-    FxIndexMap<ty::OutlivesPredicate<'tcx, ty::GenericArg<'tcx>>, Span>;
+pub(crate) type RequiredPredicates<'tcx> = FxIndexMap<ty::ArgOutlivesPredicate<'tcx>, Span>;
 
 /// Given a requirement `T: 'a` or `'b: 'a`, deduce the
 /// outlives_component and add it to `required_predicates`
 pub(crate) fn insert_outlives_predicate<'tcx>(
     tcx: TyCtxt<'tcx>,
-    kind: GenericArg<'tcx>,
+    arg: GenericArg<'tcx>,
     outlived_region: Region<'tcx>,
     span: Span,
     required_predicates: &mut RequiredPredicates<'tcx>,
@@ -26,7 +24,7 @@ pub(crate) fn insert_outlives_predicate<'tcx>(
         return;
     }
 
-    match kind.unpack() {
+    match arg.kind() {
         GenericArgKind::Type(ty) => {
             // `T: 'outlived_region` for some type `T`
             // But T could be a lot of things:
@@ -136,7 +134,7 @@ pub(crate) fn insert_outlives_predicate<'tcx>(
             if !is_free_region(r) {
                 return;
             }
-            required_predicates.entry(ty::OutlivesPredicate(kind, outlived_region)).or_insert(span);
+            required_predicates.entry(ty::OutlivesPredicate(arg, outlived_region)).or_insert(span);
         }
 
         GenericArgKind::Const(_) => {
@@ -147,7 +145,7 @@ pub(crate) fn insert_outlives_predicate<'tcx>(
 
 fn is_free_region(region: Region<'_>) -> bool {
     // First, screen for regions that might appear in a type header.
-    match *region {
+    match region.kind() {
         // These correspond to `T: 'a` relationships:
         //
         //     struct Foo<'a, T> {

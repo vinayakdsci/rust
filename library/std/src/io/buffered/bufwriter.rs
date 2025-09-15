@@ -1,10 +1,8 @@
-use crate::error;
-use crate::fmt;
 use crate::io::{
-    self, ErrorKind, IntoInnerError, IoSlice, Seek, SeekFrom, Write, DEFAULT_BUF_SIZE,
+    self, DEFAULT_BUF_SIZE, ErrorKind, IntoInnerError, IoSlice, Seek, SeekFrom, Write,
 };
 use crate::mem::{self, ManuallyDrop};
-use crate::ptr;
+use crate::{error, fmt, ptr};
 
 /// Wraps a writer and buffers its output.
 ///
@@ -94,6 +92,16 @@ impl<W: Write> BufWriter<W> {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new(inner: W) -> BufWriter<W> {
         BufWriter::with_capacity(DEFAULT_BUF_SIZE, inner)
+    }
+
+    pub(crate) fn try_new_buffer() -> io::Result<Vec<u8>> {
+        Vec::try_with_capacity(DEFAULT_BUF_SIZE).map_err(|_| {
+            io::const_error!(ErrorKind::OutOfMemory, "failed to allocate write buffer")
+        })
+    }
+
+    pub(crate) fn with_buffer(inner: W, buf: Vec<u8>) -> Self {
+        Self { inner, buf, panicked: false }
     }
 
     /// Creates a new `BufWriter<W>` with at least the specified buffer capacity.
@@ -230,7 +238,7 @@ impl<W: ?Sized + Write> BufWriter<W> {
 
             match r {
                 Ok(0) => {
-                    return Err(io::const_io_error!(
+                    return Err(io::const_error!(
                         ErrorKind::WriteZero,
                         "failed to write the buffered data",
                     ));
@@ -484,23 +492,15 @@ impl WriterPanicked {
     pub fn into_inner(self) -> Vec<u8> {
         self.buf
     }
-
-    const DESCRIPTION: &'static str =
-        "BufWriter inner writer panicked, what data remains unwritten is not known";
 }
 
 #[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
-impl error::Error for WriterPanicked {
-    #[allow(deprecated, deprecated_in_future)]
-    fn description(&self) -> &str {
-        Self::DESCRIPTION
-    }
-}
+impl error::Error for WriterPanicked {}
 
 #[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
 impl fmt::Display for WriterPanicked {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", Self::DESCRIPTION)
+        "BufWriter inner writer panicked, what data remains unwritten is not known".fmt(f)
     }
 }
 

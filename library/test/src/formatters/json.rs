@@ -1,19 +1,19 @@
-use std::{borrow::Cow, io, io::prelude::Write};
+use std::borrow::Cow;
+use std::io;
+use std::io::prelude::Write;
 
 use super::OutputFormatter;
-use crate::{
-    console::{ConsoleTestDiscoveryState, ConsoleTestState, OutputLocation},
-    test_result::TestResult,
-    time,
-    types::TestDesc,
-};
+use crate::console::{ConsoleTestDiscoveryState, ConsoleTestState, OutputLocation};
+use crate::test_result::TestResult;
+use crate::time;
+use crate::types::TestDesc;
 
 pub(crate) struct JsonFormatter<T> {
     out: OutputLocation<T>,
 }
 
 impl<T: Write> JsonFormatter<T> {
-    pub fn new(out: OutputLocation<T>) -> Self {
+    pub(crate) fn new(out: OutputLocation<T>) -> Self {
         Self { out }
     }
 
@@ -214,6 +214,17 @@ impl<T: Write> OutputFormatter for JsonFormatter<T> {
         ))?;
 
         Ok(state.failed == 0)
+    }
+
+    fn write_merged_doctests_times(
+        &mut self,
+        total_time: f64,
+        compilation_time: f64,
+    ) -> io::Result<()> {
+        let newline = "\n";
+        self.writeln_message(&format!(
+            r#"{{ "type": "report", "total_time": {total_time}, "compilation_time": {compilation_time} }}{newline}"#,
+        ))
     }
 }
 

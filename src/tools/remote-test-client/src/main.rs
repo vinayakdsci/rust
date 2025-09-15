@@ -5,15 +5,14 @@
 //! Here is also where we bake in the support to spawn the QEMU emulator as
 //! well.
 
-use std::env;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::{self, BufWriter};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::Duration;
+use std::{env, thread};
 
 const REMOTE_ADDR_ENV: &str = "TEST_DEVICE_ADDR";
 const DEFAULT_ADDR: &str = "127.0.0.1:12345";
@@ -336,7 +335,9 @@ fn run(support_lib_count: usize, exe: String, all_args: Vec<String>) {
         std::process::exit(code);
     } else {
         println!("died due to signal {}", code);
-        std::process::exit(3);
+        // Behave like bash and other tools and exit with 128 + the signal
+        // number. That way we can avoid special case code in other places.
+        std::process::exit(128 + code);
     }
 }
 

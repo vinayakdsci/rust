@@ -1,9 +1,22 @@
 //@compile-flags: -Zmiri-strict-provenance
-#![feature(portable_simd, adt_const_params, core_intrinsics, repr_simd)]
+#![feature(
+    portable_simd,
+    unsized_const_params,
+    adt_const_params,
+    rustc_attrs,
+    intrinsics,
+    core_intrinsics,
+    repr_simd
+)]
 #![allow(incomplete_features, internal_features)]
 use std::intrinsics::simd as intrinsics;
 use std::ptr;
-use std::simd::{prelude::*, StdFloat};
+use std::simd::StdFloat;
+use std::simd::prelude::*;
+
+#[rustc_intrinsic]
+#[rustc_nounwind]
+pub unsafe fn simd_shuffle_const_generic<T, U, const IDX: &'static [u32]>(x: T, y: T) -> U;
 
 fn simd_ops_f32() {
     let a = f32x4::splat(10.0);
@@ -26,6 +39,17 @@ fn simd_ops_f32() {
         f32x4::splat(-3.2).mul_add(b, f32x4::splat(f32::NEG_INFINITY)),
         f32x4::splat(f32::NEG_INFINITY)
     );
+
+    unsafe {
+        assert_eq!(intrinsics::simd_relaxed_fma(a, b, a), (a * b) + a);
+        assert_eq!(intrinsics::simd_relaxed_fma(b, b, a), (b * b) + a);
+        assert_eq!(intrinsics::simd_relaxed_fma(a, b, b), (a * b) + b);
+        assert_eq!(
+            intrinsics::simd_relaxed_fma(f32x4::splat(-3.2), b, f32x4::splat(f32::NEG_INFINITY)),
+            f32x4::splat(f32::NEG_INFINITY)
+        );
+    }
+
     assert_eq!((a * a).sqrt(), a);
     assert_eq!((b * b).sqrt(), b.abs());
 
@@ -80,6 +104,17 @@ fn simd_ops_f64() {
         f64x4::splat(-3.2).mul_add(b, f64x4::splat(f64::NEG_INFINITY)),
         f64x4::splat(f64::NEG_INFINITY)
     );
+
+    unsafe {
+        assert_eq!(intrinsics::simd_relaxed_fma(a, b, a), (a * b) + a);
+        assert_eq!(intrinsics::simd_relaxed_fma(b, b, a), (b * b) + a);
+        assert_eq!(intrinsics::simd_relaxed_fma(a, b, b), (a * b) + b);
+        assert_eq!(
+            intrinsics::simd_relaxed_fma(f64x4::splat(-3.2), b, f64x4::splat(f64::NEG_INFINITY)),
+            f64x4::splat(f64::NEG_INFINITY)
+        );
+    }
+
     assert_eq!((a * a).sqrt(), a);
     assert_eq!((b * b).sqrt(), b.abs());
 
@@ -264,27 +299,6 @@ fn simd_mask() {
         }
     }
 
-    // This used to cause an ICE. It exercises simd_select_bitmask with an array as input.
-    let bitmask = u8x4::from_array([0b00001101, 0, 0, 0]);
-    assert_eq!(
-        mask32x4::from_bitmask_vector(bitmask),
-        mask32x4::from_array([true, false, true, true]),
-    );
-    let bitmask = u8x8::from_array([0b01000101, 0, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        mask32x8::from_bitmask_vector(bitmask),
-        mask32x8::from_array([true, false, true, false, false, false, true, false]),
-    );
-    let bitmask =
-        u8x16::from_array([0b01000101, 0b11110000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(
-        mask32x16::from_bitmask_vector(bitmask),
-        mask32x16::from_array([
-            true, false, true, false, false, false, true, false, false, false, false, false, true,
-            true, true, true,
-        ]),
-    );
-
     // Also directly call simd_select_bitmask, to test both kinds of argument types.
     unsafe {
         // These masks are exactly the results we got out above in the `simd_bitmask` tests.
@@ -317,16 +331,32 @@ fn simd_mask() {
         );
         assert_eq!(selected1, i32x4::from_array([0, 0, 0, 1]));
         assert_eq!(selected2, selected1);
+        // Non-zero "padding" (the extra bits) is also allowed.
+        let selected1 = simd_select_bitmask::<u8, _>(
+            if cfg!(target_endian = "little") { 0b11111000 } else { 0b11110001 },
+            i32x4::splat(1), // yes
+            i32x4::splat(0), // no
+        );
+        let selected2 = simd_select_bitmask::<[u8; 1], _>(
+            if cfg!(target_endian = "little") { [0b11111000] } else { [0b11110001] },
+            i32x4::splat(1), // yes
+            i32x4::splat(0), // no
+        );
+        assert_eq!(selected1, i32x4::from_array([0, 0, 0, 1]));
+        assert_eq!(selected2, selected1);
     }
 
     // Non-power-of-2 multi-byte mask.
     #[repr(simd, packed)]
     #[allow(non_camel_case_types)]
-    #[derive(Copy, Clone, Debug, PartialEq)]
+    #[derive(Copy, Clone)]
     struct i32x10([i32; 10]);
     impl i32x10 {
         fn splat(x: i32) -> Self {
             Self([x; 10])
+        }
+        fn into_array(self) -> [i32; 10] {
+            unsafe { std::mem::transmute(self) }
         }
     }
     unsafe {
@@ -350,18 +380,21 @@ fn simd_mask() {
             i32x10::splat(!0), // yes
             i32x10::splat(0),  // no
         );
-        assert_eq!(selected1, mask);
-        assert_eq!(selected2, mask);
+        assert_eq!(selected1.into_array(), mask.into_array());
+        assert_eq!(selected2.into_array(), mask.into_array());
     }
 
     // Test for a mask where the next multiple of 8 is not a power of two.
     #[repr(simd, packed)]
     #[allow(non_camel_case_types)]
-    #[derive(Copy, Clone, Debug, PartialEq)]
+    #[derive(Copy, Clone)]
     struct i32x20([i32; 20]);
     impl i32x20 {
         fn splat(x: i32) -> Self {
             Self([x; 20])
+        }
+        fn into_array(self) -> [i32; 20] {
+            unsafe { std::mem::transmute(self) }
         }
     }
     unsafe {
@@ -392,8 +425,8 @@ fn simd_mask() {
             i32x20::splat(!0), // yes
             i32x20::splat(0),  // no
         );
-        assert_eq!(selected1, mask);
-        assert_eq!(selected2, mask);
+        assert_eq!(selected1.into_array(), mask.into_array());
+        assert_eq!(selected2.into_array(), mask.into_array());
     }
 }
 
@@ -543,6 +576,10 @@ fn simd_round() {
         f32x4::from_array([1.0, 1.0, 2.0, -5.0])
     );
     assert_eq!(
+        unsafe { intrinsics::simd_round_ties_even(f32x4::from_array([0.9, 1.001, 2.0, -4.5])) },
+        f32x4::from_array([1.0, 1.0, 2.0, -4.0])
+    );
+    assert_eq!(
         f32x4::from_array([0.9, 1.001, 2.0, -4.5]).trunc(),
         f32x4::from_array([0.0, 1.0, 2.0, -4.0])
     );
@@ -558,6 +595,10 @@ fn simd_round() {
     assert_eq!(
         f64x4::from_array([0.9, 1.001, 2.0, -4.5]).round(),
         f64x4::from_array([1.0, 1.0, 2.0, -5.0])
+    );
+    assert_eq!(
+        unsafe { intrinsics::simd_round_ties_even(f64x4::from_array([0.9, 1.001, 2.0, -4.5])) },
+        f64x4::from_array([1.0, 1.0, 2.0, -4.0])
     );
     assert_eq!(
         f64x4::from_array([0.9, 1.001, 2.0, -4.5]).trunc(),
@@ -605,14 +646,17 @@ fn simd_intrinsics() {
             simd_select(i8x4::from_array([0, -1, -1, 0]), b, a),
             i32x4::from_array([10, 2, 10, 10])
         );
-        assert_eq!(simd_shuffle_generic::<_, i32x4, { &[3, 1, 0, 2] }>(a, b), a,);
-        assert_eq!(simd_shuffle::<_, _, i32x4>(a, b, const { [3u32, 1, 0, 2] }), a,);
+        assert_eq!(simd_shuffle_const_generic::<_, i32x4, { &[3, 1, 0, 2] }>(a, b), a,);
         assert_eq!(
-            simd_shuffle_generic::<_, i32x4, { &[7, 5, 4, 6] }>(a, b),
+            simd_shuffle::<_, _, i32x4>(a, b, const { u32x4::from_array([3u32, 1, 0, 2]) }),
+            a,
+        );
+        assert_eq!(
+            simd_shuffle_const_generic::<_, i32x4, { &[7, 5, 4, 6] }>(a, b),
             i32x4::from_array([4, 2, 1, 10]),
         );
         assert_eq!(
-            simd_shuffle::<_, _, i32x4>(a, b, const { [7u32, 5, 4, 6] }),
+            simd_shuffle::<_, _, i32x4>(a, b, const { u32x4::from_array([7u32, 5, 4, 6]) }),
             i32x4::from_array([4, 2, 1, 10]),
         );
     }
@@ -670,12 +714,12 @@ fn simd_ops_non_pow2() {
     let x = SimdPacked([1u32; 3]);
     let y = SimdPacked([2u32; 3]);
     let z = unsafe { intrinsics::simd_add(x, y) };
-    assert_eq!({ z.0 }, [3u32; 3]);
+    assert_eq!(unsafe { *(&raw const z).cast::<[u32; 3]>() }, [3u32; 3]);
 
     let x = SimdPadded([1u32; 3]);
     let y = SimdPadded([2u32; 3]);
     let z = unsafe { intrinsics::simd_add(x, y) };
-    assert_eq!(z.0, [3u32; 3]);
+    assert_eq!(unsafe { *(&raw const z).cast::<[u32; 3]>() }, [3u32; 3]);
 }
 
 fn main() {

@@ -1,12 +1,13 @@
-use clippy_utils::consts::{constant_full_int, constant_simple, Constant, FullInt};
+use clippy_utils::consts::{ConstEvalCtxt, Constant, FullInt, integer_const, is_zero_integer_const};
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::{clip, peel_hir_expr_refs, unsext};
+use clippy_utils::{ExprUseNode, clip, expr_use_ctxt, peel_hir_expr_refs, unsext};
 use rustc_errors::Applicability;
-use rustc_hir::{BinOpKind, Expr, ExprKind, Node};
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::{BinOpKind, Expr, ExprKind, Node, Path, QPath};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::Span;
+use rustc_span::{Span, kw};
 
 use super::IDENTITY_OP;
 
@@ -17,7 +18,7 @@ pub(crate) fn check<'tcx>(
     left: &'tcx Expr<'_>,
     right: &'tcx Expr<'_>,
 ) {
-    if !is_allowed(cx, op, left, right) {
+    if !is_allowed(cx, expr, op, left, right) {
         return;
     }
 
@@ -42,83 +43,43 @@ pub(crate) fn check<'tcx>(
 
     match op {
         BinOpKind::Add | BinOpKind::BitOr | BinOpKind::BitXor => {
-            let _ = check_op(
-                cx,
-                left,
-                0,
-                expr.span,
-                peeled_right_span,
-                needs_parenthesis(cx, expr, right),
-                right_is_coerced_to_value,
-            ) || check_op(
-                cx,
-                right,
-                0,
-                expr.span,
-                peeled_left_span,
-                Parens::Unneeded,
-                left_is_coerced_to_value,
-            );
+            if is_redundant_op(cx, left, 0) {
+                let paren = needs_parenthesis(cx, expr, right);
+                span_ineffective_operation(cx, expr.span, peeled_right_span, paren, right_is_coerced_to_value);
+            } else if is_redundant_op(cx, right, 0) {
+                let paren = needs_parenthesis(cx, expr, left);
+                span_ineffective_operation(cx, expr.span, peeled_left_span, paren, left_is_coerced_to_value);
+            }
         },
         BinOpKind::Shl | BinOpKind::Shr | BinOpKind::Sub => {
-            let _ = check_op(
-                cx,
-                right,
-                0,
-                expr.span,
-                peeled_left_span,
-                Parens::Unneeded,
-                left_is_coerced_to_value,
-            );
+            if is_redundant_op(cx, right, 0) {
+                let paren = needs_parenthesis(cx, expr, left);
+                span_ineffective_operation(cx, expr.span, peeled_left_span, paren, left_is_coerced_to_value);
+            }
         },
         BinOpKind::Mul => {
-            let _ = check_op(
-                cx,
-                left,
-                1,
-                expr.span,
-                peeled_right_span,
-                needs_parenthesis(cx, expr, right),
-                right_is_coerced_to_value,
-            ) || check_op(
-                cx,
-                right,
-                1,
-                expr.span,
-                peeled_left_span,
-                Parens::Unneeded,
-                left_is_coerced_to_value,
-            );
+            if is_redundant_op(cx, left, 1) {
+                let paren = needs_parenthesis(cx, expr, right);
+                span_ineffective_operation(cx, expr.span, peeled_right_span, paren, right_is_coerced_to_value);
+            } else if is_redundant_op(cx, right, 1) {
+                let paren = needs_parenthesis(cx, expr, left);
+                span_ineffective_operation(cx, expr.span, peeled_left_span, paren, left_is_coerced_to_value);
+            }
         },
         BinOpKind::Div => {
-            let _ = check_op(
-                cx,
-                right,
-                1,
-                expr.span,
-                peeled_left_span,
-                Parens::Unneeded,
-                left_is_coerced_to_value,
-            );
+            if is_redundant_op(cx, right, 1) {
+                let paren = needs_parenthesis(cx, expr, left);
+                span_ineffective_operation(cx, expr.span, peeled_left_span, paren, left_is_coerced_to_value);
+            }
         },
         BinOpKind::BitAnd => {
-            let _ = check_op(
-                cx,
-                left,
-                -1,
-                expr.span,
-                peeled_right_span,
-                needs_parenthesis(cx, expr, right),
-                right_is_coerced_to_value,
-            ) || check_op(
-                cx,
-                right,
-                -1,
-                expr.span,
-                peeled_left_span,
-                Parens::Unneeded,
-                left_is_coerced_to_value,
-            );
+            if is_redundant_op(cx, left, -1) {
+                let paren = needs_parenthesis(cx, expr, right);
+                span_ineffective_operation(cx, expr.span, peeled_right_span, paren, right_is_coerced_to_value);
+            } else if is_redundant_op(cx, right, -1) {
+                let paren = needs_parenthesis(cx, expr, left);
+                span_ineffective_operation(cx, expr.span, peeled_left_span, paren, left_is_coerced_to_value);
+            }
         },
         BinOpKind::Rem => check_remainder(cx, left, right, expr.span, left.span),
         _ => (),
@@ -138,60 +99,99 @@ enum Parens {
     Unneeded,
 }
 
-/// Checks if `left op right` needs parenthesis when reduced to `right`
+/// Checks if a binary expression needs parenthesis when reduced to just its
+/// right or left child.
+///
+/// e.g. `-(x + y + 0)` cannot be reduced to `-x + y`, as the behavior changes silently.
+/// e.g. `1u64 + ((x + y + 0i32) as u64)` cannot be reduced to `1u64 + x + y as u64`, since
+/// the cast expression will not apply to the same expression.
 /// e.g. `0 + if b { 1 } else { 2 } + if b { 3 } else { 4 }` cannot be reduced
 /// to `if b { 1 } else { 2 } + if b { 3 } else { 4 }` where the `if` could be
-/// interpreted as a statement
+/// interpreted as a statement. The same behavior happens for `match`, `loop`,
+/// and blocks.
+/// e.g.  `2 * (0 + { a })` can be reduced to `2 * { a }` without the need for parenthesis,
+/// but `1 * ({ a } + 4)` cannot be reduced to `{ a } + 4`, as a block at the start of a line
+/// will be interpreted as a statement instead of an expression.
 ///
-/// See #8724
-fn needs_parenthesis(cx: &LateContext<'_>, binary: &Expr<'_>, right: &Expr<'_>) -> Parens {
-    match right.kind {
+/// See #8724, #13470
+fn needs_parenthesis(cx: &LateContext<'_>, binary: &Expr<'_>, child: &Expr<'_>) -> Parens {
+    match child.kind {
         ExprKind::Binary(_, lhs, _) | ExprKind::Cast(lhs, _) => {
-            // ensure we're checking against the leftmost expression of `right`
-            //
-            //     ~~~ `lhs`
-            // 0 + {4} * 2
-            //     ~~~~~~~ `right`
-            return needs_parenthesis(cx, binary, lhs);
+            // For casts and binary expressions, we want to add parenthesis if
+            // the parent HIR node is an expression, or if the parent HIR node
+            // is a Block or Stmt, and the new left hand side would need
+            // parenthesis be treated as a statement rather than an expression.
+            if let Some((_, parent)) = cx.tcx.hir_parent_iter(binary.hir_id).next() {
+                match parent {
+                    Node::Expr(_) => return Parens::Needed,
+                    Node::Block(_) | Node::Stmt(_) => {
+                        // ensure we're checking against the leftmost expression of `child`
+                        //
+                        // ~~~~~~~~~~~ `binary`
+                        //     ~~~ `lhs`
+                        // 0 + {4} * 2
+                        //     ~~~~~~~ `child`
+                        return needs_parenthesis(cx, binary, lhs);
+                    },
+                    _ => return Parens::Unneeded,
+                }
+            }
         },
-        ExprKind::If(..) | ExprKind::Match(..) | ExprKind::Block(..) | ExprKind::Loop(..) => {},
-        _ => return Parens::Unneeded,
+        ExprKind::If(..) | ExprKind::Match(..) | ExprKind::Block(..) | ExprKind::Loop(..) => {
+            // For if, match, block, and loop expressions, we want to add parenthesis if
+            // the closest ancestor node that is not an expression is a block or statement.
+            // This would mean that the rustfix suggestion will appear at the start of a line, which causes
+            // these expressions to be interpreted as statements if they do not have parenthesis.
+            let mut prev_id = binary.hir_id;
+            for (_, parent) in cx.tcx.hir_parent_iter(binary.hir_id) {
+                if let Node::Expr(expr) = parent
+                    && let ExprKind::Binary(_, lhs, _) | ExprKind::Cast(lhs, _) | ExprKind::Unary(_, lhs) = expr.kind
+                    && lhs.hir_id == prev_id
+                {
+                    // keep going until we find a node that encompasses left of `binary`
+                    prev_id = expr.hir_id;
+                    continue;
+                }
+
+                match parent {
+                    Node::Block(_) | Node::Stmt(_) => return Parens::Needed,
+                    _ => return Parens::Unneeded,
+                };
+            }
+        },
+        _ => {
+            return Parens::Unneeded;
+        },
     }
-
-    let mut prev_id = binary.hir_id;
-    for (_, node) in cx.tcx.hir().parent_iter(binary.hir_id) {
-        if let Node::Expr(expr) = node
-            && let ExprKind::Binary(_, lhs, _) | ExprKind::Cast(lhs, _) = expr.kind
-            && lhs.hir_id == prev_id
-        {
-            // keep going until we find a node that encompasses left of `binary`
-            prev_id = expr.hir_id;
-            continue;
-        }
-
-        match node {
-            Node::Block(_) | Node::Stmt(_) => break,
-            _ => return Parens::Unneeded,
-        };
-    }
-
     Parens::Needed
 }
 
-fn is_allowed(cx: &LateContext<'_>, cmp: BinOpKind, left: &Expr<'_>, right: &Expr<'_>) -> bool {
+fn is_allowed<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'tcx>,
+    cmp: BinOpKind,
+    left: &Expr<'tcx>,
+    right: &Expr<'tcx>,
+) -> bool {
+    // Exclude case where the left or right side is associated function call returns a type which is
+    // `Self` that is not given explicitly, and the expression is not a let binding's init
+    // expression and the let binding has a type annotation, or a function's return value.
+    if (is_assoc_fn_without_type_instance(cx, left) || is_assoc_fn_without_type_instance(cx, right))
+        && !is_expr_used_with_type_annotation(cx, expr)
+    {
+        return false;
+    }
+
     // This lint applies to integers and their references
     cx.typeck_results().expr_ty(left).peel_refs().is_integral()
         && cx.typeck_results().expr_ty(right).peel_refs().is_integral()
         // `1 << 0` is a common pattern in bit manipulation code
-        && !(cmp == BinOpKind::Shl
-            && constant_simple(cx, cx.typeck_results(), right) == Some(Constant::Int(0))
-            && constant_simple(cx, cx.typeck_results(), left) == Some(Constant::Int(1)))
+        && !(cmp == BinOpKind::Shl && is_zero_integer_const(cx, right) && integer_const(cx, left) == Some(1))
 }
 
 fn check_remainder(cx: &LateContext<'_>, left: &Expr<'_>, right: &Expr<'_>, span: Span, arg: Span) {
-    let lhs_const = constant_full_int(cx, cx.typeck_results(), left);
-    let rhs_const = constant_full_int(cx, cx.typeck_results(), right);
-    if match (lhs_const, rhs_const) {
+    let ecx = ConstEvalCtxt::new(cx);
+    if match (ecx.eval_full_int(left), ecx.eval_full_int(right)) {
         (Some(FullInt::S(lv)), Some(FullInt::S(rv))) => lv.abs() < rv.abs(),
         (Some(FullInt::U(lv)), Some(FullInt::U(rv))) => lv < rv,
         _ => return,
@@ -200,8 +200,8 @@ fn check_remainder(cx: &LateContext<'_>, left: &Expr<'_>, right: &Expr<'_>, span
     }
 }
 
-fn check_op(cx: &LateContext<'_>, e: &Expr<'_>, m: i8, span: Span, arg: Span, parens: Parens, is_erased: bool) -> bool {
-    if let Some(Constant::Int(v)) = constant_simple(cx, cx.typeck_results(), e).map(Constant::peel_refs) {
+fn is_redundant_op(cx: &LateContext<'_>, e: &Expr<'_>, m: i8) -> bool {
+    if let Some(Constant::Int(v)) = ConstEvalCtxt::new(cx).eval_simple(e).map(Constant::peel_refs) {
         let check = match *cx.typeck_results().expr_ty(e).peel_refs().kind() {
             ty::Int(ity) => unsext(cx.tcx, -1_i128, ity),
             ty::Uint(uty) => clip(cx.tcx, !0, uty),
@@ -213,7 +213,6 @@ fn check_op(cx: &LateContext<'_>, e: &Expr<'_>, m: i8, span: Span, arg: Span, pa
             1 => v == 1,
             _ => unreachable!(),
         } {
-            span_ineffective_operation(cx, span, arg, parens, is_erased);
             return true;
         }
     }
@@ -248,4 +247,48 @@ fn span_ineffective_operation(
         suggestion,
         applicability,
     );
+}
+
+fn is_expr_used_with_type_annotation<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
+    match expr_use_ctxt(cx, expr).use_node(cx) {
+        ExprUseNode::LetStmt(letstmt) => letstmt.ty.is_some(),
+        ExprUseNode::Return(_) => true,
+        _ => false,
+    }
+}
+
+/// Check if the expression is an associated function without a type instance.
+/// Example:
+/// ```
+/// trait Def {
+///     fn def() -> Self;
+/// }
+/// impl Def for usize {
+///     fn def() -> Self {
+///         0
+///     }
+/// }
+/// fn test() {
+///     let _ = 0usize + &Default::default();
+///     let _ = 0usize + &Def::def();
+/// }
+/// ```
+fn is_assoc_fn_without_type_instance<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> bool {
+    if let ExprKind::Call(func, _) = peel_hir_expr_refs(expr).0.kind
+        && let ExprKind::Path(QPath::Resolved(
+            // If it's not None, don't need to go further.
+            None,
+            Path {
+                res: Res::Def(DefKind::AssocFn, def_id),
+                ..
+            },
+        )) = func.kind
+        && let output_ty = cx.tcx.fn_sig(def_id).instantiate_identity().skip_binder().output()
+        && let ty::Param(ty::ParamTy {
+            name: kw::SelfUpper, ..
+        }) = output_ty.kind()
+    {
+        return true;
+    }
+    false
 }

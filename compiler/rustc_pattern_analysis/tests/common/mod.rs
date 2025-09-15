@@ -1,16 +1,16 @@
-use rustc_pattern_analysis::{
-    constructor::{
-        Constructor, ConstructorSet, IntRange, MaybeInfiniteInt, RangeEnd, VariantVisibility,
-    },
-    usefulness::{PlaceValidity, UsefulnessReport},
-    Captures, MatchArm, PatCx, PrivateUninhabitedField,
+#![allow(dead_code, unreachable_pub)]
+use rustc_pattern_analysis::constructor::{
+    Constructor, ConstructorSet, IntRange, MaybeInfiniteInt, RangeEnd, VariantVisibility,
 };
+use rustc_pattern_analysis::pat::DeconstructedPat;
+use rustc_pattern_analysis::usefulness::{PlaceValidity, UsefulnessReport};
+use rustc_pattern_analysis::{MatchArm, PatCx, PrivateUninhabitedField};
 
 /// Sets up `tracing` for easier debugging. Tries to look like the `rustc` setup.
-pub fn init_tracing() {
+fn init_tracing() {
+    use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::Layer;
     let _ = tracing_tree::HierarchicalLayer::default()
         .with_writer(std::io::stderr)
         .with_ansi(true)
@@ -23,36 +23,54 @@ pub fn init_tracing() {
         .try_init();
 }
 
+pub(super) const UNIT: Ty = Ty::Tuple(&[]);
+pub(super) const NEVER: Ty = Ty::Enum(&[]);
+
 /// A simple set of types.
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone)]
-pub enum Ty {
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(super) enum Ty {
     /// Booleans
     Bool,
     /// 8-bit unsigned integers
     U8,
     /// Tuples.
     Tuple(&'static [Ty]),
+    /// Enum with one variant of each given type.
+    Enum(&'static [Ty]),
     /// A struct with `arity` fields of type `ty`.
     BigStruct { arity: usize, ty: &'static Ty },
     /// A enum with `arity` variants of type `ty`.
     BigEnum { arity: usize, ty: &'static Ty },
+    /// Like `Enum` but non-exhaustive.
+    NonExhaustiveEnum(&'static [Ty]),
 }
 
 /// The important logic.
 impl Ty {
-    pub fn sub_tys(&self, ctor: &Constructor<Cx>) -> Vec<Self> {
+    pub(super) fn sub_tys(&self, ctor: &Constructor<Cx>) -> Vec<Self> {
         use Constructor::*;
         match (ctor, *self) {
             (Struct, Ty::Tuple(tys)) => tys.iter().copied().collect(),
             (Struct, Ty::BigStruct { arity, ty }) => (0..arity).map(|_| *ty).collect(),
+            (Variant(i), Ty::Enum(tys) | Ty::NonExhaustiveEnum(tys)) => vec![tys[*i]],
             (Variant(_), Ty::BigEnum { ty, .. }) => vec![*ty],
             (Bool(..) | IntRange(..) | NonExhaustive | Missing | Wildcard, _) => vec![],
             _ => panic!("Unexpected ctor {ctor:?} for type {self:?}"),
         }
     }
 
-    pub fn ctor_set(&self) -> ConstructorSet<Cx> {
+    fn is_empty(&self) -> bool {
+        match *self {
+            Ty::Bool | Ty::U8 => false,
+            Ty::Tuple(tys) => tys.iter().any(|ty| ty.is_empty()),
+            Ty::Enum(tys) => tys.iter().all(|ty| ty.is_empty()),
+            Ty::BigStruct { arity, ty } => arity != 0 && ty.is_empty(),
+            Ty::BigEnum { arity, ty } => arity == 0 || ty.is_empty(),
+            Ty::NonExhaustiveEnum(..) => false,
+        }
+    }
+
+    fn ctor_set(&self) -> ConstructorSet<Cx> {
         match *self {
             Ty::Bool => ConstructorSet::Bool,
             Ty::U8 => ConstructorSet::Integers {
@@ -64,14 +82,49 @@ impl Ty {
                 range_2: None,
             },
             Ty::Tuple(..) | Ty::BigStruct { .. } => ConstructorSet::Struct { empty: false },
-            Ty::BigEnum { arity, .. } => ConstructorSet::Variants {
-                variants: (0..arity).map(|_| VariantVisibility::Visible).collect(),
+            Ty::Enum(tys) if tys.is_empty() => ConstructorSet::NoConstructors,
+            Ty::Enum(tys) => ConstructorSet::Variants {
+                variants: tys
+                    .iter()
+                    .map(|ty| {
+                        if ty.is_empty() {
+                            VariantVisibility::Empty
+                        } else {
+                            VariantVisibility::Visible
+                        }
+                    })
+                    .collect(),
                 non_exhaustive: false,
             },
+            Ty::NonExhaustiveEnum(tys) => ConstructorSet::Variants {
+                variants: tys
+                    .iter()
+                    .map(|ty| {
+                        if ty.is_empty() {
+                            VariantVisibility::Empty
+                        } else {
+                            VariantVisibility::Visible
+                        }
+                    })
+                    .collect(),
+                non_exhaustive: true,
+            },
+            Ty::BigEnum { arity: 0, .. } => ConstructorSet::NoConstructors,
+            Ty::BigEnum { arity, ty } => {
+                let vis = if ty.is_empty() {
+                    VariantVisibility::Empty
+                } else {
+                    VariantVisibility::Visible
+                };
+                ConstructorSet::Variants {
+                    variants: (0..arity).map(|_| vis).collect(),
+                    non_exhaustive: false,
+                }
+            }
         }
     }
 
-    pub fn write_variant_name(
+    fn write_variant_name(
         &self,
         f: &mut std::fmt::Formatter<'_>,
         ctor: &Constructor<Cx>,
@@ -79,6 +132,9 @@ impl Ty {
         match (*self, ctor) {
             (Ty::Tuple(..), _) => Ok(()),
             (Ty::BigStruct { .. }, _) => write!(f, "BigStruct"),
+            (Ty::Enum(..) | Ty::NonExhaustiveEnum(..), Constructor::Variant(i)) => {
+                write!(f, "Enum::Variant{i}")
+            }
             (Ty::BigEnum { .. }, Constructor::Variant(i)) => write!(f, "BigEnum::Variant{i}"),
             _ => write!(f, "{:?}::{:?}", self, ctor),
         }
@@ -86,15 +142,16 @@ impl Ty {
 }
 
 /// Compute usefulness in our simple context (and set up tracing for easier debugging).
-pub fn compute_match_usefulness<'p>(
+pub(super) fn compute_match_usefulness<'p>(
     arms: &[MatchArm<'p, Cx>],
     ty: Ty,
     scrut_validity: PlaceValidity,
-    complexity_limit: Option<usize>,
+    complexity_limit: usize,
+    exhaustive_witnesses: bool,
 ) -> Result<UsefulnessReport<'p, Cx>, ()> {
     init_tracing();
     rustc_pattern_analysis::usefulness::compute_match_usefulness(
-        &Cx,
+        &Cx { exhaustive_witnesses },
         arms,
         ty,
         scrut_validity,
@@ -103,7 +160,9 @@ pub fn compute_match_usefulness<'p>(
 }
 
 #[derive(Debug)]
-pub struct Cx;
+pub(super) struct Cx {
+    exhaustive_witnesses: bool,
+}
 
 /// The context for pattern analysis. Forwards anything interesting to `Ty` methods.
 impl PatCx for Cx {
@@ -118,20 +177,19 @@ impl PatCx for Cx {
         false
     }
 
-    fn is_min_exhaustive_patterns_feature_on(&self) -> bool {
-        false
+    fn exhaustive_witnesses(&self) -> bool {
+        self.exhaustive_witnesses
     }
 
     fn ctor_arity(&self, ctor: &Constructor<Self>, ty: &Self::Ty) -> usize {
         ty.sub_tys(ctor).len()
     }
 
-    fn ctor_sub_tys<'a>(
-        &'a self,
-        ctor: &'a Constructor<Self>,
-        ty: &'a Self::Ty,
-    ) -> impl Iterator<Item = (Self::Ty, PrivateUninhabitedField)> + ExactSizeIterator + Captures<'a>
-    {
+    fn ctor_sub_tys(
+        &self,
+        ctor: &Constructor<Self>,
+        ty: &Self::Ty,
+    ) -> impl Iterator<Item = (Self::Ty, PrivateUninhabitedField)> + ExactSizeIterator {
         ty.sub_tys(ctor).into_iter().map(|ty| (ty, PrivateUninhabitedField(false)))
     }
 
@@ -154,6 +212,14 @@ impl PatCx for Cx {
     /// Abort when reaching the complexity limit. This is what we'll check in tests.
     fn complexity_exceeded(&self) -> Result<(), Self::Error> {
         Err(())
+    }
+
+    fn report_mixed_deref_pat_ctors(
+        &self,
+        _deref_pat: &DeconstructedPat<Self>,
+        _normal_pat: &DeconstructedPat<Self>,
+    ) -> Self::Error {
+        panic!("`rustc_pattern_analysis::tests` currently doesn't test deref pattern errors")
     }
 }
 
@@ -181,16 +247,18 @@ macro_rules! pats {
     // Entrypoint
     // Parse `type; ..`
     ($ty:expr; $($rest:tt)*) => {{
-        #[allow(unused_imports)]
+        #[allow(unused)]
         use rustc_pattern_analysis::{
             constructor::{Constructor, IntRange, MaybeInfiniteInt, RangeEnd},
-            pat::DeconstructedPat,
+            pat::{DeconstructedPat, IndexedPat},
         };
         let ty = $ty;
         // The heart of the macro is designed to push `IndexedPat`s into a `Vec`, so we work around
         // that.
+        #[allow(unused)]
         let sub_tys = ::std::iter::repeat(&ty);
-        let mut vec = Vec::new();
+        #[allow(unused)]
+        let mut vec: Vec<IndexedPat<_>> = Vec::new();
         pats!(@ctor(vec:vec, sub_tys:sub_tys, idx:0) $($rest)*);
         vec.into_iter().map(|ipat| ipat.pat).collect::<Vec<_>>()
     }};
@@ -225,6 +293,8 @@ macro_rules! pats {
         let ctor = Constructor::Wildcard;
         pats!(@pat($($args)*, ctor:ctor) $($rest)*)
     }};
+    // Nothing
+    (@ctor($($args:tt)*)) => {};
 
     // Integers and int ranges
     (@ctor($($args:tt)*) $($start:literal)?..$end:literal $($rest:tt)*) => {{

@@ -30,11 +30,15 @@
 //! platform-specific cfgs are allowed. Not sure yet how to deal with
 //! this in the long term.
 
-use crate::walk::{filter_dirs, walk};
 use std::path::Path;
+
+use crate::walk::{filter_dirs, walk};
 
 // Paths that may contain platform-specific code.
 const EXCEPTION_PATHS: &[&str] = &[
+    "library/compiler-builtins",
+    "library/std_detect",
+    "library/windows_targets",
     "library/panic_abort",
     "library/panic_unwind",
     "library/unwind",
@@ -46,8 +50,9 @@ const EXCEPTION_PATHS: &[&str] = &[
     // we must use `#[cfg(windows)]` to conditionally compile the
     // correct `VaList` structure for windows.
     "library/core/src/ffi/va_list.rs",
-    // We placed a linkage against Windows libraries here
+    // core::ffi contains platform-specific type and linkage configuration
     "library/core/src/ffi/mod.rs",
+    "library/core/src/ffi/primitives.rs",
     "library/std/src/sys", // Platform-specific code for std lives here.
     "library/std/src/os",  // Platform-specific public interfaces
     // Temporary `std` exceptions
@@ -82,7 +87,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             return;
         }
 
-        check_cfgs(contents, &file, bad, &mut saw_target_arch, &mut saw_cfg_bang);
+        check_cfgs(contents, file, bad, &mut saw_target_arch, &mut saw_cfg_bang);
     });
 
     assert!(saw_target_arch);

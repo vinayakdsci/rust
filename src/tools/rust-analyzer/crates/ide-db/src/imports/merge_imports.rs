@@ -5,13 +5,12 @@ use itertools::{EitherOrBoth, Itertools};
 use parser::T;
 use stdx::is_upper_snake_case;
 use syntax::{
-    algo,
+    Direction, SyntaxElement, algo,
     ast::{
-        self, edit_in_place::Removable, make, AstNode, HasAttrs, HasName, HasVisibility,
-        PathSegmentKind,
+        self, AstNode, HasAttrs, HasName, HasVisibility, PathSegmentKind, edit_in_place::Removable,
+        make,
     },
     ted::{self, Position},
-    Direction, SyntaxElement,
 };
 
 use crate::syntax_helpers::node_ext::vis_eq;
@@ -93,17 +92,25 @@ fn try_merge_trees_mut(lhs: &ast::UseTree, rhs: &ast::UseTree, merge: MergeBehav
         let rhs_path = rhs.path()?;
 
         let (lhs_prefix, rhs_prefix) = common_prefix(&lhs_path, &rhs_path)?;
-        if !(lhs.is_simple_path()
+        if lhs.is_simple_path()
             && rhs.is_simple_path()
             && lhs_path == lhs_prefix
-            && rhs_path == rhs_prefix)
+            && rhs_path == rhs_prefix
         {
-            lhs.split_prefix(&lhs_prefix);
-            rhs.split_prefix(&rhs_prefix);
-        } else {
+            // we can't merge if the renames are different (`A as a` and `A as b`),
+            // and we can safely return here
+            let lhs_name = lhs.rename().and_then(|lhs_name| lhs_name.name());
+            let rhs_name = rhs.rename().and_then(|rhs_name| rhs_name.name());
+            if lhs_name != rhs_name {
+                return None;
+            }
+
             ted::replace(lhs.syntax(), rhs.syntax());
             // we can safely return here, in this case `recursive_merge` doesn't do anything
             return Some(());
+        } else {
+            lhs.split_prefix(&lhs_prefix);
+            rhs.split_prefix(&rhs_prefix);
         }
     }
     recursive_merge(lhs, rhs, merge)
@@ -183,7 +190,7 @@ fn recursive_merge(lhs: &ast::UseTree, rhs: &ast::UseTree, merge: MergeBehavior)
                     && !use_trees.is_empty()
                     && rhs_t.use_tree_list().is_some() =>
             {
-                return None
+                return None;
             }
             Err(insert_idx) => {
                 use_trees.insert(insert_idx, rhs_t.clone());
@@ -282,7 +289,7 @@ pub fn try_normalize_use_tree_mut(
 fn recursive_normalize(use_tree: &ast::UseTree, style: NormalizationStyle) -> Option<()> {
     let use_tree_list = use_tree.use_tree_list()?;
     let merge_subtree_into_parent_tree = |single_subtree: &ast::UseTree| {
-        let subtree_is_only_self = single_subtree.path().as_ref().map_or(false, path_is_self);
+        let subtree_is_only_self = single_subtree.path().as_ref().is_some_and(path_is_self);
 
         let merged_path = match (use_tree.path(), single_subtree.path()) {
             // If the subtree is `{self}` then we cannot merge: `use
@@ -606,7 +613,7 @@ fn path_segment_cmp(a: &ast::PathSegment, b: &ast::PathSegment) -> Ordering {
                 (Some(_), None) => Ordering::Greater,
                 (None, Some(_)) => Ordering::Less,
                 (Some(a_name), Some(b_name)) => {
-                    // snake_case < CamelCase < UPPER_SNAKE_CASE
+                    // snake_case < UpperCamelCase < UPPER_SNAKE_CASE
                     let a_text = a_name.as_str().trim_start_matches("r#");
                     let b_text = b_name.as_str().trim_start_matches("r#");
                     if a_text.starts_with(char::is_lowercase)

@@ -1,36 +1,35 @@
-use crate::attributes;
 use libc::c_uint;
 use rustc_ast::expand::allocator::{
-    alloc_error_handler_name, default_fn_name, global_fn_name, AllocatorKind, AllocatorTy,
-    ALLOCATOR_METHODS, NO_ALLOC_SHIM_IS_UNSTABLE,
+    ALLOCATOR_METHODS, AllocatorKind, AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE,
+    alloc_error_handler_name, default_fn_name, global_fn_name,
 };
+use rustc_codegen_ssa::traits::BaseTypeCodegenMethods as _;
 use rustc_middle::bug;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{DebugInfo, OomStrategy};
+use rustc_symbol_mangling::mangle_internal_symbol;
+use smallvec::SmallVec;
 
-use crate::debuginfo;
-use crate::llvm::{self, Context, False, Module, True, Type};
-use crate::ModuleLlvm;
+use crate::builder::SBuilder;
+use crate::declare::declare_simple_fn;
+use crate::llvm::{self, FALSE, TRUE, Type, Value};
+use crate::{SimpleCx, attributes, debuginfo, llvm_util};
 
 pub(crate) unsafe fn codegen(
     tcx: TyCtxt<'_>,
-    module_llvm: &mut ModuleLlvm,
+    cx: SimpleCx<'_>,
     module_name: &str,
     kind: AllocatorKind,
     alloc_error_handler_kind: AllocatorKind,
 ) {
-    let llcx = &*module_llvm.llcx;
-    let llmod = module_llvm.llmod();
-    let usize = unsafe {
-        match tcx.sess.target.pointer_width {
-            16 => llvm::LLVMInt16TypeInContext(llcx),
-            32 => llvm::LLVMInt32TypeInContext(llcx),
-            64 => llvm::LLVMInt64TypeInContext(llcx),
-            tws => bug!("Unsupported target word size for int: {}", tws),
-        }
+    let usize = match tcx.sess.target.pointer_width {
+        16 => cx.type_i16(),
+        32 => cx.type_i32(),
+        64 => cx.type_i64(),
+        tws => bug!("Unsupported target word size for int: {}", tws),
     };
-    let i8 = unsafe { llvm::LLVMInt8TypeInContext(llcx) };
-    let i8p = unsafe { llvm::LLVMPointerTypeInContext(llcx, 0) };
+    let i8 = cx.type_i8();
+    let i8p = cx.type_ptr();
 
     if kind == AllocatorKind::Default {
         for method in ALLOCATOR_METHODS {
@@ -56,125 +55,160 @@ pub(crate) unsafe fn codegen(
                 }
             };
 
-            let from_name = global_fn_name(method.name);
-            let to_name = default_fn_name(method.name);
+            let from_name = mangle_internal_symbol(tcx, &global_fn_name(method.name));
+            let to_name = mangle_internal_symbol(tcx, &default_fn_name(method.name));
 
-            create_wrapper_function(tcx, llcx, llmod, &from_name, &to_name, &args, output, false);
+            create_wrapper_function(tcx, &cx, &from_name, Some(&to_name), &args, output, false);
         }
     }
 
     // rust alloc error handler
     create_wrapper_function(
         tcx,
-        llcx,
-        llmod,
-        "__rust_alloc_error_handler",
-        alloc_error_handler_name(alloc_error_handler_kind),
+        &cx,
+        &mangle_internal_symbol(tcx, "__rust_alloc_error_handler"),
+        Some(&mangle_internal_symbol(tcx, alloc_error_handler_name(alloc_error_handler_kind))),
         &[usize, usize], // size, align
         None,
         true,
     );
 
     unsafe {
-        // __rust_alloc_error_handler_should_panic
-        let name = OomStrategy::SYMBOL;
-        let ll_g = llvm::LLVMRustGetOrInsertGlobal(llmod, name.as_ptr().cast(), name.len(), i8);
-        if tcx.sess.default_hidden_visibility() {
-            llvm::LLVMRustSetVisibility(ll_g, llvm::Visibility::Hidden);
-        }
-        let val = tcx.sess.opts.unstable_opts.oom.should_panic();
-        let llval = llvm::LLVMConstInt(i8, val as u64, False);
-        llvm::LLVMSetInitializer(ll_g, llval);
+        // __rust_alloc_error_handler_should_panic_v2
+        create_const_value_function(
+            tcx,
+            &cx,
+            &mangle_internal_symbol(tcx, OomStrategy::SYMBOL),
+            &i8,
+            &llvm::LLVMConstInt(i8, tcx.sess.opts.unstable_opts.oom.should_panic() as u64, FALSE),
+        );
 
-        let name = NO_ALLOC_SHIM_IS_UNSTABLE;
-        let ll_g = llvm::LLVMRustGetOrInsertGlobal(llmod, name.as_ptr().cast(), name.len(), i8);
-        if tcx.sess.default_hidden_visibility() {
-            llvm::LLVMRustSetVisibility(ll_g, llvm::Visibility::Hidden);
-        }
-        let llval = llvm::LLVMConstInt(i8, 0, False);
-        llvm::LLVMSetInitializer(ll_g, llval);
+        // __rust_no_alloc_shim_is_unstable_v2
+        create_wrapper_function(
+            tcx,
+            &cx,
+            &mangle_internal_symbol(tcx, NO_ALLOC_SHIM_IS_UNSTABLE),
+            None,
+            &[],
+            None,
+            false,
+        );
     }
 
     if tcx.sess.opts.debuginfo != DebugInfo::None {
-        let dbg_cx = debuginfo::CodegenUnitDebugContext::new(llmod);
+        let dbg_cx = debuginfo::CodegenUnitDebugContext::new(cx.llmod);
         debuginfo::metadata::build_compile_unit_di_node(tcx, module_name, &dbg_cx);
         dbg_cx.finalize(tcx.sess);
     }
 }
 
+fn create_const_value_function(
+    tcx: TyCtxt<'_>,
+    cx: &SimpleCx<'_>,
+    name: &str,
+    output: &Type,
+    value: &Value,
+) {
+    let ty = cx.type_func(&[], output);
+    let llfn = declare_simple_fn(
+        &cx,
+        name,
+        llvm::CallConv::CCallConv,
+        llvm::UnnamedAddr::Global,
+        llvm::Visibility::from_generic(tcx.sess.default_visibility()),
+        ty,
+    );
+
+    attributes::apply_to_llfn(
+        llfn,
+        llvm::AttributePlace::Function,
+        &[llvm::AttributeKind::AlwaysInline.create_attr(cx.llcx)],
+    );
+
+    let llbb = unsafe { llvm::LLVMAppendBasicBlockInContext(cx.llcx, llfn, c"entry".as_ptr()) };
+    let mut bx = SBuilder::build(&cx, llbb);
+    bx.ret(value);
+}
+
 fn create_wrapper_function(
     tcx: TyCtxt<'_>,
-    llcx: &Context,
-    llmod: &Module,
+    cx: &SimpleCx<'_>,
     from_name: &str,
-    to_name: &str,
+    to_name: Option<&str>,
     args: &[&Type],
     output: Option<&Type>,
     no_return: bool,
 ) {
-    unsafe {
-        let ty = llvm::LLVMFunctionType(
-            output.unwrap_or_else(|| llvm::LLVMVoidTypeInContext(llcx)),
-            args.as_ptr(),
-            args.len() as c_uint,
-            False,
-        );
-        let llfn = llvm::LLVMRustGetOrInsertFunction(
-            llmod,
-            from_name.as_ptr().cast(),
-            from_name.len(),
+    let ty = cx.type_func(args, output.unwrap_or_else(|| cx.type_void()));
+    let llfn = declare_simple_fn(
+        &cx,
+        from_name,
+        llvm::CallConv::CCallConv,
+        llvm::UnnamedAddr::Global,
+        llvm::Visibility::from_generic(tcx.sess.default_visibility()),
+        ty,
+    );
+
+    let mut attrs = SmallVec::<[_; 2]>::new();
+
+    let target_cpu = llvm_util::target_cpu(tcx.sess);
+    let target_cpu_attr = llvm::CreateAttrStringValue(cx.llcx, "target-cpu", target_cpu);
+
+    let tune_cpu_attr = llvm_util::tune_cpu(tcx.sess)
+        .map(|tune_cpu| llvm::CreateAttrStringValue(cx.llcx, "tune-cpu", tune_cpu));
+
+    attrs.push(target_cpu_attr);
+    attrs.extend(tune_cpu_attr);
+
+    attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &attrs);
+
+    let no_return = if no_return {
+        // -> ! DIFlagNoReturn
+        let no_return = llvm::AttributeKind::NoReturn.create_attr(cx.llcx);
+        attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[no_return]);
+        Some(no_return)
+    } else {
+        None
+    };
+
+    if tcx.sess.must_emit_unwind_tables() {
+        let uwtable =
+            attributes::uwtable_attr(cx.llcx, tcx.sess.opts.unstable_opts.use_sync_unwind);
+        attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[uwtable]);
+    }
+
+    let llbb = unsafe { llvm::LLVMAppendBasicBlockInContext(cx.llcx, llfn, c"entry".as_ptr()) };
+    let mut bx = SBuilder::build(&cx, llbb);
+
+    if let Some(to_name) = to_name {
+        let callee = declare_simple_fn(
+            &cx,
+            to_name,
+            llvm::CallConv::CCallConv,
+            llvm::UnnamedAddr::Global,
+            llvm::Visibility::Hidden,
             ty,
         );
-        let no_return = if no_return {
-            // -> ! DIFlagNoReturn
-            let no_return = llvm::AttributeKind::NoReturn.create_attr(llcx);
-            attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[no_return]);
-            Some(no_return)
-        } else {
-            None
-        };
-
-        if tcx.sess.default_hidden_visibility() {
-            llvm::LLVMRustSetVisibility(llfn, llvm::Visibility::Hidden);
-        }
-        if tcx.sess.must_emit_unwind_tables() {
-            let uwtable =
-                attributes::uwtable_attr(llcx, tcx.sess.opts.unstable_opts.use_sync_unwind);
-            attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[uwtable]);
-        }
-
-        let callee =
-            llvm::LLVMRustGetOrInsertFunction(llmod, to_name.as_ptr().cast(), to_name.len(), ty);
         if let Some(no_return) = no_return {
             // -> ! DIFlagNoReturn
             attributes::apply_to_llfn(callee, llvm::AttributePlace::Function, &[no_return]);
         }
-        llvm::LLVMRustSetVisibility(callee, llvm::Visibility::Hidden);
+        llvm::set_visibility(callee, llvm::Visibility::Hidden);
 
-        let llbb = llvm::LLVMAppendBasicBlockInContext(llcx, llfn, c"entry".as_ptr().cast());
-
-        let llbuilder = llvm::LLVMCreateBuilderInContext(llcx);
-        llvm::LLVMPositionBuilderAtEnd(llbuilder, llbb);
         let args = args
             .iter()
             .enumerate()
-            .map(|(i, _)| llvm::LLVMGetParam(llfn, i as c_uint))
+            .map(|(i, _)| llvm::get_param(llfn, i as c_uint))
             .collect::<Vec<_>>();
-        let ret = llvm::LLVMRustBuildCall(
-            llbuilder,
-            ty,
-            callee,
-            args.as_ptr(),
-            args.len() as c_uint,
-            [].as_ptr(),
-            0 as c_uint,
-        );
-        llvm::LLVMSetTailCall(ret, True);
+        let ret = bx.call(ty, callee, &args, None);
+        llvm::LLVMSetTailCall(ret, TRUE);
         if output.is_some() {
-            llvm::LLVMBuildRet(llbuilder, ret);
+            bx.ret(ret);
         } else {
-            llvm::LLVMBuildRetVoid(llbuilder);
+            bx.ret_void()
         }
-        llvm::LLVMDisposeBuilder(llbuilder);
+    } else {
+        assert!(output.is_none());
+        bx.ret_void()
     }
 }

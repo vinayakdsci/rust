@@ -1,6 +1,5 @@
-//@ min-lldb-version: 310
-
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 // gdb-command:run
@@ -22,25 +21,18 @@
 // lldb-command:run
 
 // lldb-command:v len
-// lldbg-check:[...] 20
-// lldbr-check:(i32) len = 20
+// lldb-check:[...] 20
 // lldb-command:v local0
-// lldbg-check:[...] 19
-// lldbr-check:(i32) local0 = 19
+// lldb-check:[...] 19
 // lldb-command:v local1
-// lldbg-check:[...] true
-// lldbr-check:(bool) local1 = true
+// lldb-check:[...] true
 // lldb-command:v local2
-// lldbg-check:[...] 20.5
-// lldbr-check:(f64) local2 = 20.5
+// lldb-check:[...] 20.5
 
 // lldb-command:continue
 
 #![allow(unused_variables)]
 #![allow(dead_code)]
-#![feature(omit_gdb_pretty_printer_section)]
-#![omit_gdb_pretty_printer_section]
-
 
 #[no_mangle]
 pub unsafe extern "C" fn fn_with_c_abi(s: *const u8, len: i32) -> i32 {

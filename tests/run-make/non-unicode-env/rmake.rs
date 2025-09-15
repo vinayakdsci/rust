@@ -1,5 +1,5 @@
-use run_make_support::rfs;
-use run_make_support::rustc;
+//@ needs-target-std
+use run_make_support::{rfs, rustc};
 
 fn main() {
     #[cfg(unix)]

@@ -2,44 +2,15 @@
 //! typically those used in AST fragments during macro expansion.
 //! The traits are not implemented exhaustively, only when actually necessary.
 
-use crate::ptr::P;
-use crate::token::Nonterminal;
-use crate::tokenstream::LazyAttrTokenStream;
-use crate::{Arm, Crate, ExprField, FieldDef, GenericParam, Param, PatField, Variant};
-use crate::{AssocItem, Expr, ForeignItem, Item, NodeId};
-use crate::{AttrItem, AttrKind, Block, Pat, Path, Ty, Visibility};
-use crate::{AttrVec, Attribute, Stmt, StmtKind};
-
 use std::fmt;
 use std::marker::PhantomData;
 
-/// A utility trait to reduce boilerplate.
-/// Standard `Deref(Mut)` cannot be reused due to coherence.
-pub trait AstDeref {
-    type Target;
-    fn ast_deref(&self) -> &Self::Target;
-    fn ast_deref_mut(&mut self) -> &mut Self::Target;
-}
-
-macro_rules! impl_not_ast_deref {
-    ($($T:ty),+ $(,)?) => {
-        $(
-            impl !AstDeref for $T {}
-        )+
-    };
-}
-
-impl_not_ast_deref!(AssocItem, Expr, ForeignItem, Item, Stmt);
-
-impl<T> AstDeref for P<T> {
-    type Target = T;
-    fn ast_deref(&self) -> &Self::Target {
-        self
-    }
-    fn ast_deref_mut(&mut self) -> &mut Self::Target {
-        self
-    }
-}
+use crate::tokenstream::LazyAttrTokenStream;
+use crate::{
+    Arm, AssocItem, AttrItem, AttrKind, AttrVec, Attribute, Block, Crate, Expr, ExprField,
+    FieldDef, ForeignItem, GenericParam, Item, NodeId, Param, Pat, PatField, Path, Stmt, StmtKind,
+    Ty, Variant, Visibility, WherePredicate,
+};
 
 /// A trait for AST nodes having an ID.
 pub trait HasNodeId {
@@ -78,14 +49,15 @@ impl_has_node_id!(
     Stmt,
     Ty,
     Variant,
+    WherePredicate,
 );
 
-impl<T: AstDeref<Target: HasNodeId>> HasNodeId for T {
+impl<T: HasNodeId> HasNodeId for Box<T> {
     fn node_id(&self) -> NodeId {
-        self.ast_deref().node_id()
+        (**self).node_id()
     }
     fn node_id_mut(&mut self) -> &mut NodeId {
-        self.ast_deref_mut().node_id_mut()
+        (**self).node_id_mut()
     }
 }
 
@@ -126,16 +98,16 @@ macro_rules! impl_has_tokens_none {
 }
 
 impl_has_tokens!(AssocItem, AttrItem, Block, Expr, ForeignItem, Item, Pat, Path, Ty, Visibility);
-impl_has_tokens_none!(Arm, ExprField, FieldDef, GenericParam, Param, PatField, Variant);
-
-impl<T: AstDeref<Target: HasTokens>> HasTokens for T {
-    fn tokens(&self) -> Option<&LazyAttrTokenStream> {
-        self.ast_deref().tokens()
-    }
-    fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
-        self.ast_deref_mut().tokens_mut()
-    }
-}
+impl_has_tokens_none!(
+    Arm,
+    ExprField,
+    FieldDef,
+    GenericParam,
+    Param,
+    PatField,
+    Variant,
+    WherePredicate
+);
 
 impl<T: HasTokens> HasTokens for Option<T> {
     fn tokens(&self) -> Option<&LazyAttrTokenStream> {
@@ -146,13 +118,22 @@ impl<T: HasTokens> HasTokens for Option<T> {
     }
 }
 
+impl<T: HasTokens> HasTokens for Box<T> {
+    fn tokens(&self) -> Option<&LazyAttrTokenStream> {
+        (**self).tokens()
+    }
+    fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
+        (**self).tokens_mut()
+    }
+}
+
 impl HasTokens for StmtKind {
     fn tokens(&self) -> Option<&LazyAttrTokenStream> {
         match self {
             StmtKind::Let(local) => local.tokens.as_ref(),
             StmtKind::Item(item) => item.tokens(),
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => expr.tokens(),
-            StmtKind::Empty => return None,
+            StmtKind::Empty => None,
             StmtKind::MacCall(mac) => mac.tokens.as_ref(),
         }
     }
@@ -161,7 +142,7 @@ impl HasTokens for StmtKind {
             StmtKind::Let(local) => Some(&mut local.tokens),
             StmtKind::Item(item) => item.tokens_mut(),
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => expr.tokens_mut(),
-            StmtKind::Empty => return None,
+            StmtKind::Empty => None,
             StmtKind::MacCall(mac) => Some(&mut mac.tokens),
         }
     }
@@ -192,35 +173,6 @@ impl HasTokens for Attribute {
                 panic!("Called tokens_mut on doc comment attr {kind:?}")
             }
         })
-    }
-}
-
-impl HasTokens for Nonterminal {
-    fn tokens(&self) -> Option<&LazyAttrTokenStream> {
-        match self {
-            Nonterminal::NtItem(item) => item.tokens(),
-            Nonterminal::NtStmt(stmt) => stmt.tokens(),
-            Nonterminal::NtExpr(expr) | Nonterminal::NtLiteral(expr) => expr.tokens(),
-            Nonterminal::NtPat(pat) => pat.tokens(),
-            Nonterminal::NtTy(ty) => ty.tokens(),
-            Nonterminal::NtMeta(attr_item) => attr_item.tokens(),
-            Nonterminal::NtPath(path) => path.tokens(),
-            Nonterminal::NtVis(vis) => vis.tokens(),
-            Nonterminal::NtBlock(block) => block.tokens(),
-        }
-    }
-    fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
-        match self {
-            Nonterminal::NtItem(item) => item.tokens_mut(),
-            Nonterminal::NtStmt(stmt) => stmt.tokens_mut(),
-            Nonterminal::NtExpr(expr) | Nonterminal::NtLiteral(expr) => expr.tokens_mut(),
-            Nonterminal::NtPat(pat) => pat.tokens_mut(),
-            Nonterminal::NtTy(ty) => ty.tokens_mut(),
-            Nonterminal::NtMeta(attr_item) => attr_item.tokens_mut(),
-            Nonterminal::NtPath(path) => path.tokens_mut(),
-            Nonterminal::NtVis(vis) => vis.tokens_mut(),
-            Nonterminal::NtBlock(block) => block.tokens_mut(),
-        }
     }
 }
 
@@ -288,16 +240,17 @@ impl_has_attrs!(
     Param,
     PatField,
     Variant,
+    WherePredicate,
 );
 impl_has_attrs_none!(Attribute, AttrItem, Block, Pat, Path, Ty, Visibility);
 
-impl<T: AstDeref<Target: HasAttrs>> HasAttrs for T {
-    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = T::Target::SUPPORTS_CUSTOM_INNER_ATTRS;
+impl<T: HasAttrs> HasAttrs for Box<T> {
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = T::SUPPORTS_CUSTOM_INNER_ATTRS;
     fn attrs(&self) -> &[Attribute] {
-        self.ast_deref().attrs()
+        (**self).attrs()
     }
     fn visit_attrs(&mut self, f: impl FnOnce(&mut AttrVec)) {
-        self.ast_deref_mut().visit_attrs(f)
+        (**self).visit_attrs(f);
     }
 }
 
@@ -350,6 +303,7 @@ impl HasAttrs for Stmt {
 }
 
 /// A newtype around an AST node that implements the traits above if the node implements them.
+#[repr(transparent)]
 pub struct AstNodeWrapper<Wrapped, Tag> {
     pub wrapped: Wrapped,
     pub tag: PhantomData<Tag>,
@@ -359,15 +313,36 @@ impl<Wrapped, Tag> AstNodeWrapper<Wrapped, Tag> {
     pub fn new(wrapped: Wrapped, _tag: Tag) -> AstNodeWrapper<Wrapped, Tag> {
         AstNodeWrapper { wrapped, tag: Default::default() }
     }
+
+    pub fn from_mut(wrapped: &mut Wrapped, _tag: Tag) -> &mut AstNodeWrapper<Wrapped, Tag> {
+        // SAFETY: `AstNodeWrapper` is `repr(transparent)` w.r.t `Wrapped`
+        unsafe { &mut *<*mut Wrapped>::cast(wrapped) }
+    }
 }
 
-impl<Wrapped, Tag> AstDeref for AstNodeWrapper<Wrapped, Tag> {
-    type Target = Wrapped;
-    fn ast_deref(&self) -> &Self::Target {
-        &self.wrapped
+// FIXME: remove after `stmt_expr_attributes` is stabilized.
+impl<T, Tag> From<AstNodeWrapper<Box<T>, Tag>> for AstNodeWrapper<T, Tag> {
+    fn from(value: AstNodeWrapper<Box<T>, Tag>) -> Self {
+        AstNodeWrapper { wrapped: *value.wrapped, tag: value.tag }
     }
-    fn ast_deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.wrapped
+}
+
+impl<Wrapped: HasNodeId, Tag> HasNodeId for AstNodeWrapper<Wrapped, Tag> {
+    fn node_id(&self) -> NodeId {
+        self.wrapped.node_id()
+    }
+    fn node_id_mut(&mut self) -> &mut NodeId {
+        self.wrapped.node_id_mut()
+    }
+}
+
+impl<Wrapped: HasAttrs, Tag> HasAttrs for AstNodeWrapper<Wrapped, Tag> {
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = Wrapped::SUPPORTS_CUSTOM_INNER_ATTRS;
+    fn attrs(&self) -> &[Attribute] {
+        self.wrapped.attrs()
+    }
+    fn visit_attrs(&mut self, f: impl FnOnce(&mut AttrVec)) {
+        self.wrapped.visit_attrs(f);
     }
 }
 

@@ -1,32 +1,31 @@
 #![deny(unused_must_use)]
 
-use crate::diagnostics::error::{
-    invalid_attr, span_err, throw_invalid_attr, throw_span_err, DiagnosticDeriveError,
-};
-use crate::diagnostics::utils::{
-    build_field_mapping, build_suggestion_code, is_doc_comment, new_code_ident,
-    report_error_if_not_applied_to_applicability, report_error_if_not_applied_to_span,
-    should_generate_arg, AllowMultipleAlternatives, FieldInfo, FieldInnerTy, FieldMap, HasFieldMap,
-    SetOnce, SpannedOption, SubdiagnosticKind,
-};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned, Attribute, Meta, MetaList, Path};
+use syn::spanned::Spanned;
+use syn::{Attribute, Meta, MetaList, Path};
 use synstructure::{BindingInfo, Structure, VariantInfo};
 
 use super::utils::SubdiagnosticVariant;
+use crate::diagnostics::error::{
+    DiagnosticDeriveError, invalid_attr, span_err, throw_invalid_attr, throw_span_err,
+};
+use crate::diagnostics::utils::{
+    AllowMultipleAlternatives, FieldInfo, FieldInnerTy, FieldMap, HasFieldMap, SetOnce,
+    SpannedOption, SubdiagnosticKind, build_field_mapping, build_suggestion_code, is_doc_comment,
+    new_code_ident, report_error_if_not_applied_to_applicability,
+    report_error_if_not_applied_to_span, should_generate_arg,
+};
 
 /// The central struct for constructing the `add_to_diag` method from an annotated struct.
 pub(crate) struct SubdiagnosticDerive {
     diag: syn::Ident,
-    f: syn::Ident,
 }
 
 impl SubdiagnosticDerive {
     pub(crate) fn new() -> Self {
         let diag = format_ident!("diag");
-        let f = format_ident!("f");
-        Self { diag, f }
+        Self { diag }
     }
 
     pub(crate) fn into_tokens(self, mut structure: Structure<'_>) -> TokenStream {
@@ -85,19 +84,16 @@ impl SubdiagnosticDerive {
         };
 
         let diag = &self.diag;
-        let f = &self.f;
 
         // FIXME(edition_2024): Fix the `keyword_idents_2024` lint to not trigger here?
         #[allow(keyword_idents_2024)]
         let ret = structure.gen_impl(quote! {
             gen impl rustc_errors::Subdiagnostic for @Self {
-                fn add_to_diag_with<__G, __F>(
+                fn add_to_diag<__G>(
                     self,
                     #diag: &mut rustc_errors::Diag<'_, __G>,
-                    #f: &__F
                 ) where
                     __G: rustc_errors::EmissionGuarantee,
-                    __F: rustc_errors::SubdiagMessageOp<__G>,
                 {
                     #implementation
                 }
@@ -383,11 +379,10 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
                 Ok(quote! {})
             }
             "subdiagnostic" => {
-                let f = &self.parent.f;
                 let diag = &self.parent.diag;
                 let binding = &info.binding;
                 self.has_subdiagnostic = true;
-                Ok(quote! { #binding.add_to_diag_with(#diag, #f); })
+                Ok(quote! { #binding.add_to_diag(#diag); })
             }
             _ => {
                 let mut span_attrs = vec![];
@@ -530,12 +525,11 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
         let span_field = self.span_field.value_ref();
 
         let diag = &self.parent.diag;
-        let f = &self.parent.f;
         let mut calls = TokenStream::new();
         for (kind, slug, no_span) in kind_slugs {
             let message = format_ident!("__message");
             calls.extend(
-                quote! { let #message = #f(#diag, crate::fluent_generated::#slug.into()); },
+                quote! { let #message = #diag.eagerly_translate(crate::fluent_generated::#slug); },
             );
 
             let name = format_ident!(
@@ -606,7 +600,12 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
 
             calls.extend(call);
         }
-
+        let store_args = quote! {
+            #diag.store_args();
+        };
+        let restore_args = quote! {
+            #diag.restore_args();
+        };
         let plain_args: TokenStream = self
             .variant
             .bindings()
@@ -616,12 +615,21 @@ impl<'parent, 'a> SubdiagnosticDeriveVariantBuilder<'parent, 'a> {
             .collect();
 
         let formatting_init = &self.formatting_init;
+
+        // For #[derive(Subdiagnostic)]
+        //
+        // - Store args of the main diagnostic for later restore.
+        // - Add args of subdiagnostic.
+        // - Generate the calls, such as note, label, etc.
+        // - Restore the arguments for allowing main and subdiagnostic share the same fields.
         Ok(quote! {
             #init
             #formatting_init
             #attr_args
+            #store_args
             #plain_args
             #calls
+            #restore_args
         })
     }
 }

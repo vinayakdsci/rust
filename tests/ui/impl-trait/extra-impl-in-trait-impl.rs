@@ -1,8 +1,7 @@
 //@ run-rustfix
 
-#[allow(dead_code)]
+#![allow(dead_code)]
 struct S<T>(T);
-#[allow(dead_code)]
 struct S2;
 
 impl<T: Default> impl Default for S<T> {

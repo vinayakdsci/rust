@@ -1,37 +1,66 @@
 use std::time::Duration;
 
-use rustc_target::abi::Size;
+use rustc_abi::Size;
 
-use crate::concurrency::init_once::InitOnceStatus;
+use crate::concurrency::init_once::{EvalContextExt as _, InitOnceStatus};
+use crate::concurrency::sync::FutexRef;
 use crate::*;
+
+#[derive(Clone)]
+struct WindowsInitOnce {
+    init_once: InitOnceRef,
+}
+
+struct WindowsFutex {
+    futex: FutexRef,
+}
 
 impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
 trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
     // Windows sync primitives are pointer sized.
     // We only use the first 4 bytes for the id.
 
-    fn init_once_get_id(&mut self, init_once_op: &OpTy<'tcx>) -> InterpResult<'tcx, InitOnceId> {
+    fn init_once_get_data<'a>(
+        &'a mut self,
+        init_once_ptr: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, &'a WindowsInitOnce>
+    where
+        'tcx: 'a,
+    {
         let this = self.eval_context_mut();
-        this.init_once_get_or_create_id(init_once_op, this.windows_ty_layout("INIT_ONCE"), 0)
+
+        let init_once =
+            this.deref_pointer_as(init_once_ptr, this.windows_ty_layout("INIT_ONCE"))?;
+        let init_offset = Size::ZERO;
+
+        this.lazy_sync_get_data(
+            &init_once,
+            init_offset,
+            || throw_ub_format!("`INIT_ONCE` can't be moved after first use"),
+            |_| {
+                // TODO: check that this is still all-zero.
+                interp_ok(WindowsInitOnce { init_once: InitOnceRef::new() })
+            },
+        )
     }
 
     /// Returns `true` if we were succssful, `false` if we would block.
     fn init_once_try_begin(
         &mut self,
-        id: InitOnceId,
+        init_once_ref: &InitOnceRef,
         pending_place: &MPlaceTy<'tcx>,
         dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
-        Ok(match this.init_once_status(id) {
+        interp_ok(match init_once_ref.status() {
             InitOnceStatus::Uninitialized => {
-                this.init_once_begin(id);
+                init_once_ref.begin();
                 this.write_scalar(this.eval_windows("c", "TRUE"), pending_place)?;
                 this.write_scalar(this.eval_windows("c", "TRUE"), dest)?;
                 true
             }
             InitOnceStatus::Complete => {
-                this.init_once_observe_completed(id);
+                this.init_once_observe_completed(init_once_ref);
                 this.write_scalar(this.eval_windows("c", "FALSE"), pending_place)?;
                 this.write_scalar(this.eval_windows("c", "TRUE"), dest)?;
                 true
@@ -54,9 +83,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        let id = this.init_once_get_id(init_once_op)?;
+        let init_once = this.init_once_get_data(init_once_op)?.init_once.clone();
         let flags = this.read_scalar(flags_op)?.to_u32()?;
-        let pending_place = this.deref_pointer(pending_op)?;
+        // PBOOL is int*
+        let pending_place = this.deref_pointer_as(pending_op, this.machine.layouts.i32)?;
         let context = this.read_pointer(context_op)?;
 
         if flags != 0 {
@@ -67,29 +97,30 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_unsup_format!("non-null `lpContext` in `InitOnceBeginInitialize`");
         }
 
-        if this.init_once_try_begin(id, &pending_place, dest)? {
+        if this.init_once_try_begin(&init_once, &pending_place, dest)? {
             // Done!
-            return Ok(());
+            return interp_ok(());
         }
 
         // We have to block, and then try again when we are woken up.
         let dest = dest.clone();
         this.init_once_enqueue_and_block(
-            id,
+            init_once.clone(),
             callback!(
                 @capture<'tcx> {
-                    id: InitOnceId,
+                    init_once: InitOnceRef,
                     pending_place: MPlaceTy<'tcx>,
                     dest: MPlaceTy<'tcx>,
                 }
-                @unblock = |this| {
-                    let ret = this.init_once_try_begin(id, &pending_place, &dest)?;
+                |this, unblock: UnblockKind| {
+                    assert_eq!(unblock, UnblockKind::Ready);
+                    let ret = this.init_once_try_begin(&init_once, &pending_place, &dest)?;
                     assert!(ret, "we were woken up but init_once_try_begin still failed");
-                    Ok(())
+                    interp_ok(())
                 }
             ),
         );
-        return Ok(());
+        interp_ok(())
     }
 
     fn InitOnceComplete(
@@ -100,7 +131,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
 
-        let id = this.init_once_get_id(init_once_op)?;
+        let init_once = this.init_once_get_data(init_once_op)?.init_once.clone();
         let flags = this.read_scalar(flags_op)?.to_u32()?;
         let context = this.read_pointer(context_op)?;
 
@@ -116,7 +147,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             throw_unsup_format!("non-null `lpContext` in `InitOnceBeginInitialize`");
         }
 
-        if this.init_once_status(id) != InitOnceStatus::Begun {
+        if init_once.status() != InitOnceStatus::Begun {
             // The docs do not say anything about this case, but it seems better to not allow it.
             throw_ub_format!(
                 "calling InitOnceComplete on a one time initialization that has not begun or is already completed"
@@ -124,12 +155,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
 
         if success {
-            this.init_once_complete(id)?;
+            this.init_once_complete(&init_once)?;
         } else {
-            this.init_once_fail(id)?;
+            this.init_once_fail(&init_once)?;
         }
 
-        Ok(this.eval_windows("c", "TRUE"))
+        interp_ok(this.eval_windows("c", "TRUE"))
     }
 
     fn WaitOnAddress(
@@ -147,13 +178,11 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let size = this.read_target_usize(size_op)?;
         let timeout_ms = this.read_scalar(timeout_op)?.to_u32()?;
 
-        let addr = ptr.addr().bytes();
-
         if size > 8 || !size.is_power_of_two() {
             let invalid_param = this.eval_windows("c", "ERROR_INVALID_PARAMETER");
             this.set_last_error(invalid_param)?;
             this.write_scalar(Scalar::from_i32(0), dest)?;
-            return Ok(());
+            return interp_ok(());
         };
         let size = Size::from_bytes(size);
 
@@ -169,25 +198,46 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let layout = this.machine.layouts.uint(size).unwrap();
         let futex_val =
-            this.read_scalar_atomic(&this.ptr_to_mplace(ptr, layout), AtomicReadOrd::Relaxed)?;
+            this.read_scalar_atomic(&this.ptr_to_mplace(ptr, layout), AtomicReadOrd::Acquire)?;
         let compare_val = this.read_scalar(&this.ptr_to_mplace(compare, layout))?;
 
         if futex_val == compare_val {
             // If the values are the same, we have to block.
+
+            // This cannot fail since we already did an atomic acquire read on that pointer.
+            let futex_ref = this
+                .get_sync_or_init(ptr, |_| WindowsFutex { futex: Default::default() })
+                .unwrap()
+                .futex
+                .clone();
+
+            let dest = dest.clone();
             this.futex_wait(
-                addr,
+                futex_ref,
                 u32::MAX, // bitset
                 timeout,
-                Scalar::from_i32(1), // retval_succ
-                Scalar::from_i32(0), // retval_timeout
-                dest.clone(),
-                this.eval_windows("c", "ERROR_TIMEOUT"),
+                callback!(
+                    @capture<'tcx> {
+                        dest: MPlaceTy<'tcx>
+                    }
+                    |this, unblock: UnblockKind| {
+                        match unblock {
+                            UnblockKind::Ready => {
+                                this.write_int(1, &dest)
+                            }
+                            UnblockKind::TimedOut => {
+                                this.set_last_error(IoError::WindowsError("ERROR_TIMEOUT"))?;
+                                this.write_int(0, &dest)
+                            }
+                        }
+                    }
+                ),
             );
         }
 
         this.write_scalar(Scalar::from_i32(1), dest)?;
 
-        Ok(())
+        interp_ok(())
     }
 
     fn WakeByAddressSingle(&mut self, ptr_op: &OpTy<'tcx>) -> InterpResult<'tcx> {
@@ -198,10 +248,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // See the Linux futex implementation for why this fence exists.
         this.atomic_fence(AtomicFenceOrd::SeqCst)?;
 
-        let addr = ptr.addr().bytes();
-        this.futex_wake(addr, u32::MAX)?;
+        let Some(futex_ref) =
+            this.get_sync_or_init(ptr, |_| WindowsFutex { futex: Default::default() })
+        else {
+            // Seems like this cannot return an error, so we just wake nobody.
+            return interp_ok(());
+        };
+        let futex_ref = futex_ref.futex.clone();
 
-        Ok(())
+        this.futex_wake(&futex_ref, u32::MAX, 1)?;
+
+        interp_ok(())
     }
     fn WakeByAddressAll(&mut self, ptr_op: &OpTy<'tcx>) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
@@ -211,9 +268,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // See the Linux futex implementation for why this fence exists.
         this.atomic_fence(AtomicFenceOrd::SeqCst)?;
 
-        let addr = ptr.addr().bytes();
-        while this.futex_wake(addr, u32::MAX)? {}
+        let Some(futex_ref) =
+            this.get_sync_or_init(ptr, |_| WindowsFutex { futex: Default::default() })
+        else {
+            // Seems like this cannot return an error, so we just wake nobody.
+            return interp_ok(());
+        };
+        let futex_ref = futex_ref.futex.clone();
 
-        Ok(())
+        this.futex_wake(&futex_ref, u32::MAX, usize::MAX)?;
+
+        interp_ok(())
     }
 }

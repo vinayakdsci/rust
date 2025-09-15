@@ -26,7 +26,7 @@
 //! This apparently translates to any callbacks in the ".CRT$XLB" section
 //! being run on certain events.
 //!
-//! So after all that, we use the compiler's #[link_section] feature to place
+//! So after all that, we use the compiler's `#[link_section]` feature to place
 //! a callback pointer into the magic section so it ends up being called.
 //!
 //! # What's up with this callback?
@@ -58,34 +58,46 @@
 //! We don't actually use the `/INCLUDE` linker flag here like the article
 //! mentions because the Rust compiler doesn't propagate linker flags, but
 //! instead we use a shim function which performs a volatile 1-byte load from
-//! the address of the symbol to ensure it sticks around.
+//! the address of the _tls_used symbol to ensure it sticks around.
 //!
 //! [1]: https://www.codeproject.com/Articles/8113/Thread-Local-Storage-The-C-Way
 //! [2]: https://github.com/ChromiumWebApps/chromium/blob/master/base/threading/thread_local_storage_win.cc#L42
 
-use crate::ptr;
-use crate::sys::c;
 use core::ffi::c_void;
 
+use crate::ptr;
+use crate::sys::c;
+
+unsafe extern "C" {
+    #[link_name = "_tls_used"]
+    static TLS_USED: u8;
+}
 pub fn enable() {
-    // When destructors are used, we don't want LLVM eliminating CALLBACK for any
-    // reason. Once the symbol makes it to the linker, it will do the rest.
+    // When destructors are used, we need to add a reference to the _tls_used
+    // symbol provided by the CRT, otherwise the TLS support code will get
+    // GC'd by the linker and our callback won't be called.
+    unsafe { ptr::from_ref(&TLS_USED).read_volatile() };
+    // We also need to reference CALLBACK to make sure it does not get GC'd
+    // by the compiler/LLVM. The callback will end up inside the TLS
+    // callback array pointed to by _TLS_USED through linker shenanigans,
+    // but as far as the compiler is concerned, it looks like the data is
+    // unused, so we need this hack to prevent it from disappearing.
     unsafe { ptr::from_ref(&CALLBACK).read_volatile() };
 }
 
-#[link_section = ".CRT$XLB"]
+#[unsafe(link_section = ".CRT$XLB")]
 #[cfg_attr(miri, used)] // Miri only considers explicitly `#[used]` statics for `lookup_link_section`
 pub static CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = tls_callback;
 
 unsafe extern "system" fn tls_callback(_h: *mut c_void, dw_reason: u32, _pv: *mut c_void) {
     if dw_reason == c::DLL_THREAD_DETACH || dw_reason == c::DLL_PROCESS_DETACH {
-        #[cfg(target_thread_local)]
         unsafe {
+            #[cfg(target_thread_local)]
             super::super::destructors::run();
-        }
-        #[cfg(not(target_thread_local))]
-        unsafe {
+            #[cfg(not(target_thread_local))]
             super::super::key::run_dtors();
+
+            crate::rt::thread_cleanup();
         }
     }
 }

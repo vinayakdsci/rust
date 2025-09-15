@@ -1,6 +1,5 @@
-//@ min-lldb-version: 310
-
 //@ compile-flags:-g
+//@ disable-gdb-pretty-printers
 
 // === GDB TESTS ===================================================================================
 
@@ -46,8 +45,7 @@
 // lldb-command:v c
 // lldb-check:(int) c = 6
 
-#![feature(omit_gdb_pretty_printer_section, coroutines, coroutine_trait, stmt_expr_attributes)]
-#![omit_gdb_pretty_printer_section]
+#![feature(coroutines, coroutine_trait, stmt_expr_attributes)]
 
 use std::ops::Coroutine;
 use std::pin::Pin;

@@ -2,8 +2,9 @@ use std::ffi::{OsStr, OsString};
 
 use rustc_data_structures::fx::FxHashMap;
 
+use self::shims::unix::UnixEnvVars;
+use self::shims::windows::WindowsEnvVars;
 use crate::*;
-use shims::{unix::UnixEnvVars, windows::WindowsEnvVars};
 
 #[derive(Default)]
 pub enum EnvVars<'tcx> {
@@ -55,16 +56,7 @@ impl<'tcx> EnvVars<'tcx> {
         };
         ecx.machine.env_vars = env_vars;
 
-        Ok(())
-    }
-
-    pub(crate) fn cleanup(ecx: &mut InterpCx<'tcx, MiriMachine<'tcx>>) -> InterpResult<'tcx> {
-        let this = ecx.eval_context_mut();
-        match this.machine.env_vars {
-            EnvVars::Unix(_) => UnixEnvVars::cleanup(this),
-            EnvVars::Windows(_) => Ok(()), // no cleanup needed
-            EnvVars::Uninit => Ok(()),
-        }
+        interp_ok(())
     }
 
     pub(crate) fn unix(&self) -> &UnixEnvVars<'tcx> {
@@ -103,9 +95,36 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn get_env_var(&mut self, name: &OsStr) -> InterpResult<'tcx, Option<OsString>> {
         let this = self.eval_context_ref();
         match &this.machine.env_vars {
-            EnvVars::Uninit => return Ok(None),
+            EnvVars::Uninit => interp_ok(None),
             EnvVars::Unix(vars) => vars.get(this, name),
             EnvVars::Windows(vars) => vars.get(name),
+        }
+    }
+
+    /// Get the process identifier.
+    fn get_pid(&self) -> u32 {
+        let this = self.eval_context_ref();
+        if this.machine.communicate() { std::process::id() } else { 1000 }
+    }
+
+    /// Get an "OS" thread ID for the current thread.
+    fn get_current_tid(&self) -> u32 {
+        let this = self.eval_context_ref();
+        self.get_tid(this.machine.threads.active_thread())
+    }
+
+    /// Get an "OS" thread ID for any thread.
+    fn get_tid(&self, thread: ThreadId) -> u32 {
+        let this = self.eval_context_ref();
+        let index = thread.to_u32();
+        let target_os = &this.tcx.sess.target.os;
+        if target_os == "linux" || target_os == "netbsd" {
+            // On Linux, the main thread has PID == TID so we uphold this. NetBSD also appears
+            // to exhibit the same behavior, though I can't find a citation.
+            this.get_pid().strict_add(index)
+        } else {
+            // Other platforms do not display any relationship between PID and TID.
+            index
         }
     }
 }

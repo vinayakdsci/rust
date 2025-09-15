@@ -1,9 +1,10 @@
-use crate::{Lint, LintExtractor};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write;
 use std::fs;
 use std::process::Command;
+
+use crate::{Lint, LintExtractor};
 
 /// Descriptions of rustc lint groups.
 static GROUP_DESCRIPTIONS: &[(&str, &str)] = &[
@@ -23,6 +24,11 @@ static GROUP_DESCRIPTIONS: &[(&str, &str)] = &[
     (
         "keyword-idents",
         "Lints that detect identifiers which will be come keywords in later editions",
+    ),
+    ("deprecated-safe", "Lints for functions which were erroneously marked as safe in the past"),
+    (
+        "unknown-or-malformed-diagnostic-attributes",
+        "detects unknown or malformed diagnostic attributes",
     ),
 ];
 

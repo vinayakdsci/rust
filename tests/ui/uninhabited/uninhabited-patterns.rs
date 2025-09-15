@@ -1,6 +1,6 @@
+#![feature(exhaustive_patterns)]
 #![feature(box_patterns)]
 #![feature(never_type)]
-#![feature(min_exhaustive_patterns)]
 #![deny(unreachable_patterns)]
 
 mod foo {
@@ -27,7 +27,11 @@ fn main() {
 
     let x: Result<Box<NotSoSecretlyEmpty>, &[Result<!, !>]> = Err(&[]);
     match x {
-        Ok(box _) => (), //~ ERROR unreachable pattern
+        Ok(box _) => (), // We'd get a non-exhaustiveness error if this arm was removed; don't lint.
+        Err(&[]) => (),
+        Err(&[..]) => (),
+    }
+    match x { //~ ERROR non-exhaustive patterns
         Err(&[]) => (),
         Err(&[..]) => (),
     }

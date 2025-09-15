@@ -1,7 +1,7 @@
 //! See [`ManifestPath`].
 use std::{borrow::Borrow, fmt, ops};
 
-use paths::{AbsPath, AbsPathBuf};
+use paths::{AbsPath, AbsPathBuf, Utf8Path};
 
 /// More or less [`AbsPathBuf`] with non-None parent.
 ///
@@ -21,11 +21,13 @@ impl TryFrom<AbsPathBuf> for ManifestPath {
     type Error = AbsPathBuf;
 
     fn try_from(file: AbsPathBuf) -> Result<Self, Self::Error> {
-        if file.parent().is_none() {
-            Err(file)
-        } else {
-            Ok(ManifestPath { file })
-        }
+        if file.parent().is_none() { Err(file) } else { Ok(ManifestPath { file }) }
+    }
+}
+
+impl From<ManifestPath> for AbsPathBuf {
+    fn from(it: ManifestPath) -> Self {
+        it.file
     }
 }
 
@@ -40,7 +42,7 @@ impl ManifestPath {
     }
 
     pub fn is_rust_manifest(&self) -> bool {
-        self.file.extension().map_or(false, |ext| ext == "rs")
+        self.file.extension() == Some("rs")
     }
 }
 
@@ -60,6 +62,24 @@ impl ops::Deref for ManifestPath {
 
 impl AsRef<AbsPath> for ManifestPath {
     fn as_ref(&self) -> &AbsPath {
+        self.file.as_ref()
+    }
+}
+
+impl AsRef<std::path::Path> for ManifestPath {
+    fn as_ref(&self) -> &std::path::Path {
+        self.file.as_ref()
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ManifestPath {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.file.as_ref()
+    }
+}
+
+impl AsRef<Utf8Path> for ManifestPath {
+    fn as_ref(&self) -> &Utf8Path {
         self.file.as_ref()
     }
 }

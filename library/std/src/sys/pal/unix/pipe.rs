@@ -9,6 +9,7 @@ use crate::sys_common::{FromInner, IntoInner};
 // Anonymous pipes
 ////////////////////////////////////////////////////////////////////////////////
 
+#[derive(Debug)]
 pub struct AnonPipe(FileDesc);
 
 pub fn anon_pipe() -> io::Result<(AnonPipe, AnonPipe)> {
@@ -17,21 +18,25 @@ pub fn anon_pipe() -> io::Result<(AnonPipe, AnonPipe)> {
     // The only known way right now to create atomically set the CLOEXEC flag is
     // to use the `pipe2` syscall. This was added to Linux in 2.6.27, glibc 2.9
     // and musl 0.9.3, and some other targets also have it.
-    cfg_if::cfg_if! {
-        if #[cfg(any(
+    cfg_select! {
+        any(
+            target_os = "android",
             target_os = "dragonfly",
             target_os = "freebsd",
             target_os = "hurd",
+            target_os = "illumos",
             target_os = "linux",
             target_os = "netbsd",
             target_os = "openbsd",
+            target_os = "cygwin",
             target_os = "redox"
-        ))] {
+        ) => {
             unsafe {
                 cvt(libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC))?;
                 Ok((AnonPipe(FileDesc::from_raw_fd(fds[0])), AnonPipe(FileDesc::from_raw_fd(fds[1]))))
             }
-        } else {
+        }
+        _ => {
             unsafe {
                 cvt(libc::pipe(fds.as_mut_ptr()))?;
 
@@ -46,6 +51,12 @@ pub fn anon_pipe() -> io::Result<(AnonPipe, AnonPipe)> {
 }
 
 impl AnonPipe {
+    #[allow(dead_code)]
+    // FIXME: This function seems legitimately unused.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        self.0.duplicate().map(Self)
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
@@ -78,6 +89,12 @@ impl AnonPipe {
     #[inline]
     pub fn is_write_vectored(&self) -> bool {
         self.0.is_write_vectored()
+    }
+
+    #[allow(dead_code)]
+    // FIXME: This function seems legitimately unused.
+    pub fn as_file_desc(&self) -> &FileDesc {
+        &self.0
     }
 }
 

@@ -1,3 +1,4 @@
+#![allow(clippy::unused_unit, clippy::missing_safety_doc)]
 #![warn(clippy::too_many_lines)]
 
 fn good_lines() {
@@ -55,9 +56,10 @@ fn good_lines() {
     println!("This is good.");
 }
 
-fn bad_lines() {
-    //~^ ERROR: this function has too many lines (102/100)
-    //~| NOTE: `-D clippy::too-many-lines` implied by `-D warnings`
+#[allow(unused)] // the attr shouldn't get included in the highlight
+pub async unsafe extern "Rust" fn bad_lines() -> () {
+    //~^ too_many_lines
+
     println!("Dont get confused by braces: {{}}");
     println!("This is bad.");
     println!("This is bad.");
@@ -160,6 +162,117 @@ fn bad_lines() {
     println!("This is bad.");
     println!("This is bad.");
     println!("This is bad.");
+}
+
+struct Foo;
+impl Foo {
+    #[allow(unused)] // the attr shouldn't get included in the highlight
+    pub async unsafe extern "Rust" fn bad_lines() -> () {
+        //~^ too_many_lines
+
+        println!("Dont get confused by braces: {{}}");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+        println!("This is bad.");
+    }
 }
 
 fn main() {}

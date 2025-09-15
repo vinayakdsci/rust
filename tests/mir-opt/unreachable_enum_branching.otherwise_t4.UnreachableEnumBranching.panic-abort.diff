@@ -14,7 +14,7 @@
           StorageLive(_2);
           _2 = Test4::C;
           _3 = discriminant(_2);
-          switchInt(move _3) -> [0: bb2, 1: bb3, otherwise: bb1];
+          switchInt(move _3) -> [0: bb3, 1: bb2, otherwise: bb1];
       }
   
       bb1: {
@@ -26,15 +26,15 @@
       }
   
       bb2: {
-          _1 = const "A(i32)";
-          goto -> bb4;
-      }
-  
-      bb3: {
           StorageLive(_4);
           _4 = const "B(i32)";
           _1 = &(*_4);
           StorageDead(_4);
+          goto -> bb4;
+      }
+  
+      bb3: {
+          _1 = const "A(i32)";
           goto -> bb4;
       }
   
@@ -44,5 +44,17 @@
           _0 = const ();
           return;
       }
+  }
+  
+  ALLOC0 (size: 2, align: 1) {
+      43 44                                           │ CD
+  }
+  
+  ALLOC1 (size: 6, align: 1) {
+      42 28 69 33 32 29                               │ B(i32)
+  }
+  
+  ALLOC2 (size: 6, align: 1) {
+      41 28 69 33 32 29                               │ A(i32)
   }
   

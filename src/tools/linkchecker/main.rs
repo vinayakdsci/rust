@@ -6,26 +6,29 @@
 //! script is to check all relative links in our documentation to make sure they
 //! actually point to a valid place.
 //!
-//! Currently this doesn't actually do any HTML parsing or anything fancy like
-//! that, it just has a simple "regex" to search for `href` and `id` tags.
+//! Currently uses a combination of HTML parsing to
+//! extract the `href` and `id` attributes,
+//! and regex search on the original markdown to handle intra-doc links.
+//!
 //! These values are then translated to file URLs if possible and then the
 //! destination is asserted to exist.
 //!
 //! A few exceptions are allowed as there's known bugs in rustdoc, but this
 //! should catch the majority of "broken link" cases.
 
+use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::iter::once;
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
+use std::time::Instant;
+
 use html5ever::tendril::ByteTendril;
 use html5ever::tokenizer::{
     BufferQueue, TagToken, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::env;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
-use std::time::Instant;
 
 // Add linkcheck exceptions here
 // If at all possible you should use intra-doc links to avoid linkcheck issues. These
@@ -48,6 +51,29 @@ const LINKCHECK_EXCEPTIONS: &[(&str, &[&str])] = &[
     ("alloc/slice/trait.Concat.html", &["#method.concat"]),
     ("alloc/slice/index.html", &["#method.concat", "#method.join"]),
     ("alloc/vec/struct.Vec.html", &["#method.sort_by_key", "#method.sort_by_cached_key"]),
+    ("alloc/bstr/struct.ByteStr.html", &[
+        "#method.to_ascii_uppercase",
+        "#method.to_ascii_lowercase",
+        "core/slice::sort_by_key",
+        "core\\slice::sort_by_key",
+        "#method.sort_by_cached_key",
+        "#method.sort_by_key"
+    ]),
+    ("alloc/bstr/struct.ByteString.html", &[
+        "#method.to_ascii_uppercase",
+        "#method.to_ascii_lowercase",
+        "core/slice::sort_by_key",
+        "core\\slice::sort_by_key",
+        "#method.sort_by_cached_key",
+        "#method.sort_by_key"
+    ]),
+    ("core/bstr/struct.ByteStr.html", &[
+        "#method.to_ascii_uppercase",
+        "#method.to_ascii_lowercase",
+        "core/bstr/slice::sort_by_key",
+        "core\\bstr\\slice::sort_by_key",
+        "#method.sort_by_cached_key"
+    ]),
     ("core/primitive.str.html", &["#method.to_ascii_uppercase", "#method.to_ascii_lowercase"]),
     ("core/primitive.slice.html", &["#method.to_ascii_uppercase", "#method.to_ascii_lowercase",
                                     "core/slice::sort_by_key", "core\\slice::sort_by_key",
@@ -85,10 +111,25 @@ macro_rules! t {
     };
 }
 
+struct Cli {
+    docs: PathBuf,
+    link_targets_dirs: Vec<PathBuf>,
+}
+
 fn main() {
-    let docs = env::args_os().nth(1).expect("doc path should be first argument");
-    let docs = env::current_dir().unwrap().join(docs);
-    let mut checker = Checker { root: docs.clone(), cache: HashMap::new() };
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(err) => {
+            eprintln!("error: {err}");
+            usage_and_exit(1);
+        }
+    };
+
+    let mut checker = Checker {
+        root: cli.docs.clone(),
+        link_targets_dirs: cli.link_targets_dirs,
+        cache: HashMap::new(),
+    };
     let mut report = Report {
         errors: 0,
         start: Instant::now(),
@@ -98,8 +139,9 @@ fn main() {
         links_ignored_external: 0,
         links_ignored_exception: 0,
         intra_doc_exceptions: 0,
+        has_broken_urls: false,
     };
-    checker.walk(&docs, &mut report);
+    checker.walk(&cli.docs, &mut report);
     report.report();
     if report.errors != 0 {
         println!("found some broken links");
@@ -107,13 +149,57 @@ fn main() {
     }
 }
 
+fn parse_cli() -> Result<Cli, String> {
+    fn to_absolute_path(arg: &str) -> Result<PathBuf, String> {
+        std::path::absolute(arg).map_err(|e| format!("could not convert to absolute {arg}: {e}"))
+    }
+
+    let mut verbatim = false;
+    let mut docs = None;
+    let mut link_targets_dirs = Vec::new();
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if !verbatim && arg == "--" {
+            verbatim = true;
+        } else if !verbatim && (arg == "-h" || arg == "--help") {
+            usage_and_exit(0)
+        } else if !verbatim && arg == "--link-targets-dir" {
+            link_targets_dirs.push(to_absolute_path(
+                &args.next().ok_or("missing value for --link-targets-dir")?,
+            )?);
+        } else if !verbatim && let Some(value) = arg.strip_prefix("--link-targets-dir=") {
+            link_targets_dirs.push(to_absolute_path(value)?);
+        } else if !verbatim && arg.starts_with('-') {
+            return Err(format!("unknown flag: {arg}"));
+        } else if docs.is_none() {
+            docs = Some(arg);
+        } else {
+            return Err("too many positional arguments".into());
+        }
+    }
+
+    Ok(Cli {
+        docs: to_absolute_path(&docs.ok_or("missing first positional argument")?)?,
+        link_targets_dirs,
+    })
+}
+
+fn usage_and_exit(code: i32) -> ! {
+    eprintln!("usage: linkchecker PATH [--link-targets-dir=PATH ...]");
+    std::process::exit(code)
+}
+
 struct Checker {
     root: PathBuf,
+    link_targets_dirs: Vec<PathBuf>,
     cache: Cache,
 }
 
 struct Report {
     errors: u32,
+    // Used to provide help message to remind the user to register a page in `SUMMARY.md`.
+    has_broken_urls: bool,
     start: Instant,
     html_files: u32,
     html_redirects: u32,
@@ -146,18 +232,7 @@ enum FileEntry {
 type Cache = HashMap<String, FileEntry>;
 
 fn small_url_encode(s: &str) -> String {
-    s.replace('<', "%3C")
-        .replace('>', "%3E")
-        .replace(' ', "%20")
-        .replace('?', "%3F")
-        .replace('\'', "%27")
-        .replace('&', "%26")
-        .replace(',', "%2C")
-        .replace(':', "%3A")
-        .replace(';', "%3B")
-        .replace('[', "%5B")
-        .replace(']', "%5D")
-        .replace('\"', "%22")
+    urlencoding::encode(s).to_string()
 }
 
 impl Checker {
@@ -272,6 +347,7 @@ impl Checker {
                     report.links_ignored_exception += 1;
                 } else {
                     report.errors += 1;
+                    report.has_broken_urls = true;
                     println!("{}:{}: broken link - `{}`", pretty_path, i, target_pretty_path);
                 }
                 return;
@@ -391,37 +467,34 @@ impl Checker {
 
     /// Load a file from disk, or from the cache if available.
     fn load_file(&mut self, file: &Path, report: &mut Report) -> (String, &FileEntry) {
-        // https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
-        #[cfg(windows)]
-        const ERROR_INVALID_NAME: i32 = 123;
-
         let pretty_path =
             file.strip_prefix(&self.root).unwrap_or(file).to_str().unwrap().to_string();
 
-        let entry =
-            self.cache.entry(pretty_path.clone()).or_insert_with(|| match fs::metadata(file) {
+        for base in once(&self.root).chain(self.link_targets_dirs.iter()) {
+            let entry = self.cache.entry(pretty_path.clone());
+            if let Entry::Occupied(e) = &entry
+                && !matches!(e.get(), FileEntry::Missing)
+            {
+                break;
+            }
+
+            let file = base.join(&pretty_path);
+            entry.insert_entry(match fs::metadata(&file) {
                 Ok(metadata) if metadata.is_dir() => FileEntry::Dir,
                 Ok(_) => {
                     if file.extension().and_then(|s| s.to_str()) != Some("html") {
                         FileEntry::OtherFile
                     } else {
                         report.html_files += 1;
-                        load_html_file(file, report)
+                        load_html_file(&file, report)
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound => FileEntry::Missing,
-                Err(e) => {
-                    // If a broken intra-doc link contains `::`, on windows, it will cause `ERROR_INVALID_NAME` rather than `NotFound`.
-                    // Explicitly check for that so that the broken link can be allowed in `LINKCHECK_EXCEPTIONS`.
-                    #[cfg(windows)]
-                    if e.raw_os_error() == Some(ERROR_INVALID_NAME)
-                        && file.as_os_str().to_str().map_or(false, |s| s.contains("::"))
-                    {
-                        return FileEntry::Missing;
-                    }
-                    panic!("unexpected read error for {}: {}", file.display(), e);
-                }
+                Err(e) if is_not_found_error(&file, &e) => FileEntry::Missing,
+                Err(e) => panic!("unexpected read error for {}: {}", file.display(), e),
             });
+        }
+
+        let entry = self.cache.get(&pretty_path).unwrap();
         (pretty_path, entry)
     }
 }
@@ -436,6 +509,13 @@ impl Report {
         println!("number of links ignored due to exceptions: {}", self.links_ignored_exception);
         println!("number of intra doc links ignored: {}", self.intra_doc_exceptions);
         println!("errors found: {}", self.errors);
+
+        if self.has_broken_urls {
+            eprintln!(
+                "NOTE: if you are adding or renaming a markdown file in a mdBook, don't forget to \
+                register the page in SUMMARY.md"
+            );
+        }
     }
 }
 
@@ -508,7 +588,7 @@ fn parse_html<Sink: TokenSink>(source: &str, sink: Sink) -> Sink {
     let mut input = BufferQueue::default();
     input.push_back(tendril.try_reinterpret().unwrap());
 
-    let mut tok = Tokenizer::new(sink, TokenizerOpts::default());
+    let tok = Tokenizer::new(sink, TokenizerOpts::default());
     let _ = tok.feed(&mut input);
     assert!(input.is_empty());
     tok.end();
@@ -518,8 +598,8 @@ fn parse_html<Sink: TokenSink>(source: &str, sink: Sink) -> Sink {
 #[derive(Default)]
 struct AttrCollector {
     attr_name: &'static [u8],
-    base: Option<String>,
-    found_attrs: Vec<(u64, String)>,
+    base: Cell<Option<String>>,
+    found_attrs: RefCell<Vec<(u64, String)>>,
     /// Tracks whether or not it is inside a <script> tag.
     ///
     /// A lot of our sources have JSON script tags which have HTML embedded
@@ -528,13 +608,13 @@ struct AttrCollector {
     /// `TokenSinkResult::Script(…)` (and then maybe switch parser?), but I
     /// don't fully understand the best way to use that, and this seems good
     /// enough for now.
-    in_script: bool,
+    in_script: Cell<bool>,
 }
 
 impl TokenSink for AttrCollector {
     type Handle = ();
 
-    fn process_token(&mut self, token: Token, line_number: u64) -> TokenSinkResult<()> {
+    fn process_token(&self, token: Token, line_number: u64) -> TokenSinkResult<()> {
         match token {
             TagToken(tag) => {
                 let tag_name = tag.name.as_bytes();
@@ -542,20 +622,20 @@ impl TokenSink for AttrCollector {
                     if let Some(href) =
                         tag.attrs.iter().find(|attr| attr.name.local.as_bytes() == b"href")
                     {
-                        self.base = Some(href.value.to_string());
+                        self.base.set(Some(href.value.to_string()));
                     }
                     return TokenSinkResult::Continue;
                 } else if tag_name == b"script" {
-                    self.in_script = !self.in_script;
+                    self.in_script.set(!self.in_script.get());
                 }
-                if self.in_script {
+                if self.in_script.get() {
                     return TokenSinkResult::Continue;
                 }
                 for attr in tag.attrs.iter() {
                     let name = attr.name.local.as_bytes();
                     if name == self.attr_name {
                         let url = attr.value.to_string();
-                        self.found_attrs.push((line_number, url));
+                        self.found_attrs.borrow_mut().push((line_number, url));
                     }
                 }
             }
@@ -571,7 +651,7 @@ impl TokenSink for AttrCollector {
 fn get_urls(source: &str) -> (Option<String>, Vec<(u64, String)>) {
     let collector = AttrCollector { attr_name: b"href", ..AttrCollector::default() };
     let sink = parse_html(source, collector);
-    (sink.base, sink.found_attrs)
+    (sink.base.into_inner(), sink.found_attrs.into_inner())
 }
 
 /// Retrieves id="..." attributes from HTML elements.
@@ -583,7 +663,7 @@ fn parse_ids(ids: &mut HashSet<String>, file: &str, source: &str, report: &mut R
 
     let collector = AttrCollector { attr_name: b"id", ..AttrCollector::default() };
     let sink = parse_html(source, collector);
-    for (line_number, id) in sink.found_attrs {
+    for (line_number, id) in sink.found_attrs.into_inner() {
         let encoded = small_url_encode(&id);
         if let Some(id) = ids.replace(id) {
             report.errors += 1;
@@ -592,4 +672,17 @@ fn parse_ids(ids: &mut HashSet<String>, file: &str, source: &str, report: &mut R
         // Just in case, we also add the encoded id.
         ids.insert(encoded);
     }
+}
+
+fn is_not_found_error(path: &Path, error: &std::io::Error) -> bool {
+    // https://docs.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
+    const WINDOWS_ERROR_INVALID_NAME: i32 = 123;
+
+    error.kind() == std::io::ErrorKind::NotFound
+        // If a broken intra-doc link contains `::`, on windows, it will cause `ERROR_INVALID_NAME`
+        // rather than `NotFound`. Explicitly check for that so that the broken link can be allowed
+        // in `LINKCHECK_EXCEPTIONS`.
+        || (cfg!(windows)
+            && error.raw_os_error() == Some(WINDOWS_ERROR_INVALID_NAME)
+            && path.as_os_str().to_str().map_or(false, |s| s.contains("::")))
 }

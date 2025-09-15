@@ -15,10 +15,10 @@ thread_local! {
 }
 
 /// Print to terminal output to a buffer
-pub fn entrypoint(stream: &MdStream<'_>, buf: &mut Buffer) -> io::Result<()> {
+pub(crate) fn entrypoint(stream: &MdStream<'_>, buf: &mut Buffer) -> io::Result<()> {
     #[cfg(not(test))]
     if let Some((w, _)) = termize::dimensions() {
-        WIDTH.with(|c| c.set(std::cmp::min(w, DEFAULT_COLUMN_WIDTH)));
+        WIDTH.set(std::cmp::min(w, DEFAULT_COLUMN_WIDTH));
     }
     write_stream(stream, buf, None, 0)?;
     buf.write_all(b"\n")
@@ -47,7 +47,7 @@ fn write_stream(
     Ok(())
 }
 
-pub fn write_tt(tt: &MdTree<'_>, buf: &mut Buffer, indent: usize) -> io::Result<()> {
+fn write_tt(tt: &MdTree<'_>, buf: &mut Buffer, indent: usize) -> io::Result<()> {
     match tt {
         MdTree::CodeBlock { txt, lang: _ } => {
             buf.set_color(ColorSpec::new().set_dimmed(true))?;
@@ -84,7 +84,7 @@ pub fn write_tt(tt: &MdTree<'_>, buf: &mut Buffer, indent: usize) -> io::Result<
             reset_cursor();
         }
         MdTree::HorizontalRule => {
-            (0..WIDTH.with(Cell::get)).for_each(|_| buf.write_all(b"-").unwrap());
+            (0..WIDTH.get()).for_each(|_| buf.write_all(b"-").unwrap());
             reset_cursor();
         }
         MdTree::Heading(n, stream) => {
@@ -121,7 +121,7 @@ pub fn write_tt(tt: &MdTree<'_>, buf: &mut Buffer, indent: usize) -> io::Result<
 
 /// End of that block, just wrap the line
 fn reset_cursor() {
-    CURSOR.with(|cur| cur.set(0));
+    CURSOR.set(0);
 }
 
 /// Change to be generic on Write for testing. If we have a link URL, we don't
@@ -144,7 +144,7 @@ fn write_wrapping<B: io::Write>(
                 buf.write_all(ind_ws)?;
                 cur.set(indent);
             }
-            let ch_count = WIDTH.with(Cell::get) - cur.get();
+            let ch_count = WIDTH.get() - cur.get();
             let mut iter = to_write.char_indices();
             let Some((end_idx, _ch)) = iter.nth(ch_count) else {
                 // Write entire line

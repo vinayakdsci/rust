@@ -18,52 +18,51 @@
 #![doc(test(attr(deny(warnings))))]
 #![doc(rust_logo)]
 #![feature(rustdoc_internals)]
+#![feature(file_buffered)]
 #![feature(internal_output_capture)]
+#![feature(io_const_error)]
 #![feature(staged_api)]
 #![feature(process_exitcode_internals)]
 #![feature(panic_can_unwind)]
 #![feature(test)]
+#![feature(thread_spawn_hook)]
 #![allow(internal_features)]
+#![warn(rustdoc::unescaped_backticks)]
+#![warn(unreachable_pub)]
 
-pub use self::bench::{black_box, Bencher};
+pub use cli::TestOpts;
+
+pub use self::ColorConfig::*;
+pub use self::bench::{Bencher, black_box};
 pub use self::console::run_tests_console;
 pub use self::options::{ColorConfig, Options, OutputFormat, RunIgnored, ShouldPanic};
 pub use self::types::TestName::*;
 pub use self::types::*;
-pub use self::ColorConfig::*;
-pub use cli::TestOpts;
 
 // Module to be used by rustc to compile tests in libtest
 pub mod test {
-    pub use crate::{
-        assert_test_result,
-        bench::Bencher,
-        cli::{parse_opts, TestOpts},
-        filter_tests,
-        helpers::metrics::{Metric, MetricMap},
-        options::{Options, RunIgnored, RunStrategy, ShouldPanic},
-        run_test, test_main, test_main_static,
-        test_result::{TestResult, TrFailed, TrFailedMsg, TrIgnored, TrOk},
-        time::{TestExecTime, TestTimeOptions},
-        types::{
-            DynTestFn, DynTestName, StaticBenchFn, StaticTestFn, StaticTestName, TestDesc,
-            TestDescAndFn, TestId, TestName, TestType,
-        },
+    pub use crate::bench::Bencher;
+    pub use crate::cli::{TestOpts, parse_opts};
+    pub use crate::helpers::metrics::{Metric, MetricMap};
+    pub use crate::options::{Options, RunIgnored, RunStrategy, ShouldPanic};
+    pub use crate::test_result::{TestResult, TrFailed, TrFailedMsg, TrIgnored, TrOk};
+    pub use crate::time::{TestExecTime, TestTimeOptions};
+    pub use crate::types::{
+        DynTestFn, DynTestName, StaticBenchFn, StaticTestFn, StaticTestName, TestDesc,
+        TestDescAndFn, TestId, TestName, TestType,
     };
+    pub use crate::{assert_test_result, filter_tests, run_test, test_main, test_main_static};
 }
 
-use std::{
-    collections::VecDeque,
-    env, io,
-    io::prelude::Write,
-    mem::ManuallyDrop,
-    panic::{self, catch_unwind, AssertUnwindSafe, PanicHookInfo},
-    process::{self, Command, Termination},
-    sync::mpsc::{channel, Sender},
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
+use std::io::prelude::Write;
+use std::mem::ManuallyDrop;
+use std::panic::{self, AssertUnwindSafe, PanicHookInfo, catch_unwind};
+use std::process::{self, Command, Termination};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{env, io, thread};
 
 pub mod bench;
 mod cli;
@@ -82,6 +81,7 @@ mod types;
 mod tests;
 
 use core::any::Any;
+
 use event::{CompletedTest, TestEvent};
 use helpers::concurrency::get_concurrency;
 use helpers::shuffle::{get_shuffle_seed, shuffle_tests};
@@ -89,8 +89,8 @@ use options::RunStrategy;
 use test_result::*;
 use time::TestExecTime;
 
-// Process exit code to be used to indicate test failures.
-const ERROR_EXIT_CODE: i32 = 101;
+/// Process exit code to be used to indicate test failures.
+pub const ERROR_EXIT_CODE: i32 = 101;
 
 const SECONDARY_TEST_INVOKER_VAR: &str = "__RUST_TEST_INVOKE";
 const SECONDARY_TEST_BENCH_BENCHMARKS_VAR: &str = "__RUST_TEST_BENCH_BENCHMARKS";
@@ -98,6 +98,15 @@ const SECONDARY_TEST_BENCH_BENCHMARKS_VAR: &str = "__RUST_TEST_BENCH_BENCHMARKS"
 // The default console test runner. It accepts the command line
 // arguments and a vector of test_descs.
 pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Options>) {
+    test_main_with_exit_callback(args, tests, options, || {})
+}
+
+pub fn test_main_with_exit_callback<F: FnOnce()>(
+    args: &[String],
+    tests: Vec<TestDescAndFn>,
+    options: Option<Options>,
+    exit_callback: F,
+) {
     let mut opts = match cli::parse_opts(args) {
         Some(Ok(o)) => o,
         Some(Err(msg)) => {
@@ -137,10 +146,21 @@ pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Opt
                 }
             });
             panic::set_hook(hook);
+            // Use a thread spawning hook to make new threads inherit output capturing.
+            std::thread::add_spawn_hook(|_| {
+                // Get and clone the output capture of the current thread.
+                let output_capture = io::set_output_capture(None);
+                io::set_output_capture(output_capture.clone());
+                // Set the output capture of the new thread.
+                || {
+                    io::set_output_capture(output_capture);
+                }
+            });
         }
         let res = console::run_tests_console(&opts, tests);
         // Prevent Valgrind from reporting reachable blocks in users' unit tests.
         drop(panic::take_hook());
+        exit_callback();
         match res {
             Ok(true) => {}
             Ok(false) => process::exit(ERROR_EXIT_CODE),
@@ -175,12 +195,16 @@ pub fn test_main_static_abort(tests: &[&TestDescAndFn]) {
     // If we're being run in SpawnedSecondary mode, run the test here. run_test
     // will then exit the process.
     if let Ok(name) = env::var(SECONDARY_TEST_INVOKER_VAR) {
-        env::remove_var(SECONDARY_TEST_INVOKER_VAR);
+        unsafe {
+            env::remove_var(SECONDARY_TEST_INVOKER_VAR);
+        }
 
         // Convert benchmarks to tests if we're not benchmarking.
         let mut tests = tests.iter().map(make_owned_test).collect::<Vec<_>>();
         if env::var(SECONDARY_TEST_BENCH_BENCHMARKS_VAR).is_ok() {
-            env::remove_var(SECONDARY_TEST_BENCH_BENCHMARKS_VAR);
+            unsafe {
+                env::remove_var(SECONDARY_TEST_BENCH_BENCHMARKS_VAR);
+            }
         } else {
             tests = convert_benchmarks_to_tests(tests);
         };
@@ -218,6 +242,21 @@ fn make_owned_test(test: &&TestDescAndFn) -> TestDescAndFn {
         StaticBenchFn(f) => TestDescAndFn { testfn: StaticBenchFn(f), desc: test.desc.clone() },
         _ => panic!("non-static tests passed to test::test_main_static"),
     }
+}
+
+/// Public API used by rustdoc to display the `total` and `compilation` times in the expected
+/// format.
+pub fn print_merged_doctests_times(args: &[String], total_time: f64, compilation_time: f64) {
+    let opts = match cli::parse_opts(args) {
+        Some(Ok(o)) => o,
+        Some(Err(msg)) => {
+            eprintln!("error: {msg}");
+            process::exit(ERROR_EXIT_CODE);
+        }
+        None => return,
+    };
+    let mut formatter = console::get_formatter(&opts, 0);
+    formatter.write_merged_doctests_times(total_time, compilation_time).unwrap();
 }
 
 /// Invoked when unit tests terminate. Returns `Result::Err` if the test is
@@ -652,10 +691,11 @@ fn run_test_in_process(
 
     io::set_output_capture(None);
 
-    let test_result = match result {
-        Ok(()) => calc_result(&desc, Ok(()), &time_opts, &exec_time),
-        Err(e) => calc_result(&desc, Err(e.as_ref()), &time_opts, &exec_time),
-    };
+    // Determine whether the test passed or failed, by comparing its panic
+    // payload (if any) with its `ShouldPanic` value, and by checking for
+    // fatal timeout.
+    let test_result =
+        calc_result(&desc, result.err().as_deref(), time_opts.as_ref(), exec_time.as_ref());
     let stdout = data.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     let message = CompletedTest::new(id, desc, test_result, exec_time, stdout);
     monitor_ch.send(message).unwrap();
@@ -715,7 +755,8 @@ fn spawn_test_subprocess(
         formatters::write_stderr_delimiter(&mut test_output, &desc.name);
         test_output.extend_from_slice(&stderr);
 
-        let result = get_result_from_exit_code(&desc, status, &time_opts, &exec_time);
+        let result =
+            get_result_from_exit_code(&desc, status, time_opts.as_ref(), exec_time.as_ref());
         (result, test_output, exec_time)
     })();
 
@@ -726,10 +767,7 @@ fn spawn_test_subprocess(
 fn run_test_in_spawned_subprocess(desc: TestDesc, runnable_test: RunnableTest) -> ! {
     let builtin_panic_hook = panic::take_hook();
     let record_result = Arc::new(move |panic_info: Option<&'_ PanicHookInfo<'_>>| {
-        let test_result = match panic_info {
-            Some(info) => calc_result(&desc, Err(info.payload()), &None, &None),
-            None => calc_result(&desc, Ok(()), &None, &None),
-        };
+        let test_result = calc_result(&desc, panic_info.map(|info| info.payload()), None, None);
 
         // We don't support serializing TrFailedMsg, so just
         // print the message out to stderr.

@@ -1,228 +1,215 @@
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:11:1
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:12:1
    |
 LL | #[coverage]
-   | ^^^^^^^^^^^
+   | ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
    |
-help: the following are the possible correct uses
+help: try changing it to one of the following valid forms of the attribute
    |
 LL | #[coverage(off)]
-   |
+   |           +++++
 LL | #[coverage(on)]
-   |
+   |           ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:16:5
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:17:5
    |
 LL |     #![coverage]
-   |     ^^^^^^^^^^^^
+   |     ^^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
    |
-help: the following are the possible correct uses
+help: try changing it to one of the following valid forms of the attribute
    |
 LL |     #![coverage(off)]
-   |
+   |                +++++
 LL |     #![coverage(on)]
-   |
+   |                ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:20:1
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:21:1
    |
 LL | #[coverage]
-   | ^^^^^^^^^^^
+   | ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
    |
-help: the following are the possible correct uses
+help: try changing it to one of the following valid forms of the attribute
    |
 LL | #[coverage(off)]
-   |
+   |           +++++
 LL | #[coverage(on)]
-   |
+   |           ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:28:5
-   |
-LL |     #[coverage]
-   |     ^^^^^^^^^^^
-   |
-help: the following are the possible correct uses
-   |
-LL |     #[coverage(off)]
-   |
-LL |     #[coverage(on)]
-   |
-
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:25:1
+error: `#[coverage]` attribute cannot be used on structs
+  --> $DIR/word-only.rs:21:1
    |
 LL | #[coverage]
    | ^^^^^^^^^^^
    |
-help: the following are the possible correct uses
+   = help: `#[coverage]` can be applied to functions, impl blocks, modules, and crates
+
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:26:1
+   |
+LL | #[coverage]
+   | ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
+   |
+help: try changing it to one of the following valid forms of the attribute
    |
 LL | #[coverage(off)]
-   |
+   |           +++++
 LL | #[coverage(on)]
-   |
+   |           ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:38:5
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:29:5
+   |
+LL |     #[coverage]
+   |     ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
+   |
+help: try changing it to one of the following valid forms of the attribute
+   |
+LL |     #[coverage(off)]
+   |               +++++
+LL |     #[coverage(on)]
+   |               ++++
+
+error: `#[coverage]` attribute cannot be used on associated consts
+  --> $DIR/word-only.rs:29:5
    |
 LL |     #[coverage]
    |     ^^^^^^^^^^^
    |
-help: the following are the possible correct uses
-   |
-LL |     #[coverage(off)]
-   |
-LL |     #[coverage(on)]
-   |
+   = help: `#[coverage]` can be applied to functions, impl blocks, modules, and crates
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:43:5
-   |
-LL |     #[coverage]
-   |     ^^^^^^^^^^^
-   |
-help: the following are the possible correct uses
-   |
-LL |     #[coverage(off)]
-   |
-LL |     #[coverage(on)]
-   |
-
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:34:1
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:35:1
    |
 LL | #[coverage]
-   | ^^^^^^^^^^^
+   | ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
    |
-help: the following are the possible correct uses
+help: try changing it to one of the following valid forms of the attribute
    |
 LL | #[coverage(off)]
-   |
+   |           +++++
 LL | #[coverage(on)]
-   |
+   |           ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:52:5
+error: `#[coverage]` attribute cannot be used on traits
+  --> $DIR/word-only.rs:35:1
+   |
+LL | #[coverage]
+   | ^^^^^^^^^^^
+   |
+   = help: `#[coverage]` can be applied to functions, impl blocks, modules, and crates
+
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:39:5
    |
 LL |     #[coverage]
-   |     ^^^^^^^^^^^
+   |     ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
    |
-help: the following are the possible correct uses
+help: try changing it to one of the following valid forms of the attribute
    |
 LL |     #[coverage(off)]
-   |
+   |               +++++
 LL |     #[coverage(on)]
-   |
+   |               ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:57:5
+error: `#[coverage]` attribute cannot be used on associated consts
+  --> $DIR/word-only.rs:39:5
    |
 LL |     #[coverage]
    |     ^^^^^^^^^^^
    |
-help: the following are the possible correct uses
+   = help: `#[coverage]` can be applied to functions, impl blocks, modules, and crates
+
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:44:5
+   |
+LL |     #[coverage]
+   |     ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
+   |
+help: try changing it to one of the following valid forms of the attribute
    |
 LL |     #[coverage(off)]
-   |
+   |               +++++
 LL |     #[coverage(on)]
-   |
+   |               ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:49:1
+error: `#[coverage]` attribute cannot be used on associated types
+  --> $DIR/word-only.rs:44:5
+   |
+LL |     #[coverage]
+   |     ^^^^^^^^^^^
+   |
+   = help: `#[coverage]` can be applied to functions, impl blocks, modules, and crates
+
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:50:1
    |
 LL | #[coverage]
-   | ^^^^^^^^^^^
+   | ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
    |
-help: the following are the possible correct uses
+help: try changing it to one of the following valid forms of the attribute
    |
 LL | #[coverage(off)]
-   |
+   |           +++++
 LL | #[coverage(on)]
-   |
+   |           ++++
 
-error: malformed `coverage` attribute input
-  --> $DIR/word-only.rs:63:1
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:53:5
+   |
+LL |     #[coverage]
+   |     ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
+   |
+help: try changing it to one of the following valid forms of the attribute
+   |
+LL |     #[coverage(off)]
+   |               +++++
+LL |     #[coverage(on)]
+   |               ++++
+
+error: `#[coverage]` attribute cannot be used on associated consts
+  --> $DIR/word-only.rs:53:5
+   |
+LL |     #[coverage]
+   |     ^^^^^^^^^^^
+   |
+   = help: `#[coverage]` can be applied to functions, impl blocks, modules, and crates
+
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:58:5
+   |
+LL |     #[coverage]
+   |     ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
+   |
+help: try changing it to one of the following valid forms of the attribute
+   |
+LL |     #[coverage(off)]
+   |               +++++
+LL |     #[coverage(on)]
+   |               ++++
+
+error: `#[coverage]` attribute cannot be used on associated types
+  --> $DIR/word-only.rs:58:5
+   |
+LL |     #[coverage]
+   |     ^^^^^^^^^^^
+   |
+   = help: `#[coverage]` can be applied to functions, impl blocks, modules, and crates
+
+error[E0539]: malformed `coverage` attribute input
+  --> $DIR/word-only.rs:64:1
    |
 LL | #[coverage]
-   | ^^^^^^^^^^^
+   | ^^^^^^^^^^^ this attribute is only valid with either `on` or `off` as an argument
    |
-help: the following are the possible correct uses
+help: try changing it to one of the following valid forms of the attribute
    |
 LL | #[coverage(off)]
-   |
+   |           +++++
 LL | #[coverage(on)]
-   |
-
-error[E0788]: attribute should be applied to a function definition or closure
-  --> $DIR/word-only.rs:20:1
-   |
-LL | #[coverage]
-   | ^^^^^^^^^^^
-...
-LL | struct MyStruct;
-   | ---------------- not a function or closure
-
-error[E0788]: attribute should be applied to a function definition or closure
-  --> $DIR/word-only.rs:34:1
-   |
-LL |   #[coverage]
-   |   ^^^^^^^^^^^
-...
-LL | / trait MyTrait {
-LL | |     #[coverage]
-LL | |
-LL | |
-...  |
-LL | |     type T;
-LL | | }
-   | |_- not a function or closure
-
-error[E0788]: attribute should be applied to a function definition or closure
-  --> $DIR/word-only.rs:38:5
-   |
-LL |     #[coverage]
-   |     ^^^^^^^^^^^
-...
-LL |     const X: u32;
-   |     ------------- not a function or closure
-
-error[E0788]: attribute should be applied to a function definition or closure
-  --> $DIR/word-only.rs:43:5
-   |
-LL |     #[coverage]
-   |     ^^^^^^^^^^^
-...
-LL |     type T;
-   |     ------- not a function or closure
-
-error[E0788]: attribute should be applied to a function definition or closure
-  --> $DIR/word-only.rs:28:5
-   |
-LL |     #[coverage]
-   |     ^^^^^^^^^^^
-...
-LL |     const X: u32 = 7;
-   |     ----------------- not a function or closure
-
-error[E0788]: attribute should be applied to a function definition or closure
-  --> $DIR/word-only.rs:52:5
-   |
-LL |     #[coverage]
-   |     ^^^^^^^^^^^
-...
-LL |     const X: u32 = 8;
-   |     ----------------- not a function or closure
-
-error[E0788]: attribute should be applied to a function definition or closure
-  --> $DIR/word-only.rs:57:5
-   |
-LL |     #[coverage]
-   |     ^^^^^^^^^^^
-...
-LL |     type T = ();
-   |     ------------ not a function or closure
+   |           ++++
 
 error: aborting due to 19 previous errors
 
-For more information about this error, try `rustc --explain E0788`.
+For more information about this error, try `rustc --explain E0539`.

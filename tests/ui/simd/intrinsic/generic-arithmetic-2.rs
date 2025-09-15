@@ -1,43 +1,26 @@
 //@ build-fail
 
-#![feature(repr_simd, intrinsics)]
+#![feature(repr_simd, core_intrinsics)]
 #![allow(non_camel_case_types)]
-#[repr(simd)]
-#[derive(Copy, Clone)]
-pub struct i32x4(pub i32, pub i32, pub i32, pub i32);
+
+use std::intrinsics::simd::*;
 
 #[repr(simd)]
 #[derive(Copy, Clone)]
-pub struct u32x4(pub u32, pub u32, pub u32, pub u32);
+pub struct i32x4(pub [i32; 4]);
 
 #[repr(simd)]
 #[derive(Copy, Clone)]
-pub struct f32x4(pub f32, pub f32, pub f32, pub f32);
+pub struct u32x4(pub [u32; 4]);
 
-extern "rust-intrinsic" {
-    fn simd_add<T>(x: T, y: T) -> T;
-    fn simd_sub<T>(x: T, y: T) -> T;
-    fn simd_mul<T>(x: T, y: T) -> T;
-    fn simd_div<T>(x: T, y: T) -> T;
-    fn simd_rem<T>(x: T, y: T) -> T;
-    fn simd_shl<T>(x: T, y: T) -> T;
-    fn simd_shr<T>(x: T, y: T) -> T;
-    fn simd_and<T>(x: T, y: T) -> T;
-    fn simd_or<T>(x: T, y: T) -> T;
-    fn simd_xor<T>(x: T, y: T) -> T;
-
-    fn simd_neg<T>(x: T) -> T;
-    fn simd_bswap<T>(x: T) -> T;
-    fn simd_bitreverse<T>(x: T) -> T;
-    fn simd_ctlz<T>(x: T) -> T;
-    fn simd_ctpop<T>(x: T) -> T;
-    fn simd_cttz<T>(x: T) -> T;
-}
+#[repr(simd)]
+#[derive(Copy, Clone)]
+pub struct f32x4(pub [f32; 4]);
 
 fn main() {
-    let x = i32x4(0, 0, 0, 0);
-    let y = u32x4(0, 0, 0, 0);
-    let z = f32x4(0.0, 0.0, 0.0, 0.0);
+    let x = i32x4([0, 0, 0, 0]);
+    let y = u32x4([0, 0, 0, 0]);
+    let z = f32x4([0.0, 0.0, 0.0, 0.0]);
 
     unsafe {
         simd_add(x, x);
@@ -60,6 +43,10 @@ fn main() {
         simd_shl(y, y);
         simd_shr(x, x);
         simd_shr(y, y);
+        simd_funnel_shl(x, x, x);
+        simd_funnel_shl(y, y, y);
+        simd_funnel_shr(x, x, x);
+        simd_funnel_shr(y, y, y);
         simd_and(x, x);
         simd_and(y, y);
         simd_or(x, x);
@@ -90,6 +77,10 @@ fn main() {
         //~^ ERROR expected SIMD input type, found non-SIMD `i32`
         simd_shr(0, 0);
         //~^ ERROR expected SIMD input type, found non-SIMD `i32`
+        simd_funnel_shl(0, 0, 0);
+        //~^ ERROR expected SIMD input type, found non-SIMD `i32`
+        simd_funnel_shr(0, 0, 0);
+        //~^ ERROR expected SIMD input type, found non-SIMD `i32`
         simd_and(0, 0);
         //~^ ERROR expected SIMD input type, found non-SIMD `i32`
         simd_or(0, 0);
@@ -111,6 +102,10 @@ fn main() {
         simd_shl(z, z);
         //~^ ERROR unsupported operation on `f32x4` with element `f32`
         simd_shr(z, z);
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
+        simd_funnel_shl(z, z, z);
+        //~^ ERROR unsupported operation on `f32x4` with element `f32`
+        simd_funnel_shr(z, z, z);
         //~^ ERROR unsupported operation on `f32x4` with element `f32`
         simd_and(z, z);
         //~^ ERROR unsupported operation on `f32x4` with element `f32`

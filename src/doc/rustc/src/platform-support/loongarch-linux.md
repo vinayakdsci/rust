@@ -7,8 +7,8 @@ LoongArch is a RISC ISA developed by Loongson Technology Corporation Limited.
 
 | Target | Description |
 |--------|-------------|
-| `loongarch64-unknown-linux-gnu` | LoongArch64 Linux, LP64D ABI (kernel 5.19, glibc 2.36) |
-| `loongarch64-unknown-linux-musl` | LoongArch64 Linux, LP64D ABI (kernel 5.19, musl 1.2.5) |
+| `loongarch64-unknown-linux-gnu` | LoongArch64 Linux, LP64D ABI (kernel 5.19, glibc 2.36), LSX required |
+| `loongarch64-unknown-linux-musl` | LoongArch64 Linux, LP64D ABI (kernel 5.19, musl 1.2.5), LSX required |
 
 These support both native and cross builds, and have full support for `std`.
 
@@ -22,10 +22,8 @@ Reference material:
 
 ## Target maintainers
 
-- [WANG Rui](https://github.com/heiher) `wangrui@loongson.cn`
-- [ZHAI Xiang](https://github.com/xiangzhai) `zhaixiang@loongson.cn`
-- [ZHAI Xiaojuan](https://github.com/zhaixiaojuan) `zhaixiaojuan@loongson.cn`
-- [WANG Xuerui](https://github.com/xen0n) `git@xen0n.name`
+[@heiher](https://github.com/heiher)
+[@xen0n](https://github.com/xen0n)
 
 ## Requirements
 
@@ -46,8 +44,8 @@ The targets require a reasonably up-to-date LoongArch toolchain on the host.
 Currently the following components are used by the Rust CI to build the target,
 and the versions can be seen as the minimum requirement:
 
-* GNU Binutils 2.40
-* GCC 13.x
+* GNU Binutils 2.42
+* GCC 14.x
 * glibc 2.36
 * linux-headers 5.19
 
@@ -59,13 +57,18 @@ for newer LoongArch ELF relocation types, among other features.
 Recent LLVM/Clang toolchains may be able to build the targets, but are not
 currently being actively tested.
 
+### CPU features
+
+These targets require the double-precision floating-point and LSX (LoongArch
+SIMD Extension) features.
+
 ## Building
 
 These targets are distributed through `rustup`, and otherwise require no
 special configuration.
 
 If you need to build your own Rust for some reason though, the targets can be
-simply enabled in `config.toml`. For example:
+simply enabled in `bootstrap.toml`. For example:
 
 ```toml
 [build]
@@ -73,7 +76,7 @@ target = ["loongarch64-unknown-linux-gnu"]
 ```
 
 Make sure the LoongArch toolchain binaries are reachable from `$PATH`.
-Alternatively, you can explicitly configure the paths in `config.toml`:
+Alternatively, you can explicitly configure the paths in `bootstrap.toml`:
 
 ```toml
 [target.loongarch64-unknown-linux-gnu]

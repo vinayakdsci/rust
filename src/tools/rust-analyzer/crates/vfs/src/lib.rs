@@ -52,12 +52,12 @@ pub use crate::{
     anchored_path::{AnchoredPath, AnchoredPathBuf},
     vfs_path::VfsPath,
 };
-use indexmap::{map::Entry, IndexMap};
+use indexmap::{IndexMap, map::Entry};
 pub use paths::{AbsPath, AbsPathBuf};
 
 use rustc_hash::FxHasher;
 use stdx::hash_once;
-use tracing::{span, Level};
+use tracing::{Level, span};
 
 /// Handle to a file in [`Vfs`]
 ///
@@ -67,16 +67,16 @@ pub struct FileId(u32);
 // pub struct FileId(NonMaxU32);
 
 impl FileId {
-    pub const MAX_FILE_ID: u32 = 0x7fff_ffff;
+    const MAX: u32 = 0x7fff_ffff;
 
     #[inline]
     pub const fn from_raw(raw: u32) -> FileId {
-        assert!(raw <= Self::MAX_FILE_ID);
+        assert!(raw <= Self::MAX);
         FileId(raw)
     }
 
     #[inline]
-    pub fn index(self) -> u32 {
+    pub const fn index(self) -> u32 {
         self.0
     }
 }
@@ -100,6 +100,9 @@ pub enum FileState {
     Exists(u64),
     /// The file is deleted.
     Deleted,
+    /// The file was specifically excluded by the user. We still include excluded files
+    /// when they're opened (without their contents).
+    Excluded,
 }
 
 /// Changed file in the [`Vfs`].
@@ -164,10 +167,22 @@ pub enum ChangeKind {
     Delete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileExcluded {
+    Yes,
+    No,
+}
+
 impl Vfs {
     /// Id of the given path if it exists in the `Vfs` and is not deleted.
-    pub fn file_id(&self, path: &VfsPath) -> Option<FileId> {
-        self.interner.get(path).filter(|&it| matches!(self.get(it), FileState::Exists(_)))
+    pub fn file_id(&self, path: &VfsPath) -> Option<(FileId, FileExcluded)> {
+        let file_id = self.interner.get(path)?;
+        let file_state = self.get(file_id);
+        match file_state {
+            FileState::Exists(_) => Some((file_id, FileExcluded::No)),
+            FileState::Deleted => None,
+            FileState::Excluded => Some((file_id, FileExcluded::Yes)),
+        }
     }
 
     /// File path corresponding to the given `file_id`.
@@ -201,8 +216,8 @@ impl Vfs {
     pub fn set_file_contents(&mut self, path: VfsPath, contents: Option<Vec<u8>>) -> bool {
         let _p = span!(Level::INFO, "Vfs::set_file_contents").entered();
         let file_id = self.alloc_file_id(path);
-        let state = self.get(file_id);
-        let change_kind = match (state, contents) {
+        let state: FileState = self.get(file_id);
+        let change = match (state, contents) {
             (FileState::Deleted, None) => return false,
             (FileState::Deleted, Some(v)) => {
                 let hash = hash_once::<FxHasher>(&*v);
@@ -216,6 +231,7 @@ impl Vfs {
                 }
                 Change::Modify(v, new_hash)
             }
+            (FileState::Excluded, _) => return false,
         };
 
         let mut set_data = |change_kind| {
@@ -225,7 +241,7 @@ impl Vfs {
             };
         };
 
-        let changed_file = ChangedFile { file_id, change: change_kind };
+        let changed_file = ChangedFile { file_id, change };
         match self.changes.entry(file_id) {
             // two changes to the same file in one cycle, merge them appropriately
             Entry::Occupied(mut o) => {
@@ -296,6 +312,13 @@ impl Vfs {
     /// Panics if no file is associated to that id.
     fn get(&self, file_id: FileId) -> FileState {
         self.data[file_id.0 as usize]
+    }
+
+    /// We cannot ignore excluded files, because this will lead to errors when the client
+    /// requests semantic information for them, so we instead mark them specially.
+    pub fn insert_excluded_file(&mut self, path: VfsPath) {
+        let file_id = self.alloc_file_id(path);
+        self.data[file_id.0 as usize] = FileState::Excluded;
     }
 }
 

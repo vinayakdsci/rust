@@ -1,11 +1,11 @@
+use rustc_ast::MetaItem;
+use rustc_expand::base::{Annotatable, ExtCtxt};
+use rustc_span::{Ident, Span, sym};
+use thin_vec::thin_vec;
+
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::path_std;
-use rustc_ast::MetaItem;
-use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{sym, Ident};
-use rustc_span::Span;
-use thin_vec::thin_vec;
 
 pub(crate) fn expand_deriving_ord(
     cx: &ExtCtxt<'_>,
@@ -34,6 +34,7 @@ pub(crate) fn expand_deriving_ord(
         }],
         associated_types: Vec::new(),
         is_const,
+        is_staged_api_crate: cx.ecfg.features.staged_api(),
     };
 
     trait_def.expand(cx, mitem, item, push)

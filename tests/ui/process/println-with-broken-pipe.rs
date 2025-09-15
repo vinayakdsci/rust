@@ -1,11 +1,12 @@
 //@ run-pass
 //@ check-run-results
+//@ needs-subprocess
 //@ ignore-windows
-//@ ignore-wasm32
 //@ ignore-fuchsia
 //@ ignore-horizon
 //@ ignore-android
-//@ normalize-stderr-test: ".rs:\d+:\d+" -> ".rs:LL:CC"
+//@ ignore-backends: gcc
+//@ normalize-stderr: ".rs:\d+:\d+" -> ".rs:LL:CC"
 //@ compile-flags: -Zon-broken-pipe=error
 
 // Test what the error message looks like when `println!()` panics because of

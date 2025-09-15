@@ -1,4 +1,4 @@
-error[E0599]: the method `countx` exists for struct `Filter<Map<Repeat, fn(&u64) -> &u64 {identity::<u64>}>, {closure@hrtb-doesnt-borrow-self-2.rs:111:30}>`, but its trait bounds were not satisfied
+error[E0599]: the method `countx` exists for struct `Filter<Map<Repeat, fn(&u64) -> &u64 {identity::<u64>}>, {closure@...}>`, but its trait bounds were not satisfied
   --> $DIR/hrtb-doesnt-borrow-self-2.rs:112:24
    |
 LL | pub struct Filter<S, F> {
@@ -21,6 +21,8 @@ note: `StreamExt` defines an item `countx`, perhaps you need to implement it
    |
 LL | pub trait StreamExt
    | ^^^^^^^^^^^^^^^^^^^
+   = note: the full name for the type has been written to '$TEST_BUILD_DIR/hrtb-doesnt-borrow-self-2.long-type-$LONG_TYPE_HASH.txt'
+   = note: consider using `--verbose` to print the full type name to the console
 
 error: aborting due to 1 previous error
 

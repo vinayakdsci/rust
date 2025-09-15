@@ -1,7 +1,9 @@
-use crate::stable_hasher::impl_stable_traits_for_trivial_type;
-use crate::stable_hasher::{FromStableHash, Hash64, StableHasherHash};
-use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use std::hash::{Hash, Hasher};
+
+use rustc_hashes::Hash64;
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+
+use crate::stable_hasher::{FromStableHash, StableHasherHash, impl_stable_traits_for_trivial_type};
 
 #[cfg(test)]
 mod tests;

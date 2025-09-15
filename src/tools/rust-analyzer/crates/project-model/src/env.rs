@@ -1,9 +1,9 @@
 //! Cargo-like environment variables injection.
 use base_db::Env;
-use rustc_hash::FxHashMap;
+use paths::Utf8Path;
 use toolchain::Tool;
 
-use crate::{utf8_stdout, ManifestPath, PackageData, Sysroot, TargetKind};
+use crate::{ManifestPath, PackageData, TargetKind, cargo_config_file::CargoConfigFile};
 
 /// Recreates the compile-time environment variables that Cargo sets.
 ///
@@ -17,6 +17,7 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
 
     let manifest_dir = package.manifest.parent();
     env.set("CARGO_MANIFEST_DIR", manifest_dir.as_str());
+    env.set("CARGO_MANIFEST_PATH", package.manifest.as_str());
 
     env.set("CARGO_PKG_VERSION", package.version.to_string());
     env.set("CARGO_PKG_VERSION_MAJOR", package.version.major.to_string());
@@ -24,7 +25,7 @@ pub(crate) fn inject_cargo_package_env(env: &mut Env, package: &PackageData) {
     env.set("CARGO_PKG_VERSION_PATCH", package.version.patch.to_string());
     env.set("CARGO_PKG_VERSION_PRE", package.version.pre.to_string());
 
-    env.set("CARGO_PKG_AUTHORS", package.authors.join(":").clone());
+    env.set("CARGO_PKG_AUTHORS", package.authors.join(":"));
 
     env.set("CARGO_PKG_NAME", package.name.clone());
     env.set("CARGO_PKG_DESCRIPTION", package.description.as_deref().unwrap_or_default());
@@ -59,30 +60,70 @@ pub(crate) fn inject_rustc_tool_env(env: &mut Env, cargo_name: &str, kind: Targe
     env.set("CARGO_CRATE_NAME", cargo_name.replace('-', "_"));
 }
 
-pub(crate) fn cargo_config_env(
-    manifest: &ManifestPath,
-    extra_env: &FxHashMap<String, String>,
-    sysroot: &Sysroot,
-) -> FxHashMap<String, String> {
-    let mut cargo_config = sysroot.tool(Tool::Cargo);
-    cargo_config.envs(extra_env);
-    cargo_config
-        .current_dir(manifest.parent())
-        .args(["-Z", "unstable-options", "config", "get", "env"])
-        .env("RUSTC_BOOTSTRAP", "1");
-    if manifest.is_rust_manifest() {
-        cargo_config.arg("-Zscript");
+pub(crate) fn cargo_config_env(manifest: &ManifestPath, config: &Option<CargoConfigFile>) -> Env {
+    let mut env = Env::default();
+    let Some(serde_json::Value::Object(env_json)) = config.as_ref().and_then(|c| c.get("env"))
+    else {
+        return env;
+    };
+
+    // FIXME: The base here should be the parent of the `.cargo/config` file, not the manifest.
+    // But cargo does not provide this information.
+    let base = <_ as AsRef<Utf8Path>>::as_ref(manifest.parent());
+
+    for (key, entry) in env_json {
+        let serde_json::Value::Object(entry) = entry else {
+            continue;
+        };
+        let Some(value) = entry.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let value = if entry
+            .get("relative")
+            .and_then(|v| v.as_bool())
+            .is_some_and(std::convert::identity)
+        {
+            base.join(value).to_string()
+        } else {
+            value.to_owned()
+        };
+        env.insert(key, value);
     }
-    // if successful we receive `env.key.value = "value" per entry
-    tracing::debug!("Discovering cargo config env by {:?}", cargo_config);
-    utf8_stdout(cargo_config).map(parse_output_cargo_config_env).unwrap_or_default()
+
+    env
 }
 
-fn parse_output_cargo_config_env(stdout: String) -> FxHashMap<String, String> {
-    stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix("env."))
-        .filter_map(|l| l.split_once(".value = "))
-        .map(|(key, value)| (key.to_owned(), value.trim_matches('"').to_owned()))
-        .collect()
+#[test]
+fn parse_output_cargo_config_env_works() {
+    let raw = r#"
+{
+  "env": {
+    "CARGO_WORKSPACE_DIR": {
+      "relative": true,
+      "value": ""
+    },
+    "INVALID": {
+      "relative": "invalidbool",
+      "value": "../relative"
+    },
+    "RELATIVE": {
+      "relative": true,
+      "value": "../relative"
+    },
+    "TEST": {
+      "value": "test"
+    }
+  }
+}
+"#;
+    let config: CargoConfigFile = serde_json::from_str(raw).unwrap();
+    let cwd = paths::Utf8PathBuf::try_from(std::env::current_dir().unwrap()).unwrap();
+    let manifest = paths::AbsPathBuf::assert(cwd.join("Cargo.toml"));
+    let manifest = ManifestPath::try_from(manifest).unwrap();
+    let env = cargo_config_env(&manifest, &Some(config));
+    assert_eq!(env.get("CARGO_WORKSPACE_DIR").as_deref(), Some(cwd.join("").as_str()));
+    assert_eq!(env.get("RELATIVE").as_deref(), Some(cwd.join("../relative").as_str()));
+    assert_eq!(env.get("INVALID").as_deref(), Some("../relative"));
+    assert_eq!(env.get("TEST").as_deref(), Some("test"));
 }

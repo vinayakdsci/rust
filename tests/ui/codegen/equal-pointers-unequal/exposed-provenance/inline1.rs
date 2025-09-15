@@ -1,10 +1,9 @@
 //@ known-bug: #107975
 //@ compile-flags: -Copt-level=2
 //@ run-pass
+//@ ignore-backends: gcc
 
 // Based on https://github.com/rust-lang/rust/issues/107975#issuecomment-1432161340
-
-#![feature(exposed_provenance)]
 
 use std::ptr;
 

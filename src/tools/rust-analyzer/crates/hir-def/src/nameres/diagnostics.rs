@@ -2,66 +2,29 @@
 
 use std::ops::Not;
 
-use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
-use hir_expand::{attrs::AttrId, ErasedAstId, MacroCallKind};
+use hir_expand::{ErasedAstId, ExpandErrorKind, MacroCallKind, attrs::AttrId, mod_path::ModPath};
 use la_arena::Idx;
 use syntax::ast;
 
-use crate::{
-    item_tree::{self, ItemTreeId},
-    nameres::LocalModuleId,
-    path::ModPath,
-    AstId,
-};
+use crate::{AstId, nameres::LocalModuleId};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DefDiagnosticKind {
-    UnresolvedModule {
-        ast: AstId<ast::Module>,
-        candidates: Box<[String]>,
-    },
-    UnresolvedExternCrate {
-        ast: AstId<ast::ExternCrate>,
-    },
-    UnresolvedImport {
-        id: ItemTreeId<item_tree::Use>,
-        index: Idx<ast::UseTree>,
-    },
-    UnconfiguredCode {
-        ast: ErasedAstId,
-        cfg: CfgExpr,
-        opts: CfgOptions,
-    },
-    /// A proc-macro that is lacking an expander, this might be due to build scripts not yet having
-    /// run or proc-macro expansion being disabled.
-    UnresolvedProcMacro {
-        ast: MacroCallKind,
-        krate: CrateId,
-    },
-    UnresolvedMacroCall {
-        ast: MacroCallKind,
-        path: ModPath,
-    },
-    UnimplementedBuiltinMacro {
-        ast: AstId<ast::Macro>,
-    },
-    InvalidDeriveTarget {
-        ast: AstId<ast::Item>,
-        id: usize,
-    },
-    MalformedDerive {
-        ast: AstId<ast::Adt>,
-        id: usize,
-    },
-    MacroDefError {
-        ast: AstId<ast::Macro>,
-        message: String,
-    },
+    UnresolvedModule { ast: AstId<ast::Module>, candidates: Box<[String]> },
+    UnresolvedExternCrate { ast: AstId<ast::ExternCrate> },
+    UnresolvedImport { id: AstId<ast::Use>, index: Idx<ast::UseTree> },
+    UnconfiguredCode { ast_id: ErasedAstId, cfg: CfgExpr, opts: CfgOptions },
+    UnresolvedMacroCall { ast: MacroCallKind, path: ModPath },
+    UnimplementedBuiltinMacro { ast: AstId<ast::Macro> },
+    InvalidDeriveTarget { ast: AstId<ast::Item>, id: usize },
+    MalformedDerive { ast: AstId<ast::Adt>, id: usize },
+    MacroDefError { ast: AstId<ast::Macro>, message: String },
+    MacroError { ast: AstId<ast::Item>, path: ModPath, err: ExpandErrorKind },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DefDiagnostics(Option<triomphe::Arc<Box<[DefDiagnostic]>>>);
+pub struct DefDiagnostics(Option<triomphe::ThinArc<(), DefDiagnostic>>);
 
 impl DefDiagnostics {
     pub fn new(diagnostics: Vec<DefDiagnostic>) -> Self {
@@ -69,12 +32,12 @@ impl DefDiagnostics {
             diagnostics
                 .is_empty()
                 .not()
-                .then(|| triomphe::Arc::new(diagnostics.into_boxed_slice())),
+                .then(|| triomphe::ThinArc::from_header_and_iter((), diagnostics.into_iter())),
         )
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &DefDiagnostic> {
-        self.0.as_ref().into_iter().flat_map(|it| &***it)
+        self.0.as_ref().into_iter().flat_map(|it| &it.slice)
     }
 }
 
@@ -108,27 +71,31 @@ impl DefDiagnostic {
 
     pub(super) fn unresolved_import(
         container: LocalModuleId,
-        id: ItemTreeId<item_tree::Use>,
+        id: AstId<ast::Use>,
         index: Idx<ast::UseTree>,
     ) -> Self {
         Self { in_module: container, kind: DefDiagnosticKind::UnresolvedImport { id, index } }
     }
 
+    pub fn macro_error(
+        container: LocalModuleId,
+        ast: AstId<ast::Item>,
+        path: ModPath,
+        err: ExpandErrorKind,
+    ) -> Self {
+        Self { in_module: container, kind: DefDiagnosticKind::MacroError { ast, path, err } }
+    }
+
     pub fn unconfigured_code(
         container: LocalModuleId,
-        ast: ErasedAstId,
+        ast_id: ErasedAstId,
         cfg: CfgExpr,
         opts: CfgOptions,
     ) -> Self {
-        Self { in_module: container, kind: DefDiagnosticKind::UnconfiguredCode { ast, cfg, opts } }
-    }
-
-    pub fn unresolved_proc_macro(
-        container: LocalModuleId,
-        ast: MacroCallKind,
-        krate: CrateId,
-    ) -> Self {
-        Self { in_module: container, kind: DefDiagnosticKind::UnresolvedProcMacro { ast, krate } }
+        Self {
+            in_module: container,
+            kind: DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts },
+        }
     }
 
     // FIXME: Whats the difference between this and unresolved_proc_macro

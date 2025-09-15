@@ -1,13 +1,12 @@
 //! Common code for printing backtraces.
+#![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::backtrace_rs::{self, BacktraceFmt, BytesOrWideString, PrintFmt};
 use crate::borrow::Cow;
-use crate::env;
-use crate::fmt;
-use crate::io;
 use crate::io::prelude::*;
 use crate::path::{self, Path, PathBuf};
 use crate::sync::{Mutex, MutexGuard, PoisonError};
+use crate::{env, fmt, io};
 
 /// Max number of frames to print.
 const MAX_NB_FRAMES: usize = 100;
@@ -59,76 +58,83 @@ unsafe fn _print_fmt(fmt: &mut fmt::Formatter<'_>, print_fmt: PrintFmt) -> fmt::
     let mut res = Ok(());
     let mut omitted_count: usize = 0;
     let mut first_omit = true;
-    // Start immediately if we're not using a short backtrace.
-    let mut start = print_fmt != PrintFmt::Short;
+    // If we're using a short backtrace, ignore all frames until we're told to start printing.
+    let mut print = print_fmt != PrintFmt::Short;
     set_image_base();
-    backtrace_rs::trace_unsynchronized(|frame| {
-        if print_fmt == PrintFmt::Short && idx > MAX_NB_FRAMES {
-            return false;
-        }
-
-        let mut hit = false;
-        backtrace_rs::resolve_frame_unsynchronized(frame, |symbol| {
-            hit = true;
-
-            // Any frames between `__rust_begin_short_backtrace` and `__rust_end_short_backtrace`
-            // are omitted from the backtrace in short mode, `__rust_end_short_backtrace` will be
-            // called before the panic hook, so we won't ignore any frames if there is no
-            // invoke of `__rust_begin_short_backtrace`.
-            if print_fmt == PrintFmt::Short {
-                if let Some(sym) = symbol.name().and_then(|s| s.as_str()) {
-                    if start && sym.contains("__rust_begin_short_backtrace") {
-                        start = false;
-                        return;
-                    }
-                    if sym.contains("__rust_end_short_backtrace") {
-                        start = true;
-                        return;
-                    }
-                    if !start {
-                        omitted_count += 1;
-                    }
-                }
+    // SAFETY: we roll our own locking in this town
+    unsafe {
+        backtrace_rs::trace_unsynchronized(|frame| {
+            if print_fmt == PrintFmt::Short && idx > MAX_NB_FRAMES {
+                return false;
             }
 
-            if start {
-                if omitted_count > 0 {
-                    debug_assert!(print_fmt == PrintFmt::Short);
-                    // only print the message between the middle of frames
-                    if !first_omit {
-                        let _ = writeln!(
-                            bt_fmt.formatter(),
-                            "      [... omitted {} frame{} ...]",
-                            omitted_count,
-                            if omitted_count > 1 { "s" } else { "" }
+            if cfg!(feature = "backtrace-trace-only") {
+                const HEX_WIDTH: usize = 2 + 2 * size_of::<usize>();
+                let frame_ip = frame.ip();
+                res = writeln!(bt_fmt.formatter(), "{idx:4}: {frame_ip:HEX_WIDTH$?}");
+            } else {
+                let mut hit = false;
+                backtrace_rs::resolve_frame_unsynchronized(frame, |symbol| {
+                    hit = true;
+
+                    // `__rust_end_short_backtrace` means we are done hiding symbols
+                    // for now. Print until we see `__rust_begin_short_backtrace`.
+                    if print_fmt == PrintFmt::Short {
+                        if let Some(sym) = symbol.name().and_then(|s| s.as_str()) {
+                            if sym.contains("__rust_end_short_backtrace") {
+                                print = true;
+                                return;
+                            }
+                            if print && sym.contains("__rust_begin_short_backtrace") {
+                                print = false;
+                                return;
+                            }
+                            if !print {
+                                omitted_count += 1;
+                            }
+                        }
+                    }
+
+                    if print {
+                        if omitted_count > 0 {
+                            debug_assert!(print_fmt == PrintFmt::Short);
+                            // only print the message between the middle of frames
+                            if !first_omit {
+                                let _ = writeln!(
+                                    bt_fmt.formatter(),
+                                    "      [... omitted {} frame{} ...]",
+                                    omitted_count,
+                                    if omitted_count > 1 { "s" } else { "" }
+                                );
+                            }
+                            first_omit = false;
+                            omitted_count = 0;
+                        }
+                        res = bt_fmt.frame().symbol(frame, symbol);
+                    }
+                });
+                #[cfg(all(target_os = "nto", any(target_env = "nto70", target_env = "nto71")))]
+                if libc::__my_thread_exit as *mut libc::c_void == frame.ip() {
+                    if !hit && print {
+                        use crate::backtrace_rs::SymbolName;
+                        res = bt_fmt.frame().print_raw(
+                            frame.ip(),
+                            Some(SymbolName::new("__my_thread_exit".as_bytes())),
+                            None,
+                            None,
                         );
                     }
-                    first_omit = false;
-                    omitted_count = 0;
+                    return false;
                 }
-                res = bt_fmt.frame().symbol(frame, symbol);
+                if !hit && print {
+                    res = bt_fmt.frame().print_raw(frame.ip(), None, None, None);
+                }
             }
-        });
-        #[cfg(target_os = "nto")]
-        if libc::__my_thread_exit as *mut libc::c_void == frame.ip() {
-            if !hit && start {
-                use crate::backtrace_rs::SymbolName;
-                res = bt_fmt.frame().print_raw(
-                    frame.ip(),
-                    Some(SymbolName::new("__my_thread_exit".as_bytes())),
-                    None,
-                    None,
-                );
-            }
-            return false;
-        }
-        if !hit && start {
-            res = bt_fmt.frame().print_raw(frame.ip(), None, None, None);
-        }
 
-        idx += 1;
-        res.is_ok()
-    });
+            idx += 1;
+            res.is_ok()
+        })
+    };
     res?;
     bt_fmt.finish()?;
     if print_fmt == PrintFmt::Short {

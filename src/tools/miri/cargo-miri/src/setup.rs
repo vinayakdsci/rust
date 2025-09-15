@@ -24,11 +24,9 @@ pub fn setup(
     let ask_user = !only_setup;
     let print_sysroot = only_setup && has_arg_flag("--print-sysroot"); // whether we just print the sysroot path
     let show_setup = only_setup && !print_sysroot;
-    if !only_setup {
-        if let Some(sysroot) = std::env::var_os("MIRI_SYSROOT") {
-            // Skip setup step if MIRI_SYSROOT is explicitly set, *unless* we are `cargo miri setup`.
-            return sysroot.into();
-        }
+    if !only_setup && let Some(sysroot) = std::env::var_os("MIRI_SYSROOT") {
+        // Skip setup step if MIRI_SYSROOT is explicitly set, *unless* we are `cargo miri setup`.
+        return sysroot.into();
     }
 
     // Determine where the rust sources are located.  The env var trumps auto-detection.
@@ -85,7 +83,7 @@ pub fn setup(
         SysrootConfig::NoStd
     } else {
         SysrootConfig::WithStd {
-            std_features: ["panic_unwind", "backtrace"].into_iter().map(Into::into).collect(),
+            std_features: ["panic-unwind", "backtrace"].into_iter().map(Into::into).collect(),
         }
     };
     let cargo_cmd = {
@@ -100,7 +98,10 @@ pub fn setup(
         // for target crates.
         let cargo_miri_path = std::env::current_exe().expect("current executable path invalid");
         if env::var_os("RUSTC_STAGE").is_some() {
-            assert!(env::var_os("RUSTC").is_some());
+            assert!(
+                env::var_os("RUSTC").is_some() && env::var_os("RUSTC_WRAPPER").is_some(),
+                "cargo-miri setup is running inside rustc bootstrap but RUSTC or RUST_WRAPPER is not set"
+            );
             command.env("RUSTC_REAL", &cargo_miri_path);
         } else {
             command.env("RUSTC", &cargo_miri_path);
@@ -112,7 +113,7 @@ pub fn setup(
         // https://github.com/rust-lang/miri/issues/1421,
         // https://github.com/rust-lang/miri/issues/2429). Looks like setting
         // `RUSTC_WRAPPER` to the empty string overwrites `build.rustc-wrapper` set via
-        // `config.toml`.
+        // `bootstrap.toml`.
         command.env("RUSTC_WRAPPER", "");
 
         if show_setup {

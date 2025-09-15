@@ -1,18 +1,20 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::snippet_with_context;
-use clippy_utils::visitors::{for_each_local_assignment, for_each_value_source, is_local_used};
+use clippy_utils::macros::{FormatArgsStorage, find_format_arg_expr, is_format_macro, root_macro_call_first_node};
+use clippy_utils::source::{indent_of, reindent_multiline, snippet_with_context};
+use clippy_utils::visitors::{for_each_local_assignment, for_each_value_source};
 use core::ops::ControlFlow;
+use rustc_ast::{FormatArgs, FormatArgumentKind};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::intravisit::{walk_body, Visitor};
+use rustc_hir::intravisit::{Visitor, walk_body, walk_expr};
 use rustc_hir::{Expr, ExprKind, HirId, HirIdSet, LetStmt, MatchSource, Node, PatKind, QPath, TyKind};
 use rustc_lint::{LateContext, LintContext};
-use rustc_middle::lint::{in_external_macro, is_from_async_await};
 use rustc_middle::ty;
+use rustc_span::Span;
 
 use super::LET_UNIT_VALUE;
 
-pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, local: &'tcx LetStmt<'_>) {
+pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, format_args: &FormatArgsStorage, local: &'tcx LetStmt<'_>) {
     // skip `let () = { ... }`
     if let PatKind::Tuple(fields, ..) = local.pat.kind
         && fields.is_empty()
@@ -22,8 +24,8 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, local: &'tcx LetStmt<'_>) {
 
     if let Some(init) = local.init
         && !local.pat.span.from_expansion()
-        && !in_external_macro(cx.sess(), local.span)
-        && !is_from_async_await(local.span)
+        && !local.span.in_external_macro(cx.sess().source_map())
+        && !local.span.is_from_async_await()
         && cx.typeck_results().pat_ty(local.pat).is_unit()
     {
         // skip `let awa = ()`
@@ -38,7 +40,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, local: &'tcx LetStmt<'_>) {
             return;
         }
 
-        if (local.ty.map_or(false, |ty| !matches!(ty.kind, TyKind::Infer))
+        if (local.ty.is_some_and(|ty| !matches!(ty.kind, TyKind::Infer(())))
             || matches!(local.pat.kind, PatKind::Tuple([], ddpos) if ddpos.as_opt_usize().is_none()))
             && expr_needs_inferred_result(cx, init)
         {
@@ -71,55 +73,114 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, local: &'tcx LetStmt<'_>) {
                 local.span,
                 "this let-binding has unit value",
                 |diag| {
-                    if let Some(expr) = &local.init {
-                        let mut app = Applicability::MachineApplicable;
-                        let snip = snippet_with_context(cx, expr.span, local.span.ctxt(), "()", &mut app).0;
-                        diag.span_suggestion(local.span, "omit the `let` binding", format!("{snip};"), app);
+                    let mut suggestions = Vec::new();
+
+                    // Suggest omitting the `let` binding
+                    let mut app = Applicability::MachineApplicable;
+                    let snip = snippet_with_context(cx, init.span, local.span.ctxt(), "()", &mut app).0;
+
+                    // If this is a binding pattern, we need to add suggestions to remove any usages
+                    // of the variable
+                    if let PatKind::Binding(_, binding_hir_id, ..) = local.pat.kind
+                        && let Some(body_id) = cx.enclosing_body.as_ref()
+                    {
+                        let body = cx.tcx.hir_body(*body_id);
+                        let mut visitor = UnitVariableCollector::new(cx, format_args, binding_hir_id);
+                        walk_body(&mut visitor, body);
+
+                        let mut has_in_format_capture = false;
+                        suggestions.extend(visitor.spans.iter().filter_map(|span| match span {
+                            MaybeInFormatCapture::Yes => {
+                                has_in_format_capture = true;
+                                None
+                            },
+                            MaybeInFormatCapture::No(span) => Some((*span, "()".to_string())),
+                        }));
+
+                        if has_in_format_capture {
+                            suggestions.push((
+                                init.span,
+                                format!("();\n{}", reindent_multiline(&snip, false, indent_of(cx, local.span))),
+                            ));
+                            diag.multipart_suggestion(
+                                "replace variable usages with `()`",
+                                suggestions,
+                                Applicability::MachineApplicable,
+                            );
+                            return;
+                        }
                     }
 
-                    if let PatKind::Binding(_, binding_hir_id, ident, ..) = local.pat.kind
-                        && let Some(body_id) = cx.enclosing_body.as_ref()
-                        && let body = cx.tcx.hir().body(*body_id)
-                        && is_local_used(cx, body, binding_hir_id)
-                    {
-                        let identifier = ident.as_str();
-                        let mut visitor = UnitVariableCollector::new(binding_hir_id);
-                        walk_body(&mut visitor, body);
-                        visitor.spans.into_iter().for_each(|span| {
-                            let msg =
-                                format!("variable `{identifier}` of type `()` can be replaced with explicit `()`");
-                            diag.span_suggestion(span, msg, "()", Applicability::MachineApplicable);
-                        });
-                    }
+                    suggestions.push((local.span, format!("{snip};")));
+                    let message = if suggestions.len() == 1 {
+                        "omit the `let` binding"
+                    } else {
+                        "omit the `let` binding and replace variable usages with `()`"
+                    };
+                    diag.multipart_suggestion(message, suggestions, Applicability::MachineApplicable);
                 },
             );
         }
     }
 }
 
-struct UnitVariableCollector {
+struct UnitVariableCollector<'a, 'tcx> {
+    cx: &'a LateContext<'tcx>,
+    format_args: &'a FormatArgsStorage,
     id: HirId,
-    spans: Vec<rustc_span::Span>,
+    spans: Vec<MaybeInFormatCapture>,
+    macro_call: Option<&'a FormatArgs>,
 }
 
-impl UnitVariableCollector {
-    fn new(id: HirId) -> Self {
-        Self { id, spans: vec![] }
+enum MaybeInFormatCapture {
+    Yes,
+    No(Span),
+}
+
+impl<'a, 'tcx> UnitVariableCollector<'a, 'tcx> {
+    fn new(cx: &'a LateContext<'tcx>, format_args: &'a FormatArgsStorage, id: HirId) -> Self {
+        Self {
+            cx,
+            format_args,
+            id,
+            spans: Vec::new(),
+            macro_call: None,
+        }
     }
 }
 
 /**
  * Collect all instances where a variable is used based on its `HirId`.
  */
-impl<'tcx> Visitor<'tcx> for UnitVariableCollector {
+impl<'tcx> Visitor<'tcx> for UnitVariableCollector<'_, 'tcx> {
     fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) -> Self::Result {
+        if let Some(macro_call) = root_macro_call_first_node(self.cx, ex)
+            && is_format_macro(self.cx, macro_call.def_id)
+            && let Some(format_args) = self.format_args.get(self.cx, ex, macro_call.expn)
+        {
+            let parent_macro_call = self.macro_call;
+            self.macro_call = Some(format_args);
+            walk_expr(self, ex);
+            self.macro_call = parent_macro_call;
+            return;
+        }
+
         if let ExprKind::Path(QPath::Resolved(None, path)) = ex.kind
             && let Res::Local(id) = path.res
             && id == self.id
         {
-            self.spans.push(path.span);
+            if let Some(macro_call) = self.macro_call
+                && macro_call.arguments.all_args().iter().any(|arg| {
+                    matches!(arg.kind, FormatArgumentKind::Captured(_)) && find_format_arg_expr(ex, arg).is_some()
+                })
+            {
+                self.spans.push(MaybeInFormatCapture::Yes);
+            } else {
+                self.spans.push(MaybeInFormatCapture::No(path.span));
+            }
         }
-        rustc_hir::intravisit::walk_expr(self, ex);
+
+        walk_expr(self, ex);
     }
 }
 
@@ -145,7 +206,7 @@ fn expr_needs_inferred_result<'tcx>(cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) -
     }
     while let Some(id) = locals_to_check.pop() {
         if let Node::LetStmt(l) = cx.tcx.parent_hir_node(id) {
-            if !l.ty.map_or(true, |ty| matches!(ty.kind, TyKind::Infer)) {
+            if !l.ty.is_none_or(|ty| matches!(ty.kind, TyKind::Infer(()))) {
                 return false;
             }
             if let Some(e) = l.init {
@@ -194,7 +255,7 @@ fn needs_inferred_result_ty(
     let (id, receiver, args) = match e.kind {
         ExprKind::Call(
             Expr {
-                kind: ExprKind::Path(ref path),
+                kind: ExprKind::Path(path),
                 hir_id,
                 ..
             },

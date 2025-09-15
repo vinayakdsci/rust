@@ -1,13 +1,11 @@
-#[cfg(feature = "nightly")]
-use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
-
 use std::borrow::{Borrow, BorrowMut};
-use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut, RangeBounds};
-use std::slice;
-use std::vec;
+use std::{fmt, slice, vec};
+
+#[cfg(feature = "nightly")]
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 
 use crate::{Idx, IndexSlice};
 
@@ -95,6 +93,8 @@ impl<I: Idx, T> IndexVec<I, T> {
     /// be allocated only once, with a capacity of at least `n`.)
     #[inline]
     pub fn from_fn_n(func: impl FnMut(I) -> T, n: usize) -> Self {
+        // Allow the optimizer to elide the bounds checking when creating each index.
+        let _ = I::new(n);
         IndexVec::from_raw((0..n).map(I::new).map(func).collect())
     }
 
@@ -130,11 +130,13 @@ impl<I: Idx, T> IndexVec<I, T> {
     pub fn into_iter_enumerated(
         self,
     ) -> impl DoubleEndedIterator<Item = (I, T)> + ExactSizeIterator {
+        // Allow the optimizer to elide the bounds checking when creating each index.
+        let _ = I::new(self.len());
         self.raw.into_iter().enumerate().map(|(n, t)| (I::new(n), t))
     }
 
     #[inline]
-    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> impl Iterator<Item = T> + '_ {
+    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> impl Iterator<Item = T> {
         self.raw.drain(range)
     }
 
@@ -142,7 +144,7 @@ impl<I: Idx, T> IndexVec<I, T> {
     pub fn drain_enumerated<R: RangeBounds<usize>>(
         &mut self,
         range: R,
-    ) -> impl Iterator<Item = (I, T)> + '_ {
+    ) -> impl Iterator<Item = (I, T)> {
         let begin = match range.start_bound() {
             std::ops::Bound::Included(i) => *i,
             std::ops::Bound::Excluded(i) => i.checked_add(1).unwrap(),
@@ -189,6 +191,11 @@ impl<I: Idx, T> IndexVec<I, T> {
     pub fn resize_to_elem(&mut self, elem: I, fill_value: impl FnMut() -> T) {
         let min_new_len = elem.index() + 1;
         self.raw.resize_with(min_new_len, fill_value);
+    }
+
+    #[inline]
+    pub fn append(&mut self, other: &mut Self) {
+        self.raw.append(&mut other.raw);
     }
 }
 

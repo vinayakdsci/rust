@@ -1,62 +1,54 @@
-#![feature(is_sorted)]
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
+#![feature(rustc_private)]
 #![warn(rust_2018_idioms, unused_lifetimes)]
 #![allow(unused_extern_crates)]
 
+use askama::Template;
+use askama::filters::Safe;
+use cargo_metadata::Message;
+use cargo_metadata::diagnostic::{Applicability, Diagnostic};
+use clippy_config::ClippyConfiguration;
+use clippy_lints::declared_lints::LINTS;
+use clippy_lints::deprecated_lints::{DEPRECATED, DEPRECATED_VERSION, RENAMED};
+use declare_clippy_lint::LintInfo;
+use pulldown_cmark::{Options, Parser, html};
+use serde::Deserialize;
+use test_utils::IS_RUSTC_TEST_SUITE;
+use ui_test::custom_flags::Flag;
+use ui_test::custom_flags::edition::Edition;
 use ui_test::custom_flags::rustfix::RustfixMode;
+use ui_test::dependencies::DependencyBuilder;
 use ui_test::spanned::Spanned;
-use ui_test::{status_emitter, Args, CommandBuilder, Config, Match, Mode, OutputConflictHandling};
+use ui_test::status_emitter::StatusEmitter;
+use ui_test::{Args, CommandBuilder, Config, Match, error_on_output_conflict};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env::{self, set_var, var_os};
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use test_utils::IS_RUSTC_TEST_SUITE;
-
-// Test dependencies may need an `extern crate` here to ensure that they show up
-// in the depinfo file (otherwise cargo thinks they are unused)
-extern crate clippy_lints;
-extern crate clippy_utils;
-extern crate futures;
-extern crate if_chain;
-extern crate itertools;
-extern crate parking_lot;
-extern crate quote;
-extern crate syn;
-extern crate tokio;
+use std::sync::mpsc::{Sender, channel};
+use std::{fs, iter, thread};
 
 mod test_utils;
 
-/// All crates used in UI tests are listed here
-static TEST_DEPENDENCIES: &[&str] = &[
-    "clippy_config",
-    "clippy_lints",
-    "clippy_utils",
-    "futures",
-    "if_chain",
-    "itertools",
-    "parking_lot",
-    "quote",
-    "regex",
-    "serde_derive",
-    "serde",
-    "syn",
-    "tokio",
-];
+/// All crates used in internal UI tests are listed here.
+/// We directly re-use these crates from their normal clippy builds, so we don't have them
+/// in `clippy_test_devs`. That saves a lot of time but also means they don't work in a stage 1
+/// test in rustc bootstrap.
+static INTERNAL_TEST_DEPENDENCIES: &[&str] = &["clippy_config", "clippy_lints", "clippy_utils"];
 
-/// Produces a string with an `--extern` flag for all UI test crate
-/// dependencies.
+/// Produces a string with an `--extern` flag for all `INTERNAL_TEST_DEPENDENCIES`.
 ///
 /// The dependency files are located by parsing the depinfo file for this test
 /// module. This assumes the `-Z binary-dep-depinfo` flag is enabled. All test
 /// dependencies must be added to Cargo.toml at the project root. Test
 /// dependencies that are not *directly* used by this test module require an
 /// `extern crate` declaration.
-static EXTERN_FLAGS: LazyLock<Vec<String>> = LazyLock::new(|| {
+fn internal_extern_flags() -> Vec<String> {
+    let current_exe_path = env::current_exe().unwrap();
+    let deps_path = current_exe_path.parent().unwrap();
     let current_exe_depinfo = {
-        let mut path = env::current_exe().unwrap();
+        let mut path = current_exe_path.clone();
         path.set_extension("d");
         fs::read_to_string(path).unwrap()
     };
@@ -77,16 +69,15 @@ static EXTERN_FLAGS: LazyLock<Vec<String>> = LazyLock::new(|| {
             let name = name.strip_prefix("lib").unwrap_or(name);
             Some((name, path_str))
         };
-        if let Some((name, path)) = parse_name_path() {
-            if TEST_DEPENDENCIES.contains(&name) {
-                // A dependency may be listed twice if it is available in sysroot,
-                // and the sysroot dependencies are listed first. As of the writing,
-                // this only seems to apply to if_chain.
-                crates.insert(name, path);
-            }
+        if let Some((name, path)) = parse_name_path()
+            && INTERNAL_TEST_DEPENDENCIES.contains(&name)
+        {
+            // A dependency may be listed twice if it is available in sysroot,
+            // and the sysroot dependencies are listed first.
+            crates.insert(name, path);
         }
     }
-    let not_found: Vec<&str> = TEST_DEPENDENCIES
+    let not_found: Vec<&str> = INTERNAL_TEST_DEPENDENCIES
         .iter()
         .copied()
         .filter(|n| !crates.contains_key(n))
@@ -101,70 +92,146 @@ static EXTERN_FLAGS: LazyLock<Vec<String>> = LazyLock::new(|| {
     crates
         .into_iter()
         .map(|(name, path)| format!("--extern={name}={path}"))
+        .chain([format!("-Ldependency={}", deps_path.display())])
         .collect()
-});
+}
 
 // whether to run internal tests or not
 const RUN_INTERNAL_TESTS: bool = cfg!(feature = "internal");
 
-fn base_config(test_dir: &str) -> (Config, Args) {
-    let mut args = Args::test().unwrap();
-    args.bless |= var_os("RUSTC_BLESS").is_some_and(|v| v != "0");
-
-    let target_dir = PathBuf::from(var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()));
-    let mut config = Config {
-        output_conflict_handling: OutputConflictHandling::Error,
-        filter_files: env::var("TESTNAME")
-            .map(|filters| filters.split(',').map(str::to_string).collect())
-            .unwrap_or_default(),
-        target: None,
-        bless_command: Some("cargo uibless".into()),
-        out_dir: target_dir.join("ui_test"),
-        ..Config::rustc(Path::new("tests").join(test_dir))
-    };
-    config.comment_defaults.base().mode = Some(Spanned::dummy(Mode::Yolo)).into();
-    config
-        .comment_defaults
-        .base()
-        .set_custom("rustfix", RustfixMode::Everything);
-    config.comment_defaults.base().diagnostic_code_prefix = Some(Spanned::dummy("clippy::".into())).into();
-    config.with_args(&args);
-    let current_exe_path = env::current_exe().unwrap();
-    let deps_path = current_exe_path.parent().unwrap();
-    let profile_path = deps_path.parent().unwrap();
-
-    config.program.args.extend(
-        [
-            "--emit=metadata",
-            "-Aunused",
-            "-Ainternal_features",
-            "-Zui-testing",
-            "-Zdeduplicate-diagnostics=no",
-            "-Dwarnings",
-            &format!("-Ldependency={}", deps_path.display()),
-        ]
-        .map(OsString::from),
-    );
-
-    config.program.args.extend(EXTERN_FLAGS.iter().map(OsString::from));
-    // Prevent rustc from creating `rustc-ice-*` files the console output is enough.
-    config.program.envs.push(("RUSTC_ICE".into(), Some("0".into())));
-
-    if let Some(host_libs) = option_env!("HOST_LIBS") {
-        let dep = format!("-Ldependency={}", Path::new(host_libs).join("deps").display());
-        config.program.args.push(dep.into());
-    }
-
-    config.program.program = profile_path.join(if cfg!(windows) {
-        "clippy-driver.exe"
-    } else {
-        "clippy-driver"
-    });
-    (config, args)
+struct TestContext {
+    args: Args,
+    diagnostic_collector: Option<DiagnosticCollector>,
+    collector_thread: Option<thread::JoinHandle<()>>,
 }
 
-fn run_ui() {
-    let (mut config, args) = base_config("ui");
+impl TestContext {
+    fn new() -> Self {
+        let mut args = Args::test().unwrap();
+        args.bless |= var_os("RUSTC_BLESS").is_some_and(|v| v != "0");
+        let (diagnostic_collector, collector_thread) = var_os("COLLECT_METADATA")
+            .is_some()
+            .then(DiagnosticCollector::spawn)
+            .unzip();
+        Self {
+            args,
+            diagnostic_collector,
+            collector_thread,
+        }
+    }
+
+    fn base_config(&self, test_dir: &str, mandatory_annotations: bool) -> Config {
+        let target_dir = PathBuf::from(var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()));
+        let mut config = Config {
+            output_conflict_handling: error_on_output_conflict,
+            // Pre-fill filters with TESTNAME; will be later extended with `self.args`.
+            filter_files: env::var("TESTNAME")
+                .map(|filters| {
+                    filters
+                        .split(',')
+                        // Make sure that if TESTNAME is empty we produce the empty list here,
+                        // not a list containing an empty string.
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            target: None,
+            bless_command: Some(if IS_RUSTC_TEST_SUITE {
+                "./x test src/tools/clippy --bless".into()
+            } else {
+                "cargo uibless".into()
+            }),
+            out_dir: target_dir.join("ui_test"),
+            ..Config::rustc(Path::new("tests").join(test_dir))
+        };
+        let defaults = config.comment_defaults.base();
+        defaults.set_custom("edition", Edition("2024".into()));
+        defaults.set_custom(
+            "dependencies",
+            DependencyBuilder {
+                program: {
+                    let mut p = CommandBuilder::cargo();
+                    // If we run in bootstrap, we need to use the right compiler for building the
+                    // tests -- not the compiler that built clippy, but the compiler that got linked
+                    // into clippy. Just invoking TEST_RUSTC does not work because LD_LIBRARY_PATH
+                    // is set in a way that makes it pick the wrong sysroot. Sadly due to
+                    // <https://github.com/rust-lang/cargo/issues/4423> we cannot use RUSTFLAGS to
+                    // set `--sysroot`, so we need to use bootstrap's rustc wrapper. That wrapper
+                    // however has some staging logic that is hurting us here, so to work around
+                    // that we set both the "real" and "staging" rustc to TEST_RUSTC, including the
+                    // associated library paths.
+                    #[expect(
+                        clippy::option_env_unwrap,
+                        reason = "TEST_RUSTC will ensure that the requested env vars are set during compile time"
+                    )]
+                    if let Some(rustc) = option_env!("TEST_RUSTC") {
+                        let libdir = option_env!("TEST_RUSTC_LIB").unwrap();
+                        let sysroot = option_env!("TEST_SYSROOT").unwrap();
+                        p.envs.push(("RUSTC_REAL".into(), Some(rustc.into())));
+                        p.envs.push(("RUSTC_REAL_LIBDIR".into(), Some(libdir.into())));
+                        p.envs.push(("RUSTC_SNAPSHOT".into(), Some(rustc.into())));
+                        p.envs.push(("RUSTC_SNAPSHOT_LIBDIR".into(), Some(libdir.into())));
+                        p.envs.push(("RUSTC_SYSROOT".into(), Some(sysroot.into())));
+                    }
+                    p
+                },
+                crate_manifest_path: Path::new("clippy_test_deps").join("Cargo.toml"),
+                build_std: None,
+                bless_lockfile: self.args.bless,
+            },
+        );
+        defaults.exit_status = None.into();
+        if mandatory_annotations {
+            defaults.require_annotations = Some(Spanned::dummy(true)).into();
+        } else {
+            defaults.require_annotations = None.into();
+        }
+        defaults.diagnostic_code_prefix = Some(Spanned::dummy("clippy::".into())).into();
+        defaults.set_custom("rustfix", RustfixMode::Everything);
+        if let Some(collector) = self.diagnostic_collector.clone() {
+            defaults.set_custom("diagnostic-collector", collector);
+        }
+        config.with_args(&self.args);
+        let current_exe_path = env::current_exe().unwrap();
+        let deps_path = current_exe_path.parent().unwrap();
+        let profile_path = deps_path.parent().unwrap();
+
+        config.program.args.extend(
+            [
+                "--emit=metadata",
+                "-Aunused",
+                "-Ainternal_features",
+                "-Zui-testing",
+                "-Zdeduplicate-diagnostics=no",
+                "-Dwarnings",
+            ]
+            .map(OsString::from),
+        );
+
+        // Prevent rustc from creating `rustc-ice-*` files the console output is enough.
+        config.program.envs.push(("RUSTC_ICE".into(), Some("0".into())));
+
+        if let Some(host_libs) = option_env!("HOST_LIBS") {
+            let dep = format!("-Ldependency={}", Path::new(host_libs).join("deps").display());
+            config.program.args.push(dep.into());
+        }
+        if let Some(sysroot) = option_env!("TEST_SYSROOT") {
+            config.program.args.push(format!("--sysroot={sysroot}").into());
+        }
+
+        config.program.program = profile_path.join(if cfg!(windows) {
+            "clippy-driver.exe"
+        } else {
+            "clippy-driver"
+        });
+
+        config
+    }
+}
+
+fn run_ui(cx: &TestContext) {
+    let mut config = cx.base_config("ui", true);
     config
         .program
         .envs
@@ -174,30 +241,33 @@ fn run_ui() {
         vec![config],
         ui_test::default_file_filter,
         ui_test::default_per_file_config,
-        status_emitter::Text::from(args.format),
+        Box::<dyn StatusEmitter>::from(cx.args.format),
     )
     .unwrap();
 }
 
-fn run_internal_tests() {
-    // only run internal tests with the internal-tests feature
+fn run_internal_tests(cx: &TestContext) {
     if !RUN_INTERNAL_TESTS {
         return;
     }
-    let (mut config, args) = base_config("ui-internal");
+    let mut config = cx.base_config("ui-internal", true);
+    config
+        .program
+        .args
+        .extend(internal_extern_flags().iter().map(OsString::from));
     config.bless_command = Some("cargo uitest --features internal -- -- --bless".into());
 
     ui_test::run_tests_generic(
         vec![config],
         ui_test::default_file_filter,
         ui_test::default_per_file_config,
-        status_emitter::Text::from(args.format),
+        Box::<dyn StatusEmitter>::from(cx.args.format),
     )
     .unwrap();
 }
 
-fn run_ui_toml() {
-    let (mut config, args) = base_config("ui-toml");
+fn run_ui_toml(cx: &TestContext) {
+    let mut config = cx.base_config("ui-toml", true);
 
     config
         .comment_defaults
@@ -208,32 +278,33 @@ fn run_ui_toml() {
     ui_test::run_tests_generic(
         vec![config],
         ui_test::default_file_filter,
-        |config, path, _file_contents| {
+        |config, file_contents| {
+            let path = file_contents.span().file;
             config
                 .program
                 .envs
                 .push(("CLIPPY_CONF_DIR".into(), Some(path.parent().unwrap().into())));
         },
-        status_emitter::Text::from(args.format),
+        Box::<dyn StatusEmitter>::from(cx.args.format),
     )
     .unwrap();
 }
 
 // Allow `Default::default` as `OptWithSpan` is not nameable
 #[allow(clippy::default_trait_access)]
-fn run_ui_cargo() {
+fn run_ui_cargo(cx: &TestContext) {
     if IS_RUSTC_TEST_SUITE {
         return;
     }
 
-    let (mut config, args) = base_config("ui-cargo");
+    let mut config = cx.base_config("ui-cargo", false);
     config.program.input_file_flag = CommandBuilder::cargo().input_file_flag;
     config.program.out_dir_flag = CommandBuilder::cargo().out_dir_flag;
     config.program.args = vec!["clippy".into(), "--color".into(), "never".into(), "--quiet".into()];
-    config
-        .program
-        .envs
-        .push(("RUSTFLAGS".into(), Some("-Dwarnings".into())));
+    config.program.envs.extend([
+        ("RUSTFLAGS".into(), Some("-Dwarnings".into())),
+        ("CARGO_INCREMENTAL".into(), Some("0".into())),
+    ]);
     // We need to do this while we still have a rustc in the `program` field.
     config.fill_host_and_target().unwrap();
     config.program.program.set_file_name(if cfg!(windows) {
@@ -260,33 +331,28 @@ fn run_ui_cargo() {
             path.ends_with("Cargo.toml")
                 .then(|| ui_test::default_any_file_filter(path, config) && !ignored_32bit(path))
         },
-        |_config, _path, _file_contents| {},
-        status_emitter::Text::from(args.format),
+        |_config, _file_contents| {},
+        Box::<dyn StatusEmitter>::from(cx.args.format),
     )
     .unwrap();
 }
 
 fn main() {
-    // Support being run by cargo nextest - https://nexte.st/book/custom-test-harnesses.html
-    if env::args().any(|arg| arg == "--list") {
-        if !env::args().any(|arg| arg == "--ignored") {
-            println!("compile_test: test");
-        }
-
-        return;
+    unsafe {
+        set_var("CLIPPY_DISABLE_DOCS_LINKS", "true");
     }
 
-    set_var("CLIPPY_DISABLE_DOCS_LINKS", "true");
+    let cx = TestContext::new();
+
     // The SPEEDTEST_* env variables can be used to check Clippy's performance on your PR. It runs the
     // affected test 1000 times and gets the average.
     if let Ok(speedtest) = std::env::var("SPEEDTEST") {
         println!("----------- STARTING SPEEDTEST -----------");
         let f = match speedtest.as_str() {
-            "ui" => run_ui as fn(),
-            "cargo" => run_ui_cargo as fn(),
-            "toml" => run_ui_toml as fn(),
-            "internal" => run_internal_tests as fn(),
-            "ui-cargo-toml-metadata" => ui_cargo_toml_metadata as fn(),
+            "ui" => run_ui,
+            "cargo" => run_ui_cargo,
+            "toml" => run_ui_toml,
+            "internal" => run_internal_tests,
 
             _ => panic!("unknown speedtest: {speedtest} || accepted speedtests are: [ui, cargo, toml, internal]"),
         };
@@ -303,7 +369,7 @@ fn main() {
         let mut sum = 0;
         for _ in 0..iterations {
             let start = std::time::Instant::now();
-            f();
+            f(&cx);
             sum += start.elapsed().as_millis();
         }
         println!(
@@ -312,11 +378,17 @@ fn main() {
             sum / u128::from(iterations)
         );
     } else {
-        run_ui();
-        run_ui_toml();
-        run_ui_cargo();
-        run_internal_tests();
+        run_ui(&cx);
+        run_ui_toml(&cx);
+        run_ui_cargo(&cx);
+        run_internal_tests(&cx);
+        drop(cx.diagnostic_collector);
+
         ui_cargo_toml_metadata();
+
+        if let Some(thread) = cx.collector_thread {
+            thread.join().unwrap();
+        }
     }
 }
 
@@ -345,13 +417,228 @@ fn ui_cargo_toml_metadata() {
                 .map(|component| component.as_os_str().to_string_lossy().replace('-', "_"))
                 .any(|s| *s == name)
                 || path.starts_with(&cargo_common_metadata_path),
-            "{path:?} has incorrect package name"
+            "`{}` has incorrect package name",
+            path.display(),
         );
 
         let publish = package.get("publish").and_then(toml::Value::as_bool).unwrap_or(true);
         assert!(
             !publish || publish_exceptions.contains(&path.parent().unwrap().to_path_buf()),
-            "{path:?} lacks `publish = false`"
+            "`{}` lacks `publish = false`",
+            path.display(),
         );
+    }
+}
+
+#[derive(Template)]
+#[template(path = "index_template.html")]
+struct Renderer<'a> {
+    count: usize,
+    lints: &'a Vec<LintMetadata>,
+}
+
+impl Renderer<'_> {
+    fn markdown(input: &str) -> Safe<String> {
+        let input = clippy_config::sanitize_explanation(input);
+        let parser = Parser::new_ext(&input, Options::all());
+        let mut html_output = String::new();
+        html::push_html(&mut html_output, parser);
+        // Oh deer, what a hack :O
+        Safe(html_output.replace("<table", "<table class=\"table\""))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DiagnosticOrMessage {
+    Diagnostic(Diagnostic),
+    Message(Message),
+}
+
+/// Collects applicabilities from the diagnostics produced for each UI test, producing the
+/// `util/gh-pages/lints.json` file used by <https://rust-lang.github.io/rust-clippy/>
+#[derive(Debug, Clone)]
+struct DiagnosticCollector {
+    sender: Sender<Vec<u8>>,
+}
+
+impl DiagnosticCollector {
+    #[allow(clippy::assertions_on_constants)]
+    fn spawn() -> (Self, thread::JoinHandle<()>) {
+        assert!(!IS_RUSTC_TEST_SUITE && !RUN_INTERNAL_TESTS);
+
+        let (sender, receiver) = channel::<Vec<u8>>();
+
+        let handle = thread::spawn(|| {
+            let mut applicabilities = HashMap::new();
+
+            for stderr in receiver {
+                for line in stderr.split(|&byte| byte == b'\n') {
+                    let diag = match serde_json::from_slice(line) {
+                        Ok(DiagnosticOrMessage::Diagnostic(diag)) => diag,
+                        Ok(DiagnosticOrMessage::Message(Message::CompilerMessage(message))) => message.message,
+                        _ => continue,
+                    };
+
+                    if let Some(lint) = diag.code.as_ref().and_then(|code| code.code.strip_prefix("clippy::")) {
+                        let applicability = applicabilities
+                            .entry(lint.to_string())
+                            .or_insert(Applicability::Unspecified);
+                        let diag_applicability = diag
+                            .children
+                            .iter()
+                            .flat_map(|child| &child.spans)
+                            .filter_map(|span| span.suggestion_applicability.clone())
+                            .max_by_key(applicability_ord);
+                        if let Some(diag_applicability) = diag_applicability
+                            && applicability_ord(&diag_applicability) > applicability_ord(applicability)
+                        {
+                            *applicability = diag_applicability;
+                        }
+                    }
+                }
+            }
+
+            let configs = clippy_config::get_configuration_metadata();
+            let mut metadata: Vec<LintMetadata> = LINTS
+                .iter()
+                .map(|lint| LintMetadata::new(lint, &applicabilities, &configs))
+                .chain(
+                    iter::zip(DEPRECATED, DEPRECATED_VERSION)
+                        .map(|((lint, reason), version)| LintMetadata::new_deprecated(lint, reason, version)),
+                )
+                .collect();
+
+            metadata.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+
+            fs::write(
+                "util/gh-pages/index.html",
+                Renderer {
+                    count: LINTS.len(),
+                    lints: &metadata,
+                }
+                .render()
+                .unwrap(),
+            )
+            .unwrap();
+        });
+
+        (Self { sender }, handle)
+    }
+}
+
+fn applicability_ord(applicability: &Applicability) -> u8 {
+    match applicability {
+        Applicability::MachineApplicable => 4,
+        Applicability::HasPlaceholders => 3,
+        Applicability::MaybeIncorrect => 2,
+        Applicability::Unspecified => 1,
+        _ => unimplemented!(),
+    }
+}
+
+impl Flag for DiagnosticCollector {
+    fn post_test_action(
+        &self,
+        _config: &ui_test::per_test_config::TestConfig,
+        output: &std::process::Output,
+        _build_manager: &ui_test::build_manager::BuildManager,
+    ) -> Result<(), ui_test::Errored> {
+        if !output.stderr.is_empty() {
+            self.sender.send(output.stderr.clone()).unwrap();
+        }
+        Ok(())
+    }
+
+    fn clone_inner(&self) -> Box<dyn Flag> {
+        Box::new(self.clone())
+    }
+
+    fn must_be_unique(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct LintMetadata {
+    id: String,
+    id_location: Option<&'static str>,
+    group: &'static str,
+    level: &'static str,
+    docs: String,
+    version: &'static str,
+    applicability: Applicability,
+}
+
+impl LintMetadata {
+    fn new(lint: &LintInfo, applicabilities: &HashMap<String, Applicability>, configs: &[ClippyConfiguration]) -> Self {
+        let name = lint.name_lower();
+        let applicability = applicabilities
+            .get(&name)
+            .cloned()
+            .unwrap_or(Applicability::Unspecified);
+        let past_names = RENAMED
+            .iter()
+            .filter(|(_, new_name)| new_name.strip_prefix("clippy::") == Some(&name))
+            .map(|(old_name, _)| old_name.strip_prefix("clippy::").unwrap())
+            .collect::<Vec<_>>();
+        let mut docs = lint.explanation.to_string();
+        if !past_names.is_empty() {
+            docs.push_str("\n### Past names\n\n");
+            for past_name in past_names {
+                writeln!(&mut docs, " * {past_name}").unwrap();
+            }
+        }
+        let configs: Vec<_> = configs
+            .iter()
+            .filter(|conf| conf.lints.contains(&name.as_str()))
+            .collect();
+        if !configs.is_empty() {
+            docs.push_str("\n### Configuration\n\n");
+            for config in configs {
+                writeln!(&mut docs, "{config}").unwrap();
+            }
+        }
+        Self {
+            id: name,
+            id_location: Some(lint.location),
+            group: lint.category.name(),
+            level: lint.lint.default_level.as_str(),
+            docs,
+            version: lint.version,
+            applicability,
+        }
+    }
+
+    fn new_deprecated(name: &str, reason: &str, version: &'static str) -> Self {
+        // The reason starts with a lowercase letter and ends without a period.
+        // This needs to be fixed for the website.
+        let mut reason = reason.to_owned();
+        if let Some(reason) = reason.get_mut(0..1) {
+            reason.make_ascii_uppercase();
+        }
+        Self {
+            id: name.strip_prefix("clippy::").unwrap().into(),
+            id_location: None,
+            group: "deprecated",
+            level: "none",
+            docs: format!(
+                "### What it does\n\n\
+                Nothing. This lint has been deprecated\n\n\
+                ### Deprecation reason\n\n{reason}.\n",
+            ),
+            version,
+            applicability: Applicability::Unspecified,
+        }
+    }
+
+    fn applicability_str(&self) -> &str {
+        match self.applicability {
+            Applicability::MachineApplicable => "MachineApplicable",
+            Applicability::HasPlaceholders => "HasPlaceholders",
+            Applicability::MaybeIncorrect => "MaybeIncorrect",
+            Applicability::Unspecified => "Unspecified",
+            _ => panic!("needs to update this code"),
+        }
     }
 }

@@ -1,19 +1,18 @@
 mod context;
 
-use crate::edition_panic::use_panic_2021;
-use crate::errors;
-use rustc_ast::ptr::P;
-use rustc_ast::token;
 use rustc_ast::token::Delimiter;
 use rustc_ast::tokenstream::{DelimSpan, TokenStream};
-use rustc_ast::{DelimArgs, Expr, ExprKind, MacCall, Path, PathSegment, UnOp};
+use rustc_ast::{DelimArgs, Expr, ExprKind, MacCall, Path, PathSegment, UnOp, token};
 use rustc_ast_pretty::pprust;
 use rustc_errors::PResult;
 use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
+use rustc_parse::exp;
 use rustc_parse::parser::Parser;
-use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
 use thin_vec::thin_vec;
+
+use crate::edition_panic::use_panic_2021;
+use crate::errors;
 
 pub(crate) fn expand_assert<'cx>(
     cx: &'cx mut ExtCtxt<'_>,
@@ -55,9 +54,9 @@ pub(crate) fn expand_assert<'cx>(
     let expr = if let Some(tokens) = custom_message {
         let then = cx.expr(
             call_site_span,
-            ExprKind::MacCall(P(MacCall {
+            ExprKind::MacCall(Box::new(MacCall {
                 path: panic_path(),
-                args: P(DelimArgs {
+                args: Box::new(DelimArgs {
                     dspan: DelimSpan::from_single(call_site_span),
                     delim: Delimiter::Parenthesis,
                     tokens,
@@ -69,7 +68,7 @@ pub(crate) fn expand_assert<'cx>(
     // If `generic_assert` is enabled, generates rich captured outputs
     //
     // FIXME(c410-f3r) See https://github.com/rust-lang/rust/issues/96949
-    else if cx.ecfg.features.generic_assert {
+    else if cx.ecfg.features.generic_assert() {
         context::Context::new(cx, call_site_span).build(cond_expr, panic_path())
     }
     // If `generic_assert` is not enabled, only outputs a literal "assertion failed: ..."
@@ -96,7 +95,7 @@ pub(crate) fn expand_assert<'cx>(
 }
 
 struct Assert {
-    cond_expr: P<Expr>,
+    cond_expr: Box<Expr>,
     custom_message: Option<TokenStream>,
 }
 
@@ -104,10 +103,10 @@ struct Assert {
 fn expr_if_not(
     cx: &ExtCtxt<'_>,
     span: Span,
-    cond: P<Expr>,
-    then: P<Expr>,
-    els: Option<P<Expr>>,
-) -> P<Expr> {
+    cond: Box<Expr>,
+    then: Box<Expr>,
+    els: Option<Box<Expr>>,
+) -> Box<Expr> {
     cx.expr_if(span, cx.expr(span, ExprKind::Unary(UnOp::Not, cond)), then, els)
 }
 
@@ -144,7 +143,7 @@ fn parse_assert<'a>(cx: &ExtCtxt<'a>, sp: Span, stream: TokenStream) -> PResult<
             cx.dcx().emit_err(errors::AssertMissingComma { span: parser.token.span, comma });
 
             parse_custom_message(&mut parser)
-        } else if parser.eat(&token::Comma) {
+        } else if parser.eat(exp!(Comma)) {
             parse_custom_message(&mut parser)
         } else {
             None

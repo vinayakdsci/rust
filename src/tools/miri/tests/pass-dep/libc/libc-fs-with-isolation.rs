@@ -1,8 +1,7 @@
-//@ignore-target-windows: File handling is not implemented yet
+//@ignore-target: windows # File handling is not implemented yet
 //@compile-flags: -Zmiri-isolation-error=warn-nobacktrace
 //@normalize-stderr-test: "(stat(x)?)" -> "$$STAT"
 
-use std::ffi::CString;
 use std::fs;
 use std::io::{Error, ErrorKind};
 
@@ -12,11 +11,14 @@ fn main() {
         assert!(libc::fcntl(1, libc::F_DUPFD, 0) >= 0);
     }
 
+    // Although `readlink` and `stat` require disable-isolation mode
+    // to properly run, they are tested with isolation mode on to check the error emitted
+    // with `-Zmiri-isolation-error=warn-nobacktrace`.
+
     // test `readlink`
-    let symlink_c_str = CString::new("foo.txt").unwrap();
     let mut buf = vec![0; "foo_link.txt".len() + 1];
     unsafe {
-        assert_eq!(libc::readlink(symlink_c_str.as_ptr(), buf.as_mut_ptr(), buf.len()), -1);
+        assert_eq!(libc::readlink(c"foo.txt".as_ptr(), buf.as_mut_ptr(), buf.len()), -1);
         assert_eq!(Error::last_os_error().raw_os_error(), Some(libc::EACCES));
     }
 

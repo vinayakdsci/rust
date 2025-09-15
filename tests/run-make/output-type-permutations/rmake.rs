@@ -4,11 +4,15 @@
 // files are exactly what is expected, no more, no less.
 // See https://github.com/rust-lang/rust/pull/12020
 
+//@ ignore-cross-compile
+// Reason: some cross-compiled targets don't support various crate types and fail to link.
+
+use std::path::PathBuf;
+
 use run_make_support::{
     bin_name, dynamic_lib_name, filename_not_in_denylist, rfs, rust_lib_name, rustc,
     shallow_find_files, static_lib_name,
 };
-use std::path::PathBuf;
 
 // Each test takes 4 arguments:
 // `must_exist`: output files which must be found - if any are absent, the test fails
@@ -16,6 +20,7 @@ use std::path::PathBuf;
 // `dir`: the name of the directory where the test happens
 // `rustc_invocation`: the rustc command being tested
 // Any unexpected output files not listed in `must_exist` or `can_exist` will cause a failure.
+#[track_caller]
 fn assert_expected_output_files(expectations: Expectations, rustc_invocation: impl Fn()) {
     let Expectations { expected_files: must_exist, allowed_files: can_exist, test_dir: dir } =
         expectations;
@@ -112,7 +117,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "asm-emit".to_string(),
         },
         || {
@@ -122,7 +127,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "asm-emit2".to_string(),
         },
         || {
@@ -132,7 +137,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "asm-emit3".to_string(),
         },
         || {
@@ -143,7 +148,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "llvm-ir-emit".to_string(),
         },
         || {
@@ -153,7 +158,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "llvm-ir-emit2".to_string(),
         },
         || {
@@ -163,7 +168,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "llvm-ir-emit3".to_string(),
         },
         || {
@@ -174,7 +179,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "llvm-bc-emit".to_string(),
         },
         || {
@@ -184,7 +189,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "llvm-bc-emit2".to_string(),
         },
         || {
@@ -194,7 +199,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "llvm-bc-emit3".to_string(),
         },
         || {
@@ -205,7 +210,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "obj-emit".to_string(),
         },
         || {
@@ -215,7 +220,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "obj-emit2".to_string(),
         },
         || {
@@ -225,7 +230,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "obj-emit3".to_string(),
         },
         || {
@@ -267,7 +272,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "rlib".to_string(),
         },
         || {
@@ -277,7 +282,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "rlib2".to_string(),
         },
         || {
@@ -287,7 +292,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "rlib3".to_string(),
         },
         || {
@@ -374,7 +379,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "staticlib".to_string(),
         },
         || {
@@ -384,7 +389,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "staticlib2".to_string(),
         },
         || {
@@ -394,7 +399,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["foo"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "staticlib3".to_string(),
         },
         || {
@@ -448,7 +453,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["ir", rust_lib_name("bar")],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "rlib-ir".to_string(),
         },
         || {
@@ -465,7 +470,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["ir", "asm", "bc", "obj", "link"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "staticlib-all".to_string(),
         },
         || {
@@ -483,7 +488,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["ir", "asm", "bc", "obj", "link"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "staticlib-all2".to_string(),
         },
         || {
@@ -522,7 +527,7 @@ fn main() {
     assert_expected_output_files(
         Expectations {
             expected_files: s!["bar.bc", rust_lib_name("bar"), "foo.bc"],
-            allowed_files: s![],
+            allowed_files: vec![],
             test_dir: "rlib-emits".to_string(),
         },
         || {

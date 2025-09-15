@@ -10,19 +10,15 @@
 use std::marker::PhantomData;
 use std::ops::Range;
 
-use rustc_middle::mir;
-use rustc_middle::ty;
-use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
+use rustc_abi::{self as abi, FieldIdx, Size, VariantIdx};
 use rustc_middle::ty::Ty;
-use rustc_middle::{bug, span_bug};
-use rustc_target::abi::Size;
-use rustc_target::abi::{self, VariantIdx};
-
+use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::{bug, mir, span_bug, ty};
 use tracing::{debug, instrument};
 
 use super::{
-    throw_ub, throw_unsup, InterpCx, InterpResult, MPlaceTy, Machine, MemPlaceMeta, OpTy,
-    Provenance, Scalar,
+    InterpCx, InterpResult, MPlaceTy, Machine, MemPlaceMeta, OpTy, Provenance, Scalar, err_ub,
+    interp_ok, throw_ub, throw_unsup,
 };
 
 /// Describes the constraints placed on offset-projections.
@@ -58,7 +54,7 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
             // Go through the layout. There are lots of types that support a length,
             // e.g., SIMD types. (But not all repr(simd) types even have FieldsShape::Array!)
             match layout.fields {
-                abi::FieldsShape::Array { count, .. } => Ok(count),
+                abi::FieldsShape::Array { count, .. } => interp_ok(count),
                 _ => bug!("len not supported on sized type {:?}", layout.ty),
             }
         }
@@ -86,6 +82,10 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
         self.offset_with_meta(offset, OffsetMode::Inbounds, MemPlaceMeta::None, layout, ecx)
     }
 
+    /// This does an offset-by-zero, which is effectively a transmute. Note however that
+    /// not all transmutes are supported by all projectables -- specifically, if this is an
+    /// `OpTy` or `ImmTy`, the new layout must have almost the same ABI as the old one
+    /// (only changing the `valid_range` is allowed and turning integers into pointers).
     fn transmute<M: Machine<'tcx, Provenance = Prov>>(
         &self,
         layout: TyAndLayout<'tcx>,
@@ -105,7 +105,7 @@ pub trait Projectable<'tcx, Prov: Provenance>: Sized + std::fmt::Debug {
 }
 
 /// A type representing iteration over the elements of an array.
-pub struct ArrayIterator<'tcx, 'a, Prov: Provenance, P: Projectable<'tcx, Prov>> {
+pub struct ArrayIterator<'a, 'tcx, Prov: Provenance, P: Projectable<'tcx, Prov>> {
     base: &'a P,
     range: Range<u64>,
     stride: Size,
@@ -113,15 +113,15 @@ pub struct ArrayIterator<'tcx, 'a, Prov: Provenance, P: Projectable<'tcx, Prov>>
     _phantom: PhantomData<Prov>, // otherwise it says `Prov` is never used...
 }
 
-impl<'tcx, 'a, Prov: Provenance, P: Projectable<'tcx, Prov>> ArrayIterator<'tcx, 'a, Prov, P> {
+impl<'a, 'tcx, Prov: Provenance, P: Projectable<'tcx, Prov>> ArrayIterator<'a, 'tcx, Prov, P> {
     /// Should be the same `ecx` on each call, and match the one used to create the iterator.
     pub fn next<M: Machine<'tcx, Provenance = Prov>>(
         &mut self,
         ecx: &InterpCx<'tcx, M>,
     ) -> InterpResult<'tcx, Option<(u64, P)>> {
-        let Some(idx) = self.range.next() else { return Ok(None) };
+        let Some(idx) = self.range.next() else { return interp_ok(None) };
         // We use `Wrapping` here since the offset has already been checked when the iterator was created.
-        Ok(Some((
+        interp_ok(Some((
             idx,
             self.base.offset_with_meta(
                 self.stride * idx,
@@ -144,22 +144,22 @@ where
     /// always possible without allocating, so it can take `&self`. Also return the field's layout.
     /// This supports both struct and array fields, but not slices!
     ///
-    /// This also works for arrays, but then the `usize` index type is restricting.
-    /// For indexing into arrays, use `mplace_index`.
+    /// This also works for arrays, but then the `FieldIdx` index type is restricting.
+    /// For indexing into arrays, use [`Self::project_index`].
     pub fn project_field<P: Projectable<'tcx, M::Provenance>>(
         &self,
         base: &P,
-        field: usize,
+        field: FieldIdx,
     ) -> InterpResult<'tcx, P> {
         // Slices nominally have length 0, so they will panic somewhere in `fields.offset`.
         debug_assert!(
             !matches!(base.layout().ty.kind(), ty::Slice(..)),
             "`field` projection called on a slice -- call `index` projection instead"
         );
-        let offset = base.layout().fields.offset(field);
+        let offset = base.layout().fields.offset(field.as_usize());
         // Computing the layout does normalization, so we get a normalized type out of this
         // even if the field type is non-normalized (possible e.g. via associated types).
-        let field_layout = base.layout().field(self, field);
+        let field_layout = base.layout().field(self, field.as_usize());
 
         // Offset may need adjustment for unsized fields.
         let (meta, offset) = if field_layout.is_unsized() {
@@ -168,7 +168,7 @@ where
             // Re-use parent metadata to determine dynamic field layout.
             // With custom DSTS, this *will* execute user-defined code, but the same
             // happens at run-time so that's okay.
-            match self.size_and_align_of(&base_meta, &field_layout)? {
+            match self.size_and_align_from_meta(&base_meta, &field_layout)? {
                 Some((_, align)) => {
                     // For packed types, we need to cap alignment.
                     let align = if let ty::Adt(def, _) = base.layout().ty.kind()
@@ -197,6 +197,15 @@ where
         };
 
         base.offset_with_meta(offset, OffsetMode::Inbounds, meta, field_layout, self)
+    }
+
+    /// Projects multiple fields at once. See [`Self::project_field`] for details.
+    pub fn project_fields<P: Projectable<'tcx, M::Provenance>, const N: usize>(
+        &self,
+        base: &P,
+        fields: [FieldIdx; N],
+    ) -> InterpResult<'tcx, [P; N]> {
+        fields.try_map(|field| self.project_field(base, field))
     }
 
     /// Downcasting to an enum variant.
@@ -233,19 +242,36 @@ where
                     // This can only be reached in ConstProp and non-rustc-MIR.
                     throw_ub!(BoundsCheckFailed { len, index });
                 }
-                let offset = stride * index; // `Size` multiplication
+                // With raw slices, `len` can be so big that this *can* overflow.
+                let offset = self
+                    .compute_size_in_bytes(stride, index)
+                    .ok_or_else(|| err_ub!(PointerArithOverflow))?;
+
                 // All fields have the same layout.
                 let field_layout = base.layout().field(self, 0);
                 (offset, field_layout)
             }
             _ => span_bug!(
                 self.cur_span(),
-                "`mplace_index` called on non-array type {:?}",
+                "`project_index` called on non-array type {:?}",
                 base.layout().ty
             ),
         };
 
         base.offset(offset, field_layout, self)
+    }
+
+    /// Converts a repr(simd) value into an array of the right size, such that `project_index`
+    /// accesses the SIMD elements. Also returns the number of elements.
+    pub fn project_to_simd<P: Projectable<'tcx, M::Provenance>>(
+        &self,
+        base: &P,
+    ) -> InterpResult<'tcx, (P, u64)> {
+        assert!(base.layout().ty.ty_adt_def().unwrap().repr().simd());
+        // SIMD types must be newtypes around arrays, so all we have to do is project to their only field.
+        let array = self.project_field(base, FieldIdx::ZERO)?;
+        let len = array.len(self)?;
+        interp_ok((array, len))
     }
 
     fn project_constant_index<P: Projectable<'tcx, M::Provenance>>(
@@ -277,9 +303,13 @@ where
     pub fn project_array_fields<'a, P: Projectable<'tcx, M::Provenance>>(
         &self,
         base: &'a P,
-    ) -> InterpResult<'tcx, ArrayIterator<'tcx, 'a, M::Provenance, P>> {
+    ) -> InterpResult<'tcx, ArrayIterator<'a, 'tcx, M::Provenance, P>> {
         let abi::FieldsShape::Array { stride, .. } = base.layout().fields else {
-            span_bug!(self.cur_span(), "project_array_fields: expected an array layout");
+            span_bug!(
+                self.cur_span(),
+                "project_array_fields: expected an array layout, got {:#?}",
+                base.layout()
+            );
         };
         let len = base.len(self)?;
         let field_layout = base.layout().field(self, 0);
@@ -287,7 +317,13 @@ where
         debug!("project_array_fields: {base:?} {len}");
         base.offset(len * stride, self.layout_of(self.tcx.types.unit).unwrap(), self)?;
         // Create the iterator.
-        Ok(ArrayIterator { base, range: 0..len, stride, field_layout, _phantom: PhantomData })
+        interp_ok(ArrayIterator {
+            base,
+            range: 0..len,
+            stride,
+            field_layout,
+            _phantom: PhantomData,
+        })
     }
 
     /// Subslicing
@@ -302,7 +338,7 @@ where
         let actual_to = if from_end {
             if from.checked_add(to).is_none_or(|to| to > len) {
                 // This can only be reached in ConstProp and non-rustc-MIR.
-                throw_ub!(BoundsCheckFailed { len: len, index: from.saturating_add(to) });
+                throw_ub!(BoundsCheckFailed { len, index: from.saturating_add(to) });
             }
             len.checked_sub(to).unwrap()
         } else {
@@ -354,13 +390,14 @@ where
         P: Projectable<'tcx, M::Provenance> + From<MPlaceTy<'tcx, M::Provenance>> + std::fmt::Debug,
     {
         use rustc_middle::mir::ProjectionElem::*;
-        Ok(match proj_elem {
+        interp_ok(match proj_elem {
             OpaqueCast(ty) => {
                 span_bug!(self.cur_span(), "OpaqueCast({ty}) encountered after borrowck")
             }
+            UnwrapUnsafeBinder(target) => base.transmute(self.layout_of(target)?, self)?,
             // We don't want anything happening here, this is here as a dummy.
             Subtype(_) => base.transmute(base.layout(), self)?,
-            Field(field, _) => self.project_field(base, field.index())?,
+            Field(field, _) => self.project_field(base, field)?,
             Downcast(_, variant) => self.project_downcast(base, variant)?,
             Deref => self.deref_pointer(&base.to_op(self)?)?.into(),
             Index(local) => {

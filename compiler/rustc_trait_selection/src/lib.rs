@@ -19,23 +19,22 @@
 #![feature(assert_matches)]
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
-#![feature(control_flow_enum)]
-#![feature(extract_if)]
+#![feature(default_field_values)]
 #![feature(if_let_guard)]
-#![feature(let_chains)]
+#![feature(iter_intersperse)]
+#![feature(iterator_try_reduce)]
 #![feature(never_type)]
 #![feature(rustdoc_internals)]
-#![feature(type_alias_impl_trait)]
+#![feature(try_blocks)]
 #![feature(unwrap_infallible)]
+#![feature(yeet_expr)]
 #![recursion_limit = "512"] // For rustdoc
 // tidy-alphabetical-end
-
-#[macro_use]
-extern crate tracing;
 
 pub mod error_reporting;
 pub mod errors;
 pub mod infer;
+pub mod opaque_types;
 pub mod regions;
 pub mod solve;
 pub mod traits;

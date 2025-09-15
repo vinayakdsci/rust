@@ -10,9 +10,7 @@
 // which causes less readable LLVM errors and in the worst cases causes ICEs
 // or segfaults based on system dependent behavior and codegen flags.
 
-#![feature(naked_functions, asm_const)]
-
-use std::arch::{asm, global_asm};
+use std::arch::{asm, global_asm, naked_asm};
 
 #[no_mangle]
 pub static FOO: usize = 42;
@@ -128,6 +126,7 @@ fn main() {
 
         // Tests usage of colons in non-label positions
         asm!(":lo12:FOO"); // this is apparently valid aarch64
+
         // is there an example that is valid x86 for this test?
         asm!(":bbb nop");
 
@@ -172,11 +171,10 @@ fn main() {
     }
 }
 
-// Trigger on naked fns too, even though they can't be inlined, reusing a
-// label or LTO can cause labels to break
-#[naked]
+// Don't trigger on naked functions.
+#[unsafe(naked)]
 pub extern "C" fn foo() -> i32 {
-    unsafe { asm!(".Lfoo: mov rax, {}; ret;", "nop", const 1, options(noreturn)) } //~ ERROR avoid using named labels
+    naked_asm!(".Lfoo: mov rax, {}; ret;", "nop", const 1)
 }
 
 // Make sure that non-naked attributes *do* still let the lint happen
@@ -186,21 +184,32 @@ pub extern "C" fn bar() {
     //~^ ERROR avoid using named labels
 }
 
-#[naked]
+#[unsafe(naked)]
 pub extern "C" fn aaa() {
     fn _local() {}
 
-    unsafe { asm!(".Laaa: nop; ret;", options(noreturn)) } //~ ERROR avoid using named labels
+    naked_asm!(".Laaa: nop; ret;")
+}
+
+#[unsafe(naked)]
+pub extern "C" fn bbb<'a>(a: &'a u32) {
+    naked_asm!(".Lbbb: nop; ret;")
+}
+
+#[unsafe(naked)]
+pub extern "C" fn ccc<T>(a: &T) {
+    naked_asm!(".Lccc: nop; ret;")
+    //~^ ERROR avoid using named labels
 }
 
 pub fn normal() {
     fn _local1() {}
 
-    #[naked]
+    #[unsafe(naked)]
     pub extern "C" fn bbb() {
         fn _very_local() {}
 
-        unsafe { asm!(".Lbbb: nop; ret;", options(noreturn)) } //~ ERROR avoid using named labels
+        naked_asm!(".Lbbb: nop; ret;")
     }
 
     fn _local2() {}
@@ -217,9 +226,9 @@ fn closures() {
     };
 
     || {
-        #[naked]
-        unsafe extern "C" fn _nested() {
-            asm!("ret;", options(noreturn));
+        #[unsafe(naked)]
+        extern "C" fn _nested() {
+            naked_asm!("ret;");
         }
 
         unsafe {
@@ -230,3 +239,10 @@ fn closures() {
 
 // Don't trigger on global asm
 global_asm!("aaaaaaaa: nop");
+
+trait Foo {
+    #[unsafe(naked)]
+    extern "C" fn bbb<'a>(a: &'a u32) {
+        naked_asm!(".Lbbb: nop; ret;") //~ ERROR avoid using named labels
+    }
+}

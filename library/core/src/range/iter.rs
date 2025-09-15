@@ -1,9 +1,8 @@
-use crate::num::NonZero;
-use crate::range::{legacy, Range, RangeFrom, RangeInclusive};
-
 use crate::iter::{
     FusedIterator, Step, TrustedLen, TrustedRandomAccess, TrustedRandomAccessNoCoerce, TrustedStep,
 };
+use crate::num::NonZero;
+use crate::range::{Range, RangeFrom, RangeInclusive, legacy};
 
 /// By-value [`Range`] iterator.
 #[unstable(feature = "new_range_api", issue = "125687")]
@@ -165,7 +164,7 @@ impl<A: Step> IterRangeInclusive<A> {
             return None;
         }
 
-        Some(RangeInclusive { start: self.0.start, end: self.0.end })
+        Some(RangeInclusive { start: self.0.start, last: self.0.end })
     }
 }
 

@@ -1,7 +1,7 @@
 //@ run-fail
-//@ error-pattern:thread 'main' panicked
-//@ error-pattern:explicit panic
-//@ ignore-emscripten no processes
+//@ regex-error-pattern: thread 'main'.*panicked
+//@ error-pattern: explicit panic
+//@ needs-subprocess
 
 fn main() {
     let mut vec = vec![];

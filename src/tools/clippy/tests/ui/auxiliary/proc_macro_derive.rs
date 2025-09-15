@@ -1,11 +1,11 @@
-#![feature(repr128, proc_macro_quote)]
-#![allow(incomplete_features)]
+#![feature(proc_macro_quote, proc_macro_span)]
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::eq_op)]
+#![allow(clippy::literal_string_with_formatting_args)]
 
 extern crate proc_macro;
 
-use proc_macro::{quote, Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
+use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree, quote};
 
 #[proc_macro_derive(DeriveSomething)]
 pub fn derive(_: TokenStream) -> TokenStream {
@@ -16,7 +16,7 @@ pub fn derive(_: TokenStream) -> TokenStream {
     let output = quote! {
         // Should not trigger `useless_attribute`
         #[allow(dead_code)]
-        extern crate rustc_middle;
+        extern crate core;
     };
     output
 }
@@ -181,4 +181,52 @@ pub fn non_canonical_clone_derive(_: TokenStream) -> TokenStream {
         }
         impl Copy for NonCanonicalClone {}
     }
+}
+
+// Derive macro that generates the following but where all generated spans are set to the entire
+// input span.
+//
+// ```
+// #[allow(clippy::missing_const_for_fn)]
+// fn check() {}
+// ```
+#[proc_macro_derive(AllowLintSameSpan)]
+pub fn allow_lint_same_span_derive(input: TokenStream) -> TokenStream {
+    let mut iter = input.into_iter();
+    let first = iter.next().unwrap();
+    let last = iter.last().unwrap();
+    let span = first.span().join(last.span()).unwrap();
+    let span_help = |mut t: TokenTree| -> TokenTree {
+        t.set_span(span);
+        t
+    };
+    // Generate the TokenStream but setting all the spans to the entire input span
+    <TokenStream as FromIterator<TokenTree>>::from_iter([
+        span_help(Punct::new('#', Spacing::Alone).into()),
+        span_help(
+            Group::new(
+                Delimiter::Bracket,
+                <TokenStream as FromIterator<TokenTree>>::from_iter([
+                    Ident::new("allow", span).into(),
+                    span_help(
+                        Group::new(
+                            Delimiter::Parenthesis,
+                            <TokenStream as FromIterator<TokenTree>>::from_iter([
+                                Ident::new("clippy", span).into(),
+                                span_help(Punct::new(':', Spacing::Joint).into()),
+                                span_help(Punct::new(':', Spacing::Alone).into()),
+                                Ident::new("missing_const_for_fn", span).into(),
+                            ]),
+                        )
+                        .into(),
+                    ),
+                ]),
+            )
+            .into(),
+        ),
+        Ident::new("fn", span).into(),
+        Ident::new("check", span).into(),
+        span_help(Group::new(Delimiter::Parenthesis, TokenStream::new()).into()),
+        span_help(Group::new(Delimiter::Brace, TokenStream::new()).into()),
+    ])
 }

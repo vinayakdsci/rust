@@ -4,9 +4,8 @@ use core::mem::{self, SizedTypeProperties};
 use core::ptr::NonNull;
 use core::{fmt, ptr};
 
-use crate::alloc::{Allocator, Global};
-
 use super::VecDeque;
+use crate::alloc::{Allocator, Global};
 
 /// A draining iterator over the elements of a `VecDeque`.
 ///
@@ -193,7 +192,7 @@ impl<T, A: Allocator> Drop for Drain<'_, T, A> {
                     // this branch is never taken.
                     // We use `#[cold]` instead of `#[inline(never)]`, because inlining this
                     // function into the general case (`.drain(n..m)`) is fine.
-                    // See `tests/codegen/vecdeque-drain.rs` for a test.
+                    // See `tests/codegen-llvm/vecdeque-drain.rs` for a test.
                     #[cold]
                     fn join_head_and_tail_wrapping<T, A: Allocator>(
                         source_deque: &mut VecDeque<T, A>,

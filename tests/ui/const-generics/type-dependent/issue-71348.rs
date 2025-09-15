@@ -17,6 +17,7 @@ trait Get<'a, const N: &'static str> {
 impl Foo {
     fn ask<'a, const N: &'static str>(&'a self) -> &'a <Self as Get<N>>::Target
     //[min]~^ ERROR `&'static str` is forbidden as the type of a const generic parameter
+    //[full]~^^ WARNING hiding a lifetime that's named elsewhere is confusing
     where
         Self: Get<'a, N>,
     {

@@ -2,24 +2,29 @@
 //! for incorporating changes.
 // Note, don't remove any public api from this. This API is consumed by external tools
 // to run rust-analyzer as a library.
-use std::{collections::hash_map::Entry, iter, mem, path::Path, sync};
+use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{Receiver, unbounded};
 use hir_expand::proc_macro::{
     ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
-    ProcMacros,
+    ProcMacrosBuilder,
 };
 use ide_db::{
-    base_db::{CrateGraph, Env, SourceRoot, SourceRootId},
-    prime_caches, ChangeWithProcMacros, FxHashMap, RootDatabase,
+    ChangeWithProcMacros, FxHashMap, RootDatabase,
+    base_db::{CrateGraphBuilder, Env, ProcMacroLoadingError, SourceRoot, SourceRootId},
+    prime_caches,
 };
 use itertools::Itertools;
-use proc_macro_api::{MacroDylib, ProcMacroServer};
-use project_model::{CargoConfig, ManifestPath, PackageRoot, ProjectManifest, ProjectWorkspace};
+use proc_macro_api::{MacroDylib, ProcMacroClient};
+use project_model::{CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace};
 use span::Span;
-use tracing::instrument;
-use vfs::{file_set::FileSetConfig, loader::Handle, AbsPath, AbsPathBuf, VfsPath};
+use vfs::{
+    AbsPath, AbsPathBuf, VfsPath,
+    file_set::FileSetConfig,
+    loader::{Handle, LoadingProgress},
+};
 
+#[derive(Debug)]
 pub struct LoadCargoConfig {
     pub load_out_dirs_from_check: bool,
     pub with_proc_macro_server: ProcMacroServerChoice,
@@ -37,96 +42,140 @@ pub fn load_workspace_at(
     root: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
-    progress: &dyn Fn(String),
-) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroServer>)> {
+    progress: &(dyn Fn(String) + Sync),
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroClient>)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(root));
     let root = ProjectManifest::discover_single(&root)?;
+    let manifest_path = root.manifest_path().clone();
     let mut workspace = ProjectWorkspace::load(root, cargo_config, progress)?;
 
     if load_config.load_out_dirs_from_check {
         let build_scripts = workspace.run_build_scripts(cargo_config, progress)?;
+        if let Some(error) = build_scripts.error() {
+            tracing::debug!(
+                "Errors occurred while running build scripts for {}: {}",
+                manifest_path,
+                error
+            );
+        }
         workspace.set_build_scripts(build_scripts)
     }
 
     load_workspace(workspace, &cargo_config.extra_env, load_config)
 }
 
-#[instrument(skip_all)]
 pub fn load_workspace(
     ws: ProjectWorkspace,
-    extra_env: &FxHashMap<String, String>,
+    extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
-) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroServer>)> {
+) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroClient>)> {
+    let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<u16>().ok());
+    let mut db = RootDatabase::new(lru_cap);
+
+    let (vfs, proc_macro_server) = load_workspace_into_db(ws, extra_env, load_config, &mut db)?;
+
+    Ok((db, vfs, proc_macro_server))
+}
+
+// This variant of `load_workspace` allows deferring the loading of rust-analyzer
+// into an existing database, which is useful in certain third-party scenarios,
+// now that `salsa` supports extending foreign databases (e.g. `RootDatabase`).
+pub fn load_workspace_into_db(
+    ws: ProjectWorkspace,
+    extra_env: &FxHashMap<String, Option<String>>,
+    load_config: &LoadCargoConfig,
+    db: &mut RootDatabase,
+) -> anyhow::Result<(vfs::Vfs, Option<ProcMacroClient>)> {
     let (sender, receiver) = unbounded();
     let mut vfs = vfs::Vfs::default();
     let mut loader = {
-        let loader =
-            vfs_notify::NotifyHandle::spawn(Box::new(move |msg| sender.send(msg).unwrap()));
+        let loader = vfs_notify::NotifyHandle::spawn(sender);
         Box::new(loader)
     };
 
+    tracing::debug!(?load_config, "LoadCargoConfig");
     let proc_macro_server = match &load_config.with_proc_macro_server {
-        ProcMacroServerChoice::Sysroot => ws
-            .find_sysroot_proc_macro_srv()
-            .and_then(|it| ProcMacroServer::spawn(&it, extra_env).map_err(Into::into)),
+        ProcMacroServerChoice::Sysroot => ws.find_sysroot_proc_macro_srv().map(|it| {
+            it.and_then(|it| ProcMacroClient::spawn(&it, extra_env).map_err(Into::into)).map_err(
+                |e| ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str()),
+            )
+        }),
         ProcMacroServerChoice::Explicit(path) => {
-            ProcMacroServer::spawn(path, extra_env).map_err(Into::into)
+            Some(ProcMacroClient::spawn(path, extra_env).map_err(|e| {
+                ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
+            }))
         }
-        ProcMacroServerChoice::None => Err(anyhow::format_err!("proc macro server disabled")),
+        ProcMacroServerChoice::None => Some(Err(ProcMacroLoadingError::Disabled)),
     };
+    match &proc_macro_server {
+        Some(Ok(server)) => {
+            tracing::info!(manifest=%ws.manifest_or_root(), path=%server.server_path(), "Proc-macro server started")
+        }
+        Some(Err(e)) => {
+            tracing::info!(manifest=%ws.manifest_or_root(), %e, "Failed to start proc-macro server")
+        }
+        None => {
+            tracing::info!(manifest=%ws.manifest_or_root(), "No proc-macro server started")
+        }
+    }
 
     let (crate_graph, proc_macros) = ws.to_crate_graph(
         &mut |path: &AbsPath| {
             let contents = loader.load_sync(path);
             let path = vfs::VfsPath::from(path.to_path_buf());
             vfs.set_file_contents(path.clone(), contents);
-            vfs.file_id(&path)
+            vfs.file_id(&path).and_then(|(file_id, excluded)| {
+                (excluded == vfs::FileExcluded::No).then_some(file_id)
+            })
         },
         extra_env,
     );
     let proc_macros = {
         let proc_macro_server = match &proc_macro_server {
-            Ok(it) => Ok(it),
-            Err(e) => Err(e.to_string()),
+            Some(Ok(it)) => Ok(it),
+            Some(Err(e)) => {
+                Err(ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str()))
+            }
+            None => Err(ProcMacroLoadingError::ProcMacroSrvError(
+                "proc-macro-srv is not running, workspace is missing a sysroot".into(),
+            )),
         };
         proc_macros
             .into_iter()
             .map(|(crate_id, path)| {
                 (
                     crate_id,
-                    path.map_or_else(
-                        |_| Err("proc macro crate is missing dylib".to_owned()),
-                        |(_, path)| {
-                            proc_macro_server.as_ref().map_err(Clone::clone).and_then(
-                                |proc_macro_server| load_proc_macro(proc_macro_server, &path, &[]),
-                            )
-                        },
-                    ),
+                    path.map_or_else(Err, |(_, path)| {
+                        proc_macro_server.as_ref().map_err(Clone::clone).and_then(
+                            |proc_macro_server| load_proc_macro(proc_macro_server, &path, &[]),
+                        )
+                    }),
                 )
             })
             .collect()
     };
 
-    let project_folders = ProjectFolders::new(std::slice::from_ref(&ws), &[]);
+    let project_folders = ProjectFolders::new(std::slice::from_ref(&ws), &[], None);
     loader.set_config(vfs::loader::Config {
         load: project_folders.load,
         watch: vec![],
         version: 0,
     });
 
-    let db = load_crate_graph(
-        &ws,
+    load_crate_graph_into_db(
         crate_graph,
         proc_macros,
         project_folders.source_root_config,
         &mut vfs,
         &receiver,
+        db,
     );
 
     if load_config.prefill_caches {
-        prime_caches::parallel_prime_caches(&db, 1, &|_| ());
+        prime_caches::parallel_prime_caches(db, 1, &|_| ());
     }
-    Ok((db, vfs, proc_macro_server.ok()))
+
+    Ok((vfs, proc_macro_server.and_then(Result::ok)))
 }
 
 #[derive(Default)]
@@ -137,7 +186,11 @@ pub struct ProjectFolders {
 }
 
 impl ProjectFolders {
-    pub fn new(workspaces: &[ProjectWorkspace], global_excludes: &[AbsPathBuf]) -> ProjectFolders {
+    pub fn new(
+        workspaces: &[ProjectWorkspace],
+        global_excludes: &[AbsPathBuf],
+        user_config_dir_path: Option<&AbsPath>,
+    ) -> ProjectFolders {
         let mut res = ProjectFolders::default();
         let mut fsc = FileSetConfig::builder();
         let mut local_filesets = vec![];
@@ -238,12 +291,33 @@ impl ProjectFolders {
             fsc.add_file_set(file_set_roots)
         }
 
-        // register the workspace manifest as well, note that this currently causes duplicates for
-        // non-virtual cargo workspaces! We ought to fix that
-        for manifest in workspaces.iter().filter_map(|ws| ws.manifest().map(ManifestPath::as_ref)) {
-            let file_set_roots: Vec<VfsPath> = vec![VfsPath::from(manifest.to_owned())];
+        for ws in workspaces.iter() {
+            let mut file_set_roots: Vec<VfsPath> = vec![];
+            let mut entries = vec![];
 
-            let entry = vfs::loader::Entry::Files(vec![manifest.to_owned()]);
+            for buildfile in ws.buildfiles() {
+                file_set_roots.push(VfsPath::from(buildfile.to_owned()));
+                entries.push(buildfile.to_owned());
+            }
+
+            if !file_set_roots.is_empty() {
+                let entry = vfs::loader::Entry::Files(entries);
+                res.watch.push(res.load.len());
+                res.load.push(entry);
+                local_filesets.push(fsc.len() as u64);
+                fsc.add_file_set(file_set_roots)
+            }
+        }
+
+        if let Some(user_config_path) = user_config_dir_path {
+            let ratoml_path = {
+                let mut p = user_config_path.to_path_buf();
+                p.push("rust-analyzer.toml");
+                p
+            };
+
+            let file_set_roots = vec![VfsPath::from(ratoml_path.to_owned())];
+            let entry = vfs::loader::Entry::Files(vec![ratoml_path]);
 
             res.watch.push(res.load.len());
             res.load.push(entry);
@@ -336,18 +410,19 @@ impl SourceRootConfig {
     }
 }
 
-/// Load the proc-macros for the given lib path, replacing all expanders whose names are in `dummy_replace`
-/// with an identity dummy expander.
+/// Load the proc-macros for the given lib path, disabling all expanders whose names are in `ignored_macros`.
 pub fn load_proc_macro(
-    server: &ProcMacroServer,
+    server: &ProcMacroClient,
     path: &AbsPath,
     ignored_macros: &[Box<str>],
 ) -> ProcMacroLoadResult {
-    let res: Result<Vec<_>, String> = (|| {
+    let res: Result<Vec<_>, _> = (|| {
         let dylib = MacroDylib::new(path.to_path_buf());
-        let vec = server.load_dylib(dylib).map_err(|e| format!("{e}"))?;
+        let vec = server.load_dylib(dylib).map_err(|e| {
+            ProcMacroLoadingError::ProcMacroSrvError(format!("{e}").into_boxed_str())
+        })?;
         if vec.is_empty() {
-            return Err("proc macro library returned no proc macros".to_owned());
+            return Err(ProcMacroLoadingError::NoProcMacros);
         }
         Ok(vec
             .into_iter()
@@ -369,27 +444,23 @@ pub fn load_proc_macro(
     }
 }
 
-fn load_crate_graph(
-    ws: &ProjectWorkspace,
-    crate_graph: CrateGraph,
-    proc_macros: ProcMacros,
+fn load_crate_graph_into_db(
+    crate_graph: CrateGraphBuilder,
+    proc_macros: ProcMacrosBuilder,
     source_root_config: SourceRootConfig,
     vfs: &mut vfs::Vfs,
     receiver: &Receiver<vfs::loader::Message>,
-) -> RootDatabase {
-    let ProjectWorkspace { toolchain, target_layout, .. } = ws;
-
-    let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<usize>().ok());
-    let mut db = RootDatabase::new(lru_cap);
-    let mut analysis_change = ChangeWithProcMacros::new();
+    db: &mut RootDatabase,
+) {
+    let mut analysis_change = ChangeWithProcMacros::default();
 
     db.enable_proc_attr_macros();
 
     // wait until Vfs has loaded all roots
     for task in receiver {
         match task {
-            vfs::loader::Message::Progress { n_done, n_total, .. } => {
-                if n_done == Some(n_total) {
+            vfs::loader::Message::Progress { n_done, .. } => {
+                if n_done == LoadingProgress::Finished {
                     break;
                 }
             }
@@ -404,64 +475,77 @@ fn load_crate_graph(
     }
     let changes = vfs.take_changes();
     for (_, file) in changes {
-        if let vfs::Change::Create(v, _) | vfs::Change::Modify(v, _) = file.change {
-            if let Ok(text) = String::from_utf8(v) {
-                analysis_change.change_file(file.file_id, Some(text))
-            }
+        if let vfs::Change::Create(v, _) | vfs::Change::Modify(v, _) = file.change
+            && let Ok(text) = String::from_utf8(v)
+        {
+            analysis_change.change_file(file.file_id, Some(text))
         }
     }
     let source_roots = source_root_config.partition(vfs);
     analysis_change.set_roots(source_roots);
 
-    let num_crates = crate_graph.len();
     analysis_change.set_crate_graph(crate_graph);
     analysis_change.set_proc_macros(proc_macros);
-    analysis_change
-        .set_target_data_layouts(iter::repeat(target_layout.clone()).take(num_crates).collect());
-    analysis_change.set_toolchains(iter::repeat(toolchain.clone()).take(num_crates).collect());
 
     db.apply_change(analysis_change);
-    db
 }
 
 fn expander_to_proc_macro(
     expander: proc_macro_api::ProcMacro,
     ignored_macros: &[Box<str>],
 ) -> ProcMacro {
-    let name = From::from(expander.name());
+    let name = expander.name();
     let kind = match expander.kind() {
         proc_macro_api::ProcMacroKind::CustomDerive => ProcMacroKind::CustomDerive,
         proc_macro_api::ProcMacroKind::Bang => ProcMacroKind::Bang,
         proc_macro_api::ProcMacroKind::Attr => ProcMacroKind::Attr,
     };
-    let disabled = ignored_macros.iter().any(|replace| **replace == name);
-    ProcMacro { name, kind, expander: sync::Arc::new(Expander(expander)), disabled }
+    let disabled = ignored_macros.iter().any(|replace| **replace == *name);
+    ProcMacro {
+        name: intern::Symbol::intern(name),
+        kind,
+        expander: sync::Arc::new(Expander(expander)),
+        disabled,
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct Expander(proc_macro_api::ProcMacro);
 
 impl ProcMacroExpander for Expander {
     fn expand(
         &self,
-        subtree: &tt::Subtree<Span>,
-        attrs: Option<&tt::Subtree<Span>>,
+        subtree: &tt::TopSubtree<Span>,
+        attrs: Option<&tt::TopSubtree<Span>>,
         env: &Env,
         def_site: Span,
         call_site: Span,
         mixed_site: Span,
-    ) -> Result<tt::Subtree<Span>, ProcMacroExpansionError> {
-        match self.0.expand(subtree, attrs, env.clone(), def_site, call_site, mixed_site) {
+        current_dir: String,
+    ) -> Result<tt::TopSubtree<Span>, ProcMacroExpansionError> {
+        match self.0.expand(
+            subtree.view(),
+            attrs.map(|attrs| attrs.view()),
+            env.clone().into(),
+            def_site,
+            call_site,
+            mixed_site,
+            current_dir,
+        ) {
             Ok(Ok(subtree)) => Ok(subtree),
-            Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err.0)),
+            Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err)),
             Err(err) => Err(ProcMacroExpansionError::System(err.to_string())),
         }
+    }
+
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        (other as &dyn Any).downcast_ref::<Self>() == Some(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ide_db::base_db::SourceDatabase;
+    use ide_db::base_db::RootQueryDb;
     use vfs::file_set::FileSetConfigBuilder;
 
     use super::*;
@@ -469,7 +553,7 @@ mod tests {
     #[test]
     fn test_loading_rust_analyzer() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-        let cargo_config = CargoConfig::default();
+        let cargo_config = CargoConfig { set_test: true, ..CargoConfig::default() };
         let load_cargo_config = LoadCargoConfig {
             load_out_dirs_from_check: false,
             with_proc_macro_server: ProcMacroServerChoice::None,
@@ -478,7 +562,7 @@ mod tests {
         let (db, _vfs, _proc_macro) =
             load_workspace_at(path, &cargo_config, &load_cargo_config, &|_| {}).unwrap();
 
-        let n_crates = db.crate_graph().iter().count();
+        let n_crates = db.all_crates().len();
         // RA has quite a few crates, but the exact count doesn't matter
         assert!(n_crates > 20);
     }
@@ -568,7 +652,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 2, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
 
         assert_eq!(vc, vec![(SourceRootId(2), SourceRootId(1)), (SourceRootId(3), SourceRootId(1))])
     }
@@ -583,7 +667,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
 
         assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
     }
@@ -598,7 +682,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
 
         assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
     }
@@ -614,7 +698,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
 
         assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
     }
@@ -630,7 +714,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0 .0.cmp(&y.0 .0));
+        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
 
         assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
     }

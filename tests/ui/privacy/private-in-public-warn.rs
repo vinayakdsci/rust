@@ -35,17 +35,21 @@ mod types {
 
 mod traits {
     trait PrivTr {}
+    impl PrivTr for () {}
     pub struct Pub<T>(T);
     pub trait PubTr {}
 
     pub type Alias<T: PrivTr> = T; //~ ERROR trait `traits::PrivTr` is more private than the item `traits::Alias`
-    //~^ WARNING bounds on generic parameters are not enforced in type aliases
+    //~^ WARNING bounds on generic parameters in type aliases are not enforced
     pub trait Tr1: PrivTr {} //~ ERROR trait `traits::PrivTr` is more private than the item `traits::Tr1`
     pub trait Tr2<T: PrivTr> {} //~ ERROR trait `traits::PrivTr` is more private than the item `traits::Tr2`
     pub trait Tr3 {
         type Alias: PrivTr;
         //~^ ERROR trait `traits::PrivTr` is more private than the item `traits::Tr3::Alias`
-        fn f<T: PrivTr>(arg: T) {} //~ ERROR trait `traits::PrivTr` is more private than the item `traits::Tr3::f`
+        fn f<T: PrivTr>(arg: T) {}
+        //~^ ERROR trait `traits::PrivTr` is more private than the item `traits::Tr3::f`
+        fn g() -> impl PrivTr;
+        fn h() -> impl PrivTr {}
     }
     impl<T: PrivTr> Pub<T> {} //~ ERROR trait `traits::PrivTr` is more private than the item `traits::Pub<T>`
     impl<T: PrivTr> PubTr for Pub<T> {} // OK, trait impl predicates
@@ -58,7 +62,7 @@ mod traits_where {
 
     pub type Alias<T> where T: PrivTr = T;
         //~^ ERROR trait `traits_where::PrivTr` is more private than the item `traits_where::Alias`
-        //~| WARNING where clauses are not enforced in type aliases
+        //~| WARNING where clauses on type aliases are not enforced
     pub trait Tr2<T> where T: PrivTr {}
         //~^ ERROR trait `traits_where::PrivTr` is more private than the item `traits_where::Tr2`
     pub trait Tr3 {
@@ -75,12 +79,18 @@ mod generics {
     pub struct Pub<T = u8>(T);
     trait PrivTr<T> {}
     pub trait PubTr<T> {}
+    impl PrivTr<Priv<()>> for () {}
 
     pub trait Tr1: PrivTr<Pub> {}
         //~^ ERROR trait `generics::PrivTr<generics::Pub>` is more private than the item `generics::Tr1`
     pub trait Tr2: PubTr<Priv> {} //~ ERROR type `generics::Priv` is more private than the item `generics::Tr2`
     pub trait Tr3: PubTr<[Priv; 1]> {} //~ ERROR type `generics::Priv` is more private than the item `generics::Tr3`
     pub trait Tr4: PubTr<Pub<Priv>> {} //~ ERROR type `generics::Priv` is more private than the item `Tr4`
+
+    pub trait Tr5 {
+        fn required() -> impl PrivTr<Priv<()>>;
+        fn provided() -> impl PrivTr<Priv<()>> {}
+    }
 }
 
 mod impls {

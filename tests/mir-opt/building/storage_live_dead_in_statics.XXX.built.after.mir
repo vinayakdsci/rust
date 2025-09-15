@@ -187,7 +187,7 @@ static XXX: &Foo = {
         StorageDead(_7);
         _5 = &_6;
         _4 = &(*_5);
-        _3 = move _4 as &[(u32, u32)] (PointerCoercion(Unsize));
+        _3 = move _4 as &[(u32, u32)] (PointerCoercion(Unsize, Implicit));
         StorageDead(_4);
         _2 = Foo { tup: const "hi", data: move _3 };
         StorageDead(_3);
@@ -197,4 +197,8 @@ static XXX: &Foo = {
         StorageDead(_1);
         return;
     }
+}
+
+ALLOC0 (size: 2, align: 1) {
+    68 69                                           │ hi
 }
